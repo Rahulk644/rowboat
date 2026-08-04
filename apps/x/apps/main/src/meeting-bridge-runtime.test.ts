@@ -39,6 +39,10 @@ class FakeSupervisor {
     this.stopCalls += 1;
   }
 
+  maximumRestarts(): number | undefined {
+    return this.options.restartBackoff?.maximumRestarts;
+  }
+
   emit(event: Exclude<BridgeEvent, { type: 'ready' } | { type: 'pong' }>): void {
     this.options.onEvent?.(event);
   }
@@ -77,6 +81,7 @@ test('bridge runtime warms before capture, starts only when ready, keeps a healt
 
   assert.equal(await runtime.warm('meeting-1'), true);
   assert.equal(supervisor?.warmCalls, 1);
+  assert.equal(supervisor?.maximumRestarts(), 0);
   assert.equal(await runtime.captureReady('meeting-1'), true);
   assert.deepEqual(supervisor?.startIfReadyCalls, ['meeting-1']);
   assert.equal(await runtime.restart('meeting-1'), true);

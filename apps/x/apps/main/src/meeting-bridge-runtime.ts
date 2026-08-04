@@ -51,6 +51,10 @@ export function createMeetingBridgeRuntime(options: MeetingBridgeRuntimeOptions)
   const supervisor = (options.createSupervisor ?? ((supervisorOptions) => new MeetingBridgeSupervisor(supervisorOptions)))({
     enabled,
     resolveBinary: () => resolveMeetingBridgeBinary(options.paths()),
+    // The current helper's monotonic sample origin resets after a process
+    // restart. Until an offset can cross that boundary, evidence must stay off
+    // for the rest of this meeting instead of attaching wrong speaker names.
+    restartBackoff: { initialMs: 250, maximumMs: 5_000, maximumRestarts: 0 },
     onEvent: (event) => {
       if (event.type !== 'speaker_evidence' || activeMeetingId !== event.evidence.meetingId) return;
       // The pending-upsert delivery is deliberately best-effort. A bridge
@@ -99,8 +103,8 @@ export function createMeetingBridgeRuntime(options: MeetingBridgeRuntimeOptions)
     },
     captureReady: activate,
     // A self-hosted ASR session restart does not need to tear down healthy
-    // native capture. An active matching bridge is deliberately left running;
-    // a failed/late initial Start must never create an offset sidecar later.
+    // native capture. An active matching bridge is left running; a crashed
+    // helper stays off until the next meeting because its sample clock resets.
     async restart(meetingId: string): Promise<boolean> {
       return activeMeetingId === meetingId;
     },
