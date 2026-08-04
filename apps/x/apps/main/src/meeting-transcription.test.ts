@@ -319,3 +319,55 @@ test('a fast mic final does not prune evidence needed by delayed system ASR', as
   assert.deepEqual(delayedSystem.segments[0]?.speaker, { kind: 'named', id: 'akbar', displayName: 'Akbar' });
   assert.equal(delayedSystem.segments[0]?.revision, 1);
 });
+
+test('post-transcript evidence is delivered in the next snapshot exactly once', async (t) => {
+  const originalUrl = process.env.ROWBOAT_MEETING_STT_URL;
+  const originalToken = process.env.ROWBOAT_MEETING_STT_TOKEN;
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    if (originalUrl === undefined) delete process.env.ROWBOAT_MEETING_STT_URL;
+    else process.env.ROWBOAT_MEETING_STT_URL = originalUrl;
+    if (originalToken === undefined) delete process.env.ROWBOAT_MEETING_STT_TOKEN;
+    else process.env.ROWBOAT_MEETING_STT_TOKEN = originalToken;
+    globalThis.fetch = originalFetch;
+  });
+  process.env.ROWBOAT_MEETING_STT_TOKEN = TOKEN;
+  process.env.ROWBOAT_MEETING_STT_URL = 'http://127.0.0.1:18091';
+  globalThis.fetch = async (input) => {
+    const url = new URL(input.toString());
+    const session = url.searchParams.get('session') ?? '';
+    if (url.pathname === '/stream/feed') {
+      return new Response(JSON.stringify({
+        session, full: 'remote words', committed: 'remote words', tentative: '', changed: false,
+        final: false, revision: 1, inputMs: 1_000, bufferedMs: 0,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({ ok: true, session }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  };
+
+  const provider = new SelfHostedMeetingTranscription();
+  await provider.begin('queued attribution', 'en');
+  const pcm = Buffer.alloc(32_000).toString('base64');
+  const initial = await provider.feed('queued attribution', 'system', pcm, {
+    startSample: 0, sampleCount: 16_000, sampleRate: 16_000, sequence: 0,
+  });
+  assert.equal(initial.segments[0]?.revision, 0);
+  assert.equal(initial.segments[0]?.speaker.kind, 'unknown');
+
+  const immediate = provider.applySpeakerEvidence('queued attribution', [
+    { source: 'zoom_ax', participantId: 'akbar', displayName: 'Akbar', isActive: true, startSample: 0, endSample: 16_000, confidence: 1 },
+  ]);
+  assert.equal(immediate.segments[0]?.revision, 1);
+
+  const next = await provider.feed('queued attribution', 'system', pcm, {
+    startSample: 16_000, sampleCount: 16_000, sampleRate: 16_000, sequence: 1,
+  });
+  assert.equal(next.segments.length, 1);
+  assert.equal(next.segments[0]?.revision, 1);
+  assert.deepEqual(next.segments[0]?.speaker, { kind: 'named', id: 'akbar', displayName: 'Akbar' });
+
+  const afterDelivery = await provider.feed('queued attribution', 'system', pcm, {
+    startSample: 32_000, sampleCount: 16_000, sampleRate: 16_000, sequence: 2,
+  });
+  assert.deepEqual(afterDelivery.segments, []);
+});

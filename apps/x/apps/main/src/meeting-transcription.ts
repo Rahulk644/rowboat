@@ -133,6 +133,7 @@ type ActiveMeeting = {
   segments: Map<string, MeetingTranscriptSegment>;
   corrections: Map<string, { displayName: string; rememberVoice: boolean }>;
   speakerEvidence: MeetingSpeakerEvidence[];
+  pendingAttributionUpserts: Map<string, MeetingTranscriptSegment>;
 };
 
 const SnapshotSchema = z.object({
@@ -160,6 +161,7 @@ const MAX_PCM_BYTES = 64 * 1024;
 const SAMPLE_RATE = 16_000;
 const MAX_SPEAKER_EVIDENCE = 1_024;
 const SPEAKER_EVIDENCE_HISTORY_SAMPLES = SAMPLE_RATE * 120;
+const MAX_PENDING_ATTRIBUTION_UPSERTS = 512;
 const DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]']);
 
@@ -283,6 +285,7 @@ export class SelfHostedMeetingTranscription {
         segments: new Map(),
         corrections: new Map(),
         speakerEvidence: [],
+        pendingAttributionUpserts: new Map(),
       });
     } catch (error) {
       await this.bestEffortReset(config, sessions.mic);
@@ -393,6 +396,7 @@ export class SelfHostedMeetingTranscription {
     const active = this.requireActive(meetingId);
     this.retainSpeakerEvidence(active, evidence);
     const updated = this.resolveStoredSpeakerEvidence(active, active.segments.keys(), options);
+    this.enqueueAttributionUpserts(active, updated);
     this.pruneSpeakerEvidence(active);
     return { segments: updated };
   }
@@ -468,6 +472,22 @@ export class SelfHostedMeetingTranscription {
     active.speakerEvidence.sort((a, b) => a.endSample - b.endSample || a.startSample - b.startSample);
     if (active.speakerEvidence.length > MAX_SPEAKER_EVIDENCE) {
       active.speakerEvidence.splice(0, active.speakerEvidence.length - MAX_SPEAKER_EVIDENCE);
+    }
+  }
+
+  private enqueueAttributionUpserts(active: ActiveMeeting, upserts: readonly MeetingTranscriptSegment[]): void {
+    for (const upsert of upserts) {
+      const existing = active.pendingAttributionUpserts.get(upsert.segmentId);
+      if (existing && existing.revision >= upsert.revision) continue;
+      // Move a revised record to the newest position so the bounded queue
+      // always drops the stalest delivery, never its higher revision.
+      active.pendingAttributionUpserts.delete(upsert.segmentId);
+      active.pendingAttributionUpserts.set(upsert.segmentId, upsert);
+    }
+    while (active.pendingAttributionUpserts.size > MAX_PENDING_ATTRIBUTION_UPSERTS) {
+      const oldest = active.pendingAttributionUpserts.keys().next().value;
+      if (!oldest) break;
+      active.pendingAttributionUpserts.delete(oldest);
     }
   }
 
@@ -629,7 +649,14 @@ export class SelfHostedMeetingTranscription {
     // snapshot created or revised against the bounded retained history.
     const attributed = this.resolveStoredSpeakerEvidence(active, accepted.map((segment) => segment.segmentId));
     this.pruneSpeakerEvidence(active);
-    const emitted = mergeMeetingTranscriptSegments([], [...accepted, ...attributed]);
+    const pending = [...active.pendingAttributionUpserts.values()];
+    const emitted = mergeMeetingTranscriptSegments([], [...accepted, ...attributed, ...pending]);
+    for (const queued of pending) {
+      const delivered = emitted.find((segment) => segment.segmentId === queued.segmentId);
+      if (delivered && delivered.revision >= queued.revision) {
+        active.pendingAttributionUpserts.delete(queued.segmentId);
+      }
+    }
     return {
       ...worker,
       version: 2,
