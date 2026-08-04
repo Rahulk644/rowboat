@@ -95,6 +95,72 @@ const SlackErrorKindSchema = z.enum([
   'not_authed', 'rate_limited', 'network', 'bad_channel', 'unknown',
 ]);
 
+// Canonical v2 meeting transcript upserts. The legacy text-prefix fields are
+// retained separately while older renderers migrate, but all new meeting
+// work consumes these revisioned, interval-bearing records.
+const MeetingTranscriptSegmentSchema = z.object({
+  meetingId: z.string().min(1).max(120),
+  segmentId: z.string().min(1).max(240),
+  revision: z.number().int().nonnegative(),
+  epoch: z.number().int().nonnegative(),
+  startSample: z.number().int().nonnegative(),
+  endSample: z.number().int().nonnegative(),
+  timingConfidence: z.enum(['high', 'medium', 'low']),
+  timingSource: z.enum(['feed-window', 'model-token']).optional(),
+  channel: z.enum(['mic', 'system']),
+  text: z.string(),
+  finality: z.enum(['interim', 'stable', 'final']),
+  clusterIds: z.array(z.string().min(1).max(160)),
+  overlap: z.boolean(),
+  speaker: z.object({
+    kind: z.enum(['self', 'named', 'cluster', 'unknown']),
+    id: z.string().min(1).max(240).optional(),
+    displayName: z.string().min(1).max(160).optional(),
+  }),
+  attributionSource: z.string().min(1).max(160),
+  attributionConfidence: z.number().min(0).max(1),
+  supersedes: z.array(z.string().min(1).max(240)),
+});
+
+const MeetingAudioFeedSchema = z.object({
+  sourceId: z.string().min(1).max(160),
+  channel: z.enum(['mic', 'system']),
+  epoch: z.number().int().nonnegative(),
+  startSample: z.number().int().nonnegative(),
+  sampleCount: z.number().int().positive(),
+  sampleRate: z.number().int().positive().max(192_000),
+  sequence: z.number().int().nonnegative(),
+  flags: z.array(z.enum(['discontinuity', 'recovered', 'silence'])),
+});
+
+const MeetingCaptureHealthSchema = z.object({
+  meetingId: z.string().min(1).max(120),
+  channel: z.enum(['mic', 'system']),
+  epoch: z.number().int().nonnegative(),
+  state: z.enum(['starting', 'ready', 'stalled', 'recovering', 'failed', 'off']),
+  sequence: z.number().int().nonnegative(),
+  lastFrameSample: z.number().int().nonnegative(),
+  restartCount: z.number().int().nonnegative(),
+  reason: z.string().min(1).max(240).optional(),
+});
+
+const SelfHostedMeetingSnapshotSchema = z.object({
+  session: z.string(),
+  full: z.string(),
+  committed: z.string(),
+  tentative: z.string(),
+  changed: z.boolean(),
+  final: z.boolean(),
+  revision: z.number().int().nonnegative(),
+  inputMs: z.number().int().nonnegative(),
+  bufferedMs: z.number().int().nonnegative(),
+  version: z.literal(2),
+  epoch: z.number().int().nonnegative(),
+  feed: MeetingAudioFeedSchema.optional(),
+  captureHealth: MeetingCaptureHealthSchema,
+  segments: z.array(MeetingTranscriptSegmentSchema),
+});
+
 const KnowledgeSourceConfigSchema = z.object({
   id: z.string(),
   provider: z.enum(['gmail', 'meeting', 'voice_memo', 'slack', 'github', 'linear']),
@@ -1100,32 +1166,25 @@ const ipcSchemas = {
       meetingId: z.string().min(1).max(120),
       channel: z.enum(['mic', 'system']),
       pcmBase64: z.string().min(1).max(100_000),
+      // Optional until every capture path sends explicit monotonic metadata.
+      // The main process derives the same values from bounded 16 kHz PCM when
+      // it is absent, preserving the pre-v2 renderer contract.
+      audio: z.object({
+        sourceId: z.string().min(1).max(160).optional(),
+        startSample: z.number().int().nonnegative().optional(),
+        sampleCount: z.number().int().positive().optional(),
+        sampleRate: z.number().int().positive().max(192_000).optional(),
+        sequence: z.number().int().nonnegative().optional(),
+        flags: z.array(z.enum(['discontinuity', 'recovered', 'silence'])).max(3).optional(),
+      }).optional(),
     }),
-    res: z.object({
-      session: z.string(),
-      full: z.string(),
-      committed: z.string(),
-      tentative: z.string(),
-      changed: z.boolean(),
-      final: z.boolean(),
-      revision: z.number().int().nonnegative(),
-      inputMs: z.number().int().nonnegative(),
-      bufferedMs: z.number().int().nonnegative(),
-    }),
+    res: SelfHostedMeetingSnapshotSchema,
   },
   'meeting:transcription:finalize': {
     req: z.object({ meetingId: z.string().min(1).max(120) }),
     res: z.object({
-      mic: z.object({
-        session: z.string(), full: z.string(), committed: z.string(), tentative: z.string(),
-        changed: z.boolean(), final: z.boolean(), revision: z.number().int().nonnegative(),
-        inputMs: z.number().int().nonnegative(), bufferedMs: z.number().int().nonnegative(),
-      }),
-      system: z.object({
-        session: z.string(), full: z.string(), committed: z.string(), tentative: z.string(),
-        changed: z.boolean(), final: z.boolean(), revision: z.number().int().nonnegative(),
-        inputMs: z.number().int().nonnegative(), bufferedMs: z.number().int().nonnegative(),
-      }),
+      mic: SelfHostedMeetingSnapshotSchema,
+      system: SelfHostedMeetingSnapshotSchema,
     }),
   },
   'meeting:transcription:restart': {
@@ -1135,6 +1194,15 @@ const ipcSchemas = {
   'meeting:transcription:reset': {
     req: z.object({ meetingId: z.string().min(1).max(120) }),
     res: z.object({ success: z.literal(true) }),
+  },
+  'meeting:transcription:correctSpeaker': {
+    req: z.object({
+      meetingId: z.string().min(1).max(120).optional(),
+      segmentId: z.string().min(1).max(240),
+      displayName: z.string().trim().min(1).max(160),
+      rememberVoice: z.boolean(),
+    }),
+    res: z.object({ segments: z.array(MeetingTranscriptSegmentSchema) }),
   },
   // Renderer → main: assistant voice/video call holds the mic — suppresses
   // ambient meeting detection (it would otherwise see our own capture) and

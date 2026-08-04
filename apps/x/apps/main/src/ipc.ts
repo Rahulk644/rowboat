@@ -977,7 +977,7 @@ export function setupIpcHandlers() {
       return { success: true as const };
     },
     'meeting:transcription:feed': async (_event, args) => {
-      return selfHostedMeetingTranscription.feed(args.meetingId, args.channel, args.pcmBase64);
+      return selfHostedMeetingTranscription.feed(args.meetingId, args.channel, args.pcmBase64, args.audio);
     },
     'meeting:transcription:finalize': async (_event, args) => {
       return selfHostedMeetingTranscription.finalize(args.meetingId);
@@ -989,6 +989,18 @@ export function setupIpcHandlers() {
     'meeting:transcription:reset': async (_event, args) => {
       await selfHostedMeetingTranscription.reset(args.meetingId);
       return { success: true as const };
+    },
+    'meeting:transcription:correctSpeaker': async (_event, args) => {
+      const segment = selfHostedMeetingTranscription.correctSpeaker(
+        args.meetingId,
+        args.segmentId,
+        args.displayName,
+        args.rememberVoice,
+      );
+      // `rememberVoice` deliberately has no persistence effect yet. This is
+      // a meeting-local correction; voice enrollment requires its separate
+      // explicit consent, biometric storage, and deletion design.
+      return { segments: segment ? [segment] : [] };
     },
     'voice:setCallActive': async (_event, args) => {
       voiceCallActive = args.active;
