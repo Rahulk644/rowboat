@@ -47,6 +47,9 @@ export function createMeetingBridgeRuntime(options: MeetingBridgeRuntimeOptions)
   const enabled = options.enabled ?? isMeetingBridgeEnabled;
   let activeMeetingId: string | null = null;
   let warmedMeetingId: string | null = null;
+  let warmingMeetingId: string | null = null;
+  let warmPromise: Promise<boolean> | null = null;
+  let warmGeneration = 0;
 
   const supervisor = (options.createSupervisor ?? ((supervisorOptions) => new MeetingBridgeSupervisor(supervisorOptions)))({
     enabled,
@@ -55,6 +58,9 @@ export function createMeetingBridgeRuntime(options: MeetingBridgeRuntimeOptions)
     // restart. Until an offset can cross that boundary, evidence must stay off
     // for the rest of this meeting instead of attaching wrong speaker names.
     restartBackoff: { initialMs: 250, maximumMs: 5_000, maximumRestarts: 0 },
+    // Permissions often resolve quickly. Bound an unavailable helper so it
+    // cannot delay the capture-ready boundary by the default five seconds.
+    handshakeTimeoutMs: 1_000,
     onEvent: (event) => {
       if (event.type !== 'speaker_evidence' || activeMeetingId !== event.evidence.meetingId) return;
       // The pending-upsert delivery is deliberately best-effort. A bridge
@@ -69,6 +75,8 @@ export function createMeetingBridgeRuntime(options: MeetingBridgeRuntimeOptions)
   });
 
   async function activate(meetingId: string): Promise<boolean> {
+    const pendingWarm = warmingMeetingId === meetingId ? warmPromise : null;
+    if (pendingWarm) await pendingWarm;
     // A cold process changes the native sample origin. Starting it after the
     // renderer graph is connected would make AX evidence worse than no names.
     if (!enabled() || warmedMeetingId !== meetingId) return false;
@@ -92,14 +100,33 @@ export function createMeetingBridgeRuntime(options: MeetingBridgeRuntimeOptions)
     async warm(meetingId: string): Promise<boolean> {
       if (!enabled()) return false;
       if (activeMeetingId && activeMeetingId !== meetingId) return false;
-      try {
-        const ready = await supervisor.warm();
-        warmedMeetingId = ready ? meetingId : null;
-        return ready;
-      } catch {
-        warmedMeetingId = null;
-        return false;
-      }
+      if (warmingMeetingId === meetingId && warmPromise) return warmPromise;
+
+      // Record identity/generation before the await. `stop()` can then
+      // invalidate the attempt while a slow handshake is still resolving.
+      const generation = ++warmGeneration;
+      warmingMeetingId = meetingId;
+      const attempt = Promise.resolve()
+        .then(() => supervisor.warm())
+        .then((ready) => {
+          if (generation !== warmGeneration || warmingMeetingId !== meetingId) return false;
+          warmedMeetingId = ready ? meetingId : null;
+          return ready;
+        })
+        .catch(() => {
+          if (generation === warmGeneration && warmingMeetingId === meetingId) {
+            warmedMeetingId = null;
+          }
+          return false;
+        })
+        .finally(() => {
+          if (generation === warmGeneration && warmingMeetingId === meetingId) {
+            warmingMeetingId = null;
+            warmPromise = null;
+          }
+        });
+      warmPromise = attempt;
+      return attempt;
     },
     captureReady: activate,
     // A self-hosted ASR session restart does not need to tear down healthy
@@ -110,9 +137,14 @@ export function createMeetingBridgeRuntime(options: MeetingBridgeRuntimeOptions)
     },
     async stop(meetingId: string): Promise<void> {
       if (activeMeetingId && activeMeetingId !== meetingId) return;
-      if (!activeMeetingId && warmedMeetingId !== meetingId) return;
+      if (!activeMeetingId && warmedMeetingId !== meetingId && warmingMeetingId !== meetingId) return;
+      ++warmGeneration;
       activeMeetingId = null;
       warmedMeetingId = null;
+      if (warmingMeetingId === meetingId) {
+        warmingMeetingId = null;
+        warmPromise = null;
+      }
       try {
         await supervisor.stop();
       } catch {

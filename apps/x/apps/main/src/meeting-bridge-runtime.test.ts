@@ -17,6 +17,7 @@ class FakeSupervisor {
   startIfReadyCalls: string[] = [];
   stopCalls = 0;
   warmFailure: Error | null = null;
+  warmResult: Promise<boolean> | null = null;
   startIfReadyFailure: Error | null = null;
   onStart: (() => void) | null = null;
 
@@ -25,7 +26,7 @@ class FakeSupervisor {
   async warm(): Promise<boolean> {
     this.warmCalls += 1;
     if (this.warmFailure) throw this.warmFailure;
-    return true;
+    return this.warmResult ?? true;
   }
 
   async startIfReady(meetingId: string): Promise<boolean> {
@@ -54,6 +55,14 @@ function paths(): MeetingBridgePaths {
     isPackaged: false,
     platform: 'darwin',
   };
+}
+
+function deferred<T>() {
+  let resolve: (value: T) => void = () => {};
+  const promise = new Promise<T>((nextResolve) => {
+    resolve = nextResolve;
+  });
+  return { promise, resolve };
 }
 
 test('bridge runtime warms before capture, starts only when ready, keeps a healthy bridge on restart, and forwards only active speaker evidence', async () => {
@@ -184,6 +193,52 @@ test('native warmup failure is silent and captureReady never cold-starts a late 
   assert.deepEqual(supervisor?.startIfReadyCalls, ['meeting-1']);
   await runtime.stop('meeting-1');
   assert.equal(supervisor?.stopCalls, 1);
+});
+
+test('captureReady awaits the already-started warmup and starts exactly once', async () => {
+  let supervisor: FakeSupervisor | undefined;
+  const gate = deferred<boolean>();
+  const runtime = createMeetingBridgeRuntime({
+    paths,
+    enabled: () => true,
+    createSupervisor: (options) => {
+      supervisor = new FakeSupervisor(options);
+      supervisor.warmResult = gate.promise;
+      return supervisor;
+    },
+    applySpeakerEvidence: () => {},
+  });
+
+  const warming = runtime.warm('meeting-1');
+  const ready = runtime.captureReady('meeting-1');
+  assert.deepEqual(supervisor?.startIfReadyCalls, []);
+  gate.resolve(true);
+  assert.equal(await warming, true);
+  assert.equal(await ready, true);
+  assert.deepEqual(supervisor?.startIfReadyCalls, ['meeting-1']);
+});
+
+test('reset cancels an unresolved warmup so it cannot revive a bridge later', async () => {
+  let supervisor: FakeSupervisor | undefined;
+  const gate = deferred<boolean>();
+  const runtime = createMeetingBridgeRuntime({
+    paths,
+    enabled: () => true,
+    createSupervisor: (options) => {
+      supervisor = new FakeSupervisor(options);
+      supervisor.warmResult = gate.promise;
+      return supervisor;
+    },
+    applySpeakerEvidence: () => {},
+  });
+
+  const warming = runtime.warm('meeting-1');
+  await runtime.stop('meeting-1');
+  gate.resolve(true);
+  assert.equal(await warming, false);
+  assert.equal(await runtime.captureReady('meeting-1'), false);
+  assert.equal(supervisor?.stopCalls, 1);
+  assert.deepEqual(supervisor?.startIfReadyCalls, []);
 });
 
 test('reset cleanup stops a warmed helper even when capture never became ready', async () => {
