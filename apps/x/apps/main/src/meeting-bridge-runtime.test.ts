@@ -16,6 +16,7 @@ class FakeSupervisor {
   warmCalls = 0;
   startIfReadyCalls: string[] = [];
   stopCalls = 0;
+  stopped = false;
   warmFailure: Error | null = null;
   warmResult: Promise<boolean> | null = null;
   startIfReadyFailure: Error | null = null;
@@ -25,6 +26,7 @@ class FakeSupervisor {
 
   async warm(): Promise<boolean> {
     this.warmCalls += 1;
+    if (this.stopped) throw new Error('warm invoked after stop');
     if (this.warmFailure) throw this.warmFailure;
     return this.warmResult ?? true;
   }
@@ -38,6 +40,7 @@ class FakeSupervisor {
 
   async stop(): Promise<void> {
     this.stopCalls += 1;
+    this.stopped = true;
   }
 
   maximumRestarts(): number | undefined {
@@ -233,11 +236,13 @@ test('reset cancels an unresolved warmup so it cannot revive a bridge later', as
   });
 
   const warming = runtime.warm('meeting-1');
+  assert.equal(supervisor?.warmCalls, 1);
   await runtime.stop('meeting-1');
   gate.resolve(true);
   assert.equal(await warming, false);
   assert.equal(await runtime.captureReady('meeting-1'), false);
   assert.equal(supervisor?.stopCalls, 1);
+  assert.equal(supervisor?.warmCalls, 1);
   assert.deepEqual(supervisor?.startIfReadyCalls, []);
 });
 

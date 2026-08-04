@@ -106,8 +106,18 @@ export function createMeetingBridgeRuntime(options: MeetingBridgeRuntimeOptions)
       // invalidate the attempt while a slow handshake is still resolving.
       const generation = ++warmGeneration;
       warmingMeetingId = meetingId;
-      const attempt = Promise.resolve()
-        .then(() => supervisor.warm())
+      let requestedWarm: Promise<boolean>;
+      try {
+        // Invoke synchronously before returning. Deferring this call through a
+        // microtask would allow reset/stop to run first, then spawn a helper
+        // after cleanup has already completed.
+        requestedWarm = supervisor.warm();
+      } catch {
+        warmingMeetingId = null;
+        warmedMeetingId = null;
+        return false;
+      }
+      const attempt = requestedWarm
         .then((ready) => {
           if (generation !== warmGeneration || warmingMeetingId !== meetingId) return false;
           warmedMeetingId = ready ? meetingId : null;
