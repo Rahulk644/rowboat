@@ -91,6 +91,7 @@ import { setSelfCaptureActive } from '@x/core/dist/meetings/detector.js';
 import { notifyIfEnabled } from '@x/core/dist/application/notification/notifier.js';
 import { consumePendingToggleMeetingNotes, setTrayRecordingState } from './tray.js';
 import { closeMeetingPopup, getMeetingPopupPayload, handleMeetingPopupAction } from './meeting-popup.js';
+import { selfHostedMeetingTranscription } from './meeting-transcription.js';
 
 // Ambient meeting detection must ignore Rowboat's own mic use: meeting
 // capture and assistant voice/video calls both hold the mic. Either being
@@ -966,6 +967,27 @@ export function setupIpcHandlers() {
       // Recording started through another path — a lingering "Take Notes?"
       // popup is stale now.
       if (args.recording) closeMeetingPopup();
+      return { success: true as const };
+    },
+    'meeting:transcription:getProvider': async () => {
+      return selfHostedMeetingTranscription.getStatus();
+    },
+    'meeting:transcription:begin': async (_event, args) => {
+      await selfHostedMeetingTranscription.begin(args.meetingId, args.language);
+      return { success: true as const };
+    },
+    'meeting:transcription:feed': async (_event, args) => {
+      return selfHostedMeetingTranscription.feed(args.meetingId, args.channel, args.pcmBase64);
+    },
+    'meeting:transcription:finalize': async (_event, args) => {
+      return selfHostedMeetingTranscription.finalize(args.meetingId);
+    },
+    'meeting:transcription:restart': async (_event, args) => {
+      await selfHostedMeetingTranscription.restart(args.meetingId);
+      return { success: true as const };
+    },
+    'meeting:transcription:reset': async (_event, args) => {
+      await selfHostedMeetingTranscription.reset(args.meetingId);
       return { success: true as const };
     },
     'voice:setCallActive': async (_event, args) => {

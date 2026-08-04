@@ -1076,6 +1076,66 @@ const ipcSchemas = {
     req: z.null(),
     res: z.null(),
   },
+  // Self-hosted meeting transcription runs in the Electron main process so
+  // the renderer never receives the worker bearer token. PCM is transported
+  // in bounded base64 batches because it crosses Electron's validated IPC
+  // boundary; the worker itself still receives raw little-endian signed-16.
+  'meeting:transcription:getProvider': {
+    req: z.null(),
+    res: z.object({
+      provider: z.enum(['deepgram', 'self-hosted-nemotron']),
+      configured: z.boolean(),
+      reason: z.string().optional(),
+    }),
+  },
+  'meeting:transcription:begin': {
+    req: z.object({
+      meetingId: z.string().min(1).max(120),
+      language: z.string().min(2).max(12).default('en'),
+    }),
+    res: z.object({ success: z.literal(true) }),
+  },
+  'meeting:transcription:feed': {
+    req: z.object({
+      meetingId: z.string().min(1).max(120),
+      channel: z.enum(['mic', 'system']),
+      pcmBase64: z.string().min(1).max(100_000),
+    }),
+    res: z.object({
+      session: z.string(),
+      full: z.string(),
+      committed: z.string(),
+      tentative: z.string(),
+      changed: z.boolean(),
+      final: z.boolean(),
+      revision: z.number().int().nonnegative(),
+      inputMs: z.number().int().nonnegative(),
+      bufferedMs: z.number().int().nonnegative(),
+    }),
+  },
+  'meeting:transcription:finalize': {
+    req: z.object({ meetingId: z.string().min(1).max(120) }),
+    res: z.object({
+      mic: z.object({
+        session: z.string(), full: z.string(), committed: z.string(), tentative: z.string(),
+        changed: z.boolean(), final: z.boolean(), revision: z.number().int().nonnegative(),
+        inputMs: z.number().int().nonnegative(), bufferedMs: z.number().int().nonnegative(),
+      }),
+      system: z.object({
+        session: z.string(), full: z.string(), committed: z.string(), tentative: z.string(),
+        changed: z.boolean(), final: z.boolean(), revision: z.number().int().nonnegative(),
+        inputMs: z.number().int().nonnegative(), bufferedMs: z.number().int().nonnegative(),
+      }),
+    }),
+  },
+  'meeting:transcription:restart': {
+    req: z.object({ meetingId: z.string().min(1).max(120) }),
+    res: z.object({ success: z.literal(true) }),
+  },
+  'meeting:transcription:reset': {
+    req: z.object({ meetingId: z.string().min(1).max(120) }),
+    res: z.object({ success: z.literal(true) }),
+  },
   // Renderer → main: assistant voice/video call holds the mic — suppresses
   // ambient meeting detection (it would otherwise see our own capture) and
   // runs the global push-to-talk key hook for the duration of the call.
