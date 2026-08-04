@@ -92,6 +92,7 @@ import { notifyIfEnabled } from '@x/core/dist/application/notification/notifier.
 import { consumePendingToggleMeetingNotes, setTrayRecordingState } from './tray.js';
 import { closeMeetingPopup, getMeetingPopupPayload, handleMeetingPopupAction } from './meeting-popup.js';
 import { selfHostedMeetingTranscription } from './meeting-transcription.js';
+import { createMeetingBridgeRuntime, resolveRowboatRepositoryRoot } from './meeting-bridge-runtime.js';
 
 // Ambient meeting detection must ignore Rowboat's own mic use: meeting
 // capture and assistant voice/video calls both hold the mic. Either being
@@ -101,6 +102,20 @@ let voiceCallActive = false;
 function updateSelfCaptureState() {
   setSelfCaptureActive(meetingRecordingActive || voiceCallActive);
 }
+
+// The bridge is strictly opt-in and owns no renderer audio path. It adds
+// trusted, main-process-only speaker observations to the existing session;
+// unavailable native capture therefore cannot prevent meeting transcription.
+const meetingBridgeRuntime = createMeetingBridgeRuntime({
+  paths: () => ({
+    repositoryRoot: resolveRowboatRepositoryRoot(app.getAppPath()),
+    resourcesPath: process.resourcesPath,
+    isPackaged: app.isPackaged,
+  }),
+  applySpeakerEvidence: (meetingId, evidence) => {
+    selfHostedMeetingTranscription.applySpeakerEvidence(meetingId, evidence);
+  },
+});
 import * as composioHandler from './composio-handler.js';
 import * as appsIndexer from '@x/core/dist/apps/indexer.js';
 import * as appsServer from '@x/core/dist/apps/server.js';
@@ -974,20 +989,30 @@ export function setupIpcHandlers() {
     },
     'meeting:transcription:begin': async (_event, args) => {
       await selfHostedMeetingTranscription.begin(args.meetingId, args.language);
+      void meetingBridgeRuntime.begin(args.meetingId);
       return { success: true as const };
     },
     'meeting:transcription:feed': async (_event, args) => {
       return selfHostedMeetingTranscription.feed(args.meetingId, args.channel, args.pcmBase64, args.audio);
     },
     'meeting:transcription:finalize': async (_event, args) => {
-      return selfHostedMeetingTranscription.finalize(args.meetingId);
+      try {
+        return await selfHostedMeetingTranscription.finalize(args.meetingId);
+      } finally {
+        await meetingBridgeRuntime.stop(args.meetingId);
+      }
     },
     'meeting:transcription:restart': async (_event, args) => {
       await selfHostedMeetingTranscription.restart(args.meetingId);
+      void meetingBridgeRuntime.restart(args.meetingId);
       return { success: true as const };
     },
     'meeting:transcription:reset': async (_event, args) => {
-      await selfHostedMeetingTranscription.reset(args.meetingId);
+      try {
+        await selfHostedMeetingTranscription.reset(args.meetingId);
+      } finally {
+        await meetingBridgeRuntime.stop(args.meetingId);
+      }
       return { success: true as const };
     },
     'meeting:transcription:correctSpeaker': async (_event, args) => {
