@@ -101,12 +101,40 @@ type ActiveCandidate = {
   ranges: Array<{ start: number; end: number; confidence: number }>;
 };
 
-function activeCandidates(segment: MeetingTranscriptSegment, evidence: readonly MeetingSpeakerEvidence[]): ActiveCandidate[] {
+function channelAcceptsEvidence(
+  segment: MeetingTranscriptSegment,
+  evidence: MeetingSpeakerEvidence,
+  allowRemoteMicEvidence: boolean,
+): boolean {
+  // A meeting UI's active-speaker signal identifies a participant, not the
+  // renderer audio channel that produced text. Do not let remote UI evidence
+  // rename microphone text merely because it overlaps in time: acoustic
+  // playback can leak into the mic. The one exception is deliberately
+  // unreachable until a qualified AEC/leak detector wires micLeakSuspected.
+  if (segment.channel === 'mic') {
+    return evidence.isSelf === true || allowRemoteMicEvidence;
+  }
+  // Conversely, a self tile is not evidence for mixed remote/system audio.
+  return evidence.isSelf !== true;
+}
+
+function activeCandidates(
+  segment: MeetingTranscriptSegment,
+  evidence: readonly MeetingSpeakerEvidence[],
+  allowRemoteMicEvidence: boolean,
+): ActiveCandidate[] {
   const byParticipant = new Map<string, ActiveCandidate>();
   for (const item of evidence) {
     const name = cleanName(item.displayName);
     const duration = overlapSamples(segment, item);
-    if (!name || !item.isActive || item.isMuted || duration === 0 || !TRUSTED_ACTIVE_SOURCES.has(item.source as TrustedMeetingEvidenceSource)) continue;
+    if (
+      !name
+      || !item.isActive
+      || item.isMuted
+      || duration === 0
+      || !TRUSTED_ACTIVE_SOURCES.has(item.source as TrustedMeetingEvidenceSource)
+      || !channelAcceptsEvidence(segment, item, allowRemoteMicEvidence)
+    ) continue;
     const id = item.participantId?.trim() || `name:${name.toLocaleLowerCase()}`;
     const candidate = byParticipant.get(id) ?? {
       id, name, coverage: 0, weightedCoverage: 0, maxConfidence: 0, sources: new Set<string>(), ranges: [],
@@ -145,8 +173,13 @@ function activeCandidates(segment: MeetingTranscriptSegment, evidence: readonly 
   }).sort((a, b) => b.weightedCoverage - a.weightedCoverage || b.coverage - a.coverage || a.name.localeCompare(b.name));
 }
 
-function activeResolution(segment: MeetingTranscriptSegment, evidence: readonly MeetingSpeakerEvidence[]): SpeakerResolution | null {
-  const candidates = activeCandidates(segment, evidence).filter((candidate) => candidate.coverage >= MIN_ACTIVE_OVERLAP_SAMPLES);
+function activeResolution(
+  segment: MeetingTranscriptSegment,
+  evidence: readonly MeetingSpeakerEvidence[],
+  allowRemoteMicEvidence: boolean,
+): SpeakerResolution | null {
+  const candidates = activeCandidates(segment, evidence, allowRemoteMicEvidence)
+    .filter((candidate) => candidate.coverage >= MIN_ACTIVE_OVERLAP_SAMPLES);
   if (!candidates.length) return null;
   const [winner, runnerUp] = candidates;
   if (!runnerUp || winner.weightedCoverage >= runnerUp.weightedCoverage * DOMINANCE_RATIO) {
@@ -218,7 +251,9 @@ export function resolveMeetingSpeaker(segment: MeetingTranscriptSegment, input: 
     };
   }
 
-  const ax = activeResolution(segment, input.evidence ?? []);
+  // `micLeakSuspected` is intentionally not inferred from UI state. It must
+  // only be supplied by a future measured playback-leak detector.
+  const ax = activeResolution(segment, input.evidence ?? [], input.micLeakSuspected === true);
   // A measured leaked-mic case is the one exception to the normal mic-first
   // order: direct, dominant remote AX evidence is safer than labelling remote
   // playback as the user.

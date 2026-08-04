@@ -38,6 +38,43 @@ test('qualified microphone resolves to You without Calendar or roster identity',
   assert.equal(resolution.attributionSource, 'qualified-mic');
 });
 
+test('remote AX evidence cannot relabel microphone text without a measured leak signal', () => {
+  const resolution = resolveMeetingSpeaker(segment({ channel: 'mic' }), {
+    evidence: [{
+      source: 'zoom_ax', participantId: 'parminder', displayName: 'Parminder', isSelf: false,
+      isActive: true, startSample: 0, endSample: 16_000, confidence: 1,
+    }],
+  });
+  assert.equal(resolution.speaker.kind, 'unknown');
+  assert.equal(resolution.attributionSource, 'unresolved');
+});
+
+test('self AX evidence can label microphone text but cannot label system text', () => {
+  const evidence = [{
+    source: 'zoom_ax', participantId: 'rahul', displayName: 'Rahul', isSelf: true,
+    isActive: true, startSample: 0, endSample: 16_000, confidence: 1,
+  }] as const;
+  const mic = resolveMeetingSpeaker(segment({ channel: 'mic' }), { evidence: [...evidence] });
+  assert.deepEqual(mic.speaker, { kind: 'named', id: 'rahul', displayName: 'Rahul' });
+  assert.equal(mic.attributionSource, 'zoom_ax');
+
+  const system = resolveMeetingSpeaker(segment(), { evidence: [...evidence] });
+  assert.equal(system.speaker.kind, 'unknown');
+  assert.equal(system.attributionSource, 'unresolved');
+});
+
+test('remote AX can label microphone text only after a measured leak signal', () => {
+  const resolution = resolveMeetingSpeaker(segment({ channel: 'mic' }), {
+    micLeakSuspected: true,
+    evidence: [{
+      source: 'zoom_ax', participantId: 'parminder', displayName: 'Parminder', isSelf: false,
+      isActive: true, startSample: 0, endSample: 16_000, confidence: 1,
+    }],
+  });
+  assert.deepEqual(resolution.speaker, { kind: 'named', id: 'parminder', displayName: 'Parminder' });
+  assert.equal(resolution.attributionSource, 'zoom_ax');
+});
+
 test('dominant trusted AX active-speaker evidence requires 200ms and a 1.25 lead', () => {
   const resolution = resolveMeetingSpeaker(segment(), {
     evidence: [
