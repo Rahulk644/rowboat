@@ -164,3 +164,76 @@ test('a discontinuity resets only its worker session and starts a non-duplicatin
   assert.equal(correction?.revision, 1);
   assert.equal(correction?.speaker.displayName, 'Akbar');
 });
+
+test('main-process evidence batch names distinct intervals, preserves overlap, and ignores rosters', async (t) => {
+  const originalUrl = process.env.ROWBOAT_MEETING_STT_URL;
+  const originalToken = process.env.ROWBOAT_MEETING_STT_TOKEN;
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    if (originalUrl === undefined) delete process.env.ROWBOAT_MEETING_STT_URL;
+    else process.env.ROWBOAT_MEETING_STT_URL = originalUrl;
+    if (originalToken === undefined) delete process.env.ROWBOAT_MEETING_STT_TOKEN;
+    else process.env.ROWBOAT_MEETING_STT_TOKEN = originalToken;
+    globalThis.fetch = originalFetch;
+  });
+  process.env.ROWBOAT_MEETING_STT_TOKEN = TOKEN;
+  process.env.ROWBOAT_MEETING_STT_URL = 'http://127.0.0.1:18091';
+
+  const committed = [
+    'first remote',
+    'first remote second remote',
+    'first remote second remote overlap words',
+    'first remote second remote overlap words roster words',
+  ];
+  let systemFeed = 0;
+  globalThis.fetch = async (input) => {
+    const url = new URL(input.toString());
+    const session = url.searchParams.get('session') ?? '';
+    if (url.pathname === '/stream/feed') {
+      const text = session.endsWith('.system') ? committed[systemFeed++]! : '';
+      return new Response(JSON.stringify({
+        session, full: text, committed: text, tentative: '', changed: true,
+        final: false, revision: systemFeed, inputMs: 0, bufferedMs: 0,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({ ok: true, session }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  };
+
+  const provider = new SelfHostedMeetingTranscription();
+  await provider.begin('speaker evidence', 'en');
+  const pcm = Buffer.alloc(32_000).toString('base64');
+  for (let index = 0; index < committed.length; index++) {
+    await provider.feed('speaker evidence', 'system', pcm, {
+      startSample: index * 16_000,
+      sampleCount: 16_000,
+      sampleRate: 16_000,
+      sequence: index,
+    });
+  }
+
+  const firstTwo = provider.applySpeakerEvidence('speaker evidence', [
+    { source: 'zoom_ax', participantId: 'akbar', displayName: 'Akbar', isActive: true, startSample: 0, endSample: 16_000, confidence: 1 },
+    { source: 'zoom_ax', participantId: 'parminder', displayName: 'Parminder', isActive: true, startSample: 16_000, endSample: 32_000, confidence: 1 },
+  ]);
+  assert.deepEqual(firstTwo.segments.map((item) => item.speaker.displayName), ['Akbar', 'Parminder']);
+  assert.deepEqual(firstTwo.segments.map((item) => item.revision), [1, 1]);
+  const corrected = provider.correctSpeaker('speaker evidence', firstTwo.segments[0]!.segmentId, 'Akbar confirmed', false);
+  assert.equal(corrected?.revision, 2);
+  const correctionWins = provider.applySpeakerEvidence('speaker evidence', [
+    { source: 'zoom_ax', participantId: 'parminder', displayName: 'Parminder', isActive: true, startSample: 0, endSample: 16_000, confidence: 1 },
+  ]);
+  assert.deepEqual(correctionWins, { segments: [] });
+
+  const overlap = provider.applySpeakerEvidence('speaker evidence', [
+    { source: 'zoom_ax', participantId: 'akbar', displayName: 'Akbar', isActive: true, startSample: 32_000, endSample: 48_000, confidence: 1 },
+    { source: 'zoom_ax', participantId: 'parminder', displayName: 'Parminder', isActive: true, startSample: 32_000, endSample: 48_000, confidence: 1 },
+  ]);
+  assert.equal(overlap.segments.length, 1);
+  assert.equal(overlap.segments[0]?.overlap, true);
+  assert.deepEqual(overlap.segments[0]?.speaker, { kind: 'unknown', displayName: 'Akbar + Parminder' });
+
+  const rosterOnly = provider.applySpeakerEvidence('speaker evidence', [
+    { source: 'zoom_ax', participantId: 'roster', displayName: 'Roster only', isActive: false, startSample: 48_000, endSample: 64_000, confidence: 1 },
+  ]);
+  assert.deepEqual(rosterOnly, { segments: [] });
+});

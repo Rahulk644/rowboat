@@ -1,4 +1,9 @@
 import { z } from 'zod';
+import {
+  resolveMeetingSpeakerUpsert,
+  type ConfirmedVoiceProfileMatch,
+  type MeetingSpeakerEvidence,
+} from './meeting-speaker-resolver.js';
 
 export type MeetingAudioChannel = 'mic' | 'system';
 export type MeetingAudioFeedFlag = 'discontinuity' | 'recovered' | 'silence';
@@ -89,6 +94,15 @@ export type MeetingTranscriptionSnapshot = {
   feed?: MeetingAudioFeed;
   captureHealth: MeetingCaptureHealth;
   segments: MeetingTranscriptSegment[];
+};
+
+/** Inputs a future bridge can submit after normalizing AX/diarization data. */
+export type SpeakerEvidenceApplicationOptions = {
+  voiceProfilesBySegment?: Readonly<Record<string, ConfirmedVoiceProfileMatch | undefined>>;
+  stableClusterIdsBySegment?: Readonly<Record<string, readonly string[] | undefined>>;
+  playbackReferenceHealthy?: boolean;
+  outputRouteIsolated?: boolean;
+  micLeakSuspected?: boolean;
 };
 
 type WorkerSnapshot = Omit<MeetingTranscriptionSnapshot, 'version' | 'epoch' | 'feed' | 'captureHealth' | 'segments'>;
@@ -360,6 +374,50 @@ export class SelfHostedMeetingTranscription {
     active.corrections.set(segmentIdValue, { displayName: name, rememberVoice });
     active.segments.set(segmentIdValue, corrected);
     return corrected;
+  }
+
+  /**
+   * Applies one bounded batch of normalized speaker evidence. This is a
+   * main-process seam for the Rust bridge: it has no renderer/IPC dependency,
+   * and it emits only higher-revision canonical segment upserts.
+   */
+  applySpeakerEvidence(
+    meetingId: string,
+    evidence: readonly MeetingSpeakerEvidence[],
+    options: SpeakerEvidenceApplicationOptions = {},
+  ): { segments: MeetingTranscriptSegment[] } {
+    const active = this.requireActive(meetingId);
+    const updated: MeetingTranscriptSegment[] = [];
+    for (const segment of active.segments.values()) {
+      const segmentEvidence = evidence.filter((item) => (
+        item.endSample > segment.startSample && item.startSample < segment.endSample
+      ));
+      const voiceProfile = options.voiceProfilesBySegment?.[segment.segmentId];
+      const stableClusterIds = options.stableClusterIdsBySegment?.[segment.segmentId];
+      // Do not touch unrelated historical records when a bridge batch covers
+      // another interval. A remembered explicit correction remains in the
+      // resolver input for the intervals that are re-evaluated.
+      if (!segmentEvidence.length && !voiceProfile && !stableClusterIds) continue;
+      const correction = active.corrections.get(segment.segmentId);
+      const upsert = resolveMeetingSpeakerUpsert(segment, {
+        correction: correction ? { displayName: correction.displayName } : undefined,
+        micHealth: active.channels[segment.channel].health,
+        playbackReferenceHealthy: options.playbackReferenceHealthy,
+        outputRouteIsolated: options.outputRouteIsolated,
+        micLeakSuspected: options.micLeakSuspected,
+        evidence: segmentEvidence,
+        voiceProfile,
+        stableClusterIds: stableClusterIds ? [...stableClusterIds] : undefined,
+      });
+      if (!upsert) continue;
+      active.segments.set(upsert.segmentId, upsert);
+      updated.push(upsert);
+    }
+    return {
+      segments: updated.sort((a, b) => (
+        a.epoch - b.epoch || a.startSample - b.startSample || a.segmentId.localeCompare(b.segmentId)
+      )),
+    };
   }
 
   async reset(meetingId: string): Promise<void> {

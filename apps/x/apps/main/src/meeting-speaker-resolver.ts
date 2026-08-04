@@ -244,6 +244,11 @@ export function resolveMeetingSpeakerUpsert(
   input: SpeakerResolutionInput,
 ): MeetingTranscriptSegment | null {
   const resolution = resolveMeetingSpeaker(segment, input);
+  // A batch that contains only passive roster/stale/unqualified evidence is
+  // not evidence to erase or rewrite an existing attribution. It also must
+  // not churn the default unknown `self-hosted-feed-window` placeholder into
+  // a different unknown source on every polling pass.
+  if (resolution.attributionSource === 'unresolved') return null;
   if (
     sameSpeaker(segment.speaker, resolution.speaker)
     && segment.overlap === resolution.overlap
