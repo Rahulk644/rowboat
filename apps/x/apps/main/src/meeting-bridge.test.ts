@@ -173,6 +173,37 @@ test('main supervisor uses private stdio, completes handshake, and exposes metad
   await supervisor.stop();
 });
 
+test('warm handshakes without Start and startIfReady never cold-spawns', async () => {
+  const child = new FakeBridgeChild();
+  let spawnCount = 0;
+  const supervisor = new MeetingBridgeSupervisor({
+    enabled: () => true,
+    resolveBinary: () => '/approved/meeting-bridge',
+    spawn: () => {
+      spawnCount += 1;
+      return child.asChild();
+    },
+  });
+
+  const warming = supervisor.warm();
+  child.emitReady();
+  assert.equal(await warming, true);
+  assert.deepEqual(child.commands, []);
+  assert.equal(await supervisor.startIfReady('meeting A'), true);
+  assert.deepEqual(child.commands, [{ type: 'start', meeting_id: 'meeting-A' }]);
+
+  const cold = new MeetingBridgeSupervisor({
+    enabled: () => true,
+    resolveBinary: () => '/approved/meeting-bridge',
+    spawn: () => {
+      spawnCount += 1;
+      return child.asChild();
+    },
+  });
+  assert.equal(await cold.startIfReady('meeting B'), false);
+  assert.equal(spawnCount, 1);
+});
+
 test('malformed or PCM-bearing events are rejected and a closed bridge is recycled with bounded backoff', async (t) => {
   const children: FakeBridgeChild[] = [];
   const supervisor = new MeetingBridgeSupervisor({

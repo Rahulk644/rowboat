@@ -1161,6 +1161,13 @@ const ipcSchemas = {
     }),
     res: z.object({ success: z.literal(true) }),
   },
+  // Sent after the renderer has prepared both sources and its processor but
+  // immediately before it connects the graph. This starts an already-warm
+  // helper at the same sample origin rather than after capture has advanced.
+  'meeting:transcription:captureReady': {
+    req: z.object({ meetingId: z.string().min(1).max(120) }),
+    res: z.object({ success: z.literal(true) }),
+  },
   'meeting:transcription:feed': {
     req: z.object({
       meetingId: z.string().min(1).max(120),

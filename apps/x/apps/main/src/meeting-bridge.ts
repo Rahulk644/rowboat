@@ -236,6 +236,48 @@ export class MeetingBridgeSupervisor {
     return true;
   }
 
+  /**
+   * Start and handshake the helper before renderer capture begins. Warming is
+   * deliberately not a capture command: it has no meeting id and cannot emit
+   * attribution evidence.
+   */
+  async warm(): Promise<boolean> {
+    if (!this.enabled()) {
+      this.setStatus({ state: 'disabled', restartCount: 0 });
+      return false;
+    }
+    try {
+      await this.ensureReady();
+      return true;
+    } catch {
+      // Alpha capture keeps the existing path authoritative. Do not schedule
+      // a later cold start whose sample origin would no longer match audio.
+      return false;
+    }
+  }
+
+  /**
+   * Send Start only to the already-handshaken helper. Unlike `start()`, this
+   * refuses to spawn: renderer capture must not wait for a late native child.
+   */
+  async startIfReady(meetingId: string): Promise<boolean> {
+    if (!this.enabled()) {
+      this.setStatus({ state: 'disabled', restartCount: 0 });
+      return false;
+    }
+    if (!this.child || this.status.state !== 'ready') return false;
+    const normalizedMeetingId = safeMeetingId(meetingId);
+    try {
+      await this.writeCommand({ type: 'start', meeting_id: normalizedMeetingId });
+      this.desiredMeetingId = normalizedMeetingId;
+      return true;
+    } catch {
+      // The child may have died between the readiness check and this write.
+      // Preserve current capture rather than permitting a replacement spawn.
+      return false;
+    }
+  }
+
   async stop(): Promise<void> {
     const meetingId = this.desiredMeetingId;
     this.desiredMeetingId = null;

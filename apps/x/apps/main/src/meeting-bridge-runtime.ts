@@ -17,7 +17,7 @@ import type { MeetingSpeakerEvidence } from './meeting-speaker-resolver.js';
  * and self-hosted transcription sessions continue normally.
  */
 
-export type BridgeLifecycleSupervisor = Pick<MeetingBridgeSupervisor, 'start' | 'stop'>;
+export type BridgeLifecycleSupervisor = Pick<MeetingBridgeSupervisor, 'warm' | 'startIfReady' | 'stop'>;
 
 export type MeetingBridgeRuntimeOptions = {
   paths: () => MeetingBridgePaths;
@@ -30,7 +30,8 @@ export type MeetingBridgeRuntimeOptions = {
 };
 
 export type MeetingBridgeRuntime = {
-  begin(meetingId: string): Promise<boolean>;
+  warm(meetingId: string): Promise<boolean>;
+  captureReady(meetingId: string): Promise<boolean>;
   restart(meetingId: string): Promise<boolean>;
   stop(meetingId: string): Promise<void>;
 };
@@ -45,6 +46,7 @@ export function resolveRowboatRepositoryRoot(appPath: string): string {
 export function createMeetingBridgeRuntime(options: MeetingBridgeRuntimeOptions): MeetingBridgeRuntime {
   const enabled = options.enabled ?? isMeetingBridgeEnabled;
   let activeMeetingId: string | null = null;
+  let warmedMeetingId: string | null = null;
 
   const supervisor = (options.createSupervisor ?? ((supervisorOptions) => new MeetingBridgeSupervisor(supervisorOptions)))({
     enabled,
@@ -63,7 +65,9 @@ export function createMeetingBridgeRuntime(options: MeetingBridgeRuntimeOptions)
   });
 
   async function activate(meetingId: string): Promise<boolean> {
-    if (!enabled()) return false;
+    // A cold process changes the native sample origin. Starting it after the
+    // renderer graph is connected would make AX evidence worse than no names.
+    if (!enabled() || warmedMeetingId !== meetingId) return false;
     if (activeMeetingId === meetingId) return true;
     const previousMeetingId = activeMeetingId;
     // Set the filter before Start is sent. A fast native helper can emit
@@ -71,7 +75,7 @@ export function createMeetingBridgeRuntime(options: MeetingBridgeRuntimeOptions)
     // observation must not be dropped while `start()` is awaiting its write.
     activeMeetingId = meetingId;
     try {
-      const started = await supervisor.start(meetingId);
+      const started = await supervisor.startIfReady(meetingId);
       if (!started) activeMeetingId = previousMeetingId;
       return started;
     } catch {
@@ -81,14 +85,30 @@ export function createMeetingBridgeRuntime(options: MeetingBridgeRuntimeOptions)
   }
 
   return {
-    begin: activate,
+    async warm(meetingId: string): Promise<boolean> {
+      if (!enabled()) return false;
+      if (activeMeetingId && activeMeetingId !== meetingId) return false;
+      try {
+        const ready = await supervisor.warm();
+        warmedMeetingId = ready ? meetingId : null;
+        return ready;
+      } catch {
+        warmedMeetingId = null;
+        return false;
+      }
+    },
+    captureReady: activate,
     // A self-hosted ASR session restart does not need to tear down healthy
     // native capture. An active matching bridge is deliberately left running;
-    // its own bounded supervisor handles a crashed helper.
-    restart: activate,
+    // a failed/late initial Start must never create an offset sidecar later.
+    async restart(meetingId: string): Promise<boolean> {
+      return activeMeetingId === meetingId;
+    },
     async stop(meetingId: string): Promise<void> {
-      if (activeMeetingId !== meetingId) return;
+      if (activeMeetingId && activeMeetingId !== meetingId) return;
+      if (!activeMeetingId && warmedMeetingId !== meetingId) return;
       activeMeetingId = null;
+      warmedMeetingId = null;
       try {
         await supervisor.stop();
       } catch {

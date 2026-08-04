@@ -13,16 +13,24 @@ import type {
 } from './meeting-bridge.js';
 
 class FakeSupervisor {
-  startCalls: string[] = [];
+  warmCalls = 0;
+  startIfReadyCalls: string[] = [];
   stopCalls = 0;
-  startFailure: Error | null = null;
+  warmFailure: Error | null = null;
+  startIfReadyFailure: Error | null = null;
   onStart: (() => void) | null = null;
 
   constructor(private readonly options: MeetingBridgeSupervisorOptions) {}
 
-  async start(meetingId: string): Promise<boolean> {
-    this.startCalls.push(meetingId);
-    if (this.startFailure) throw this.startFailure;
+  async warm(): Promise<boolean> {
+    this.warmCalls += 1;
+    if (this.warmFailure) throw this.warmFailure;
+    return true;
+  }
+
+  async startIfReady(meetingId: string): Promise<boolean> {
+    this.startIfReadyCalls.push(meetingId);
+    if (this.startIfReadyFailure) throw this.startIfReadyFailure;
     this.onStart?.();
     return true;
   }
@@ -44,7 +52,7 @@ function paths(): MeetingBridgePaths {
   };
 }
 
-test('bridge runtime starts after transcription, keeps a healthy bridge on restart, stops, and forwards only active speaker evidence', async () => {
+test('bridge runtime warms before capture, starts only when ready, keeps a healthy bridge on restart, and forwards only active speaker evidence', async () => {
   let supervisor: FakeSupervisor | undefined;
   const applied: Array<{
     meetingId: string;
@@ -67,10 +75,12 @@ test('bridge runtime starts after transcription, keeps a healthy bridge on resta
     },
   });
 
-  assert.equal(await runtime.begin('meeting-1'), true);
-  assert.deepEqual(supervisor?.startCalls, ['meeting-1']);
+  assert.equal(await runtime.warm('meeting-1'), true);
+  assert.equal(supervisor?.warmCalls, 1);
+  assert.equal(await runtime.captureReady('meeting-1'), true);
+  assert.deepEqual(supervisor?.startIfReadyCalls, ['meeting-1']);
   assert.equal(await runtime.restart('meeting-1'), true);
-  assert.deepEqual(supervisor?.startCalls, ['meeting-1']);
+  assert.deepEqual(supervisor?.startIfReadyCalls, ['meeting-1']);
 
   supervisor?.emit({
     type: 'audio_frame',
@@ -139,19 +149,20 @@ test('speaker evidence emitted during native Start is not lost before start reso
     },
   });
 
-  assert.equal(await runtime.begin('meeting-1'), true);
+  assert.equal(await runtime.warm('meeting-1'), true);
+  assert.equal(await runtime.captureReady('meeting-1'), true);
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(applied, ['Akbar']);
 });
 
-test('native bridge startup failure is silent and does not block the existing transcription lifecycle', async () => {
+test('native warmup failure is silent and captureReady never cold-starts a late helper', async () => {
   let supervisor: FakeSupervisor | undefined;
   const runtime = createMeetingBridgeRuntime({
     paths,
     enabled: () => true,
     createSupervisor: (options) => {
       supervisor = new FakeSupervisor(options);
-      supervisor.startFailure = new Error('native capture unavailable');
+      supervisor.warmFailure = new Error('native capture unavailable');
       return supervisor;
     },
     applySpeakerEvidence: () => {
@@ -159,11 +170,30 @@ test('native bridge startup failure is silent and does not block the existing tr
     },
   });
 
-  assert.equal(await runtime.begin('meeting-1'), false);
-  assert.deepEqual(supervisor?.startCalls, ['meeting-1']);
-  supervisor!.startFailure = null;
-  assert.equal(await runtime.restart('meeting-1'), true);
-  assert.deepEqual(supervisor?.startCalls, ['meeting-1', 'meeting-1']);
+  assert.equal(await runtime.warm('meeting-1'), false);
+  assert.equal(await runtime.captureReady('meeting-1'), false);
+  assert.deepEqual(supervisor?.startIfReadyCalls, []);
+  supervisor!.warmFailure = null;
+  assert.equal(await runtime.warm('meeting-1'), true);
+  assert.equal(await runtime.captureReady('meeting-1'), true);
+  assert.deepEqual(supervisor?.startIfReadyCalls, ['meeting-1']);
+  await runtime.stop('meeting-1');
+  assert.equal(supervisor?.stopCalls, 1);
+});
+
+test('reset cleanup stops a warmed helper even when capture never became ready', async () => {
+  let supervisor: FakeSupervisor | undefined;
+  const runtime = createMeetingBridgeRuntime({
+    paths,
+    enabled: () => true,
+    createSupervisor: (options) => {
+      supervisor = new FakeSupervisor(options);
+      return supervisor;
+    },
+    applySpeakerEvidence: () => {},
+  });
+
+  assert.equal(await runtime.warm('meeting-1'), true);
   await runtime.stop('meeting-1');
   assert.equal(supervisor?.stopCalls, 1);
 });
@@ -180,10 +210,12 @@ test('disabled bridge never starts a native helper', async () => {
     applySpeakerEvidence: () => {},
   });
 
-  assert.equal(await runtime.begin('meeting-1'), false);
+  assert.equal(await runtime.warm('meeting-1'), false);
+  assert.equal(await runtime.captureReady('meeting-1'), false);
   assert.equal(await runtime.restart('meeting-1'), false);
   await runtime.stop('meeting-1');
-  assert.deepEqual(supervisor?.startCalls, []);
+  assert.equal(supervisor?.warmCalls, 0);
+  assert.deepEqual(supervisor?.startIfReadyCalls, []);
   assert.equal(supervisor?.stopCalls, 0);
 });
 

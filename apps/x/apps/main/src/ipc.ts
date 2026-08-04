@@ -99,6 +99,10 @@ import { createMeetingBridgeRuntime, resolveRowboatRepositoryRoot } from './meet
 // active suppresses "Meeting detected" prompts.
 let meetingRecordingActive = false;
 let voiceCallActive = false;
+// A successfully opened self-hosted session warms the native helper before
+// capture. It can start only when the renderer reports its graph is prepared,
+// anchoring both sample clocks at the same instant.
+const bridgeEligibleMeetings = new Set<string>();
 function updateSelfCaptureState() {
   setSelfCaptureActive(meetingRecordingActive || voiceCallActive);
 }
@@ -989,7 +993,14 @@ export function setupIpcHandlers() {
     },
     'meeting:transcription:begin': async (_event, args) => {
       await selfHostedMeetingTranscription.begin(args.meetingId, args.language);
-      void meetingBridgeRuntime.begin(args.meetingId);
+      bridgeEligibleMeetings.add(args.meetingId);
+      void meetingBridgeRuntime.warm(args.meetingId);
+      return { success: true as const };
+    },
+    'meeting:transcription:captureReady': async (_event, args) => {
+      if (bridgeEligibleMeetings.has(args.meetingId)) {
+        await meetingBridgeRuntime.captureReady(args.meetingId);
+      }
       return { success: true as const };
     },
     'meeting:transcription:feed': async (_event, args) => {
@@ -999,12 +1010,15 @@ export function setupIpcHandlers() {
       try {
         return await selfHostedMeetingTranscription.finalize(args.meetingId);
       } finally {
+        bridgeEligibleMeetings.delete(args.meetingId);
         await meetingBridgeRuntime.stop(args.meetingId);
       }
     },
     'meeting:transcription:restart': async (_event, args) => {
       await selfHostedMeetingTranscription.restart(args.meetingId);
-      void meetingBridgeRuntime.restart(args.meetingId);
+      if (bridgeEligibleMeetings.has(args.meetingId)) {
+        void meetingBridgeRuntime.restart(args.meetingId);
+      }
       return { success: true as const };
     },
     'meeting:transcription:restartChannel': async (_event, args) => {
@@ -1015,6 +1029,7 @@ export function setupIpcHandlers() {
       try {
         await selfHostedMeetingTranscription.reset(args.meetingId);
       } finally {
+        bridgeEligibleMeetings.delete(args.meetingId);
         await meetingBridgeRuntime.stop(args.meetingId);
       }
       return { success: true as const };
