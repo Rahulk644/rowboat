@@ -6538,15 +6538,16 @@ function App() {
             const calendarEventJson = calEventMatch?.[1]?.replace(/''/g, "'")
             const { notes } = await window.ipc.invoke('meeting:summarize', { transcript: fileContent, meetingStartTime, calendarEventJson })
             if (notes) {
-              // Prepend meeting notes above the existing transcript block
+              // Prepend generated notes without reconstructing the meeting
+              // document.  The live transcript owns only its transcript-v2
+              // fence and people may have added a scratchpad above or below
+              // it while capture was running.
               const { raw: fm, body } = splitFrontmatter(fileContent)
               const fmTitleMatch = fileContent.match(/^title:\s*(.+)$/m)
               const noteTitle = fmTitleMatch?.[1]?.trim() || 'Meeting Notes'
               const cleanedNotes = notes.replace(/^#{1,2}\s+.+\n+/, '')
-              // Extract the existing transcript block and preserve it as-is
-              const transcriptBlockMatch = body.match(/(```transcript\n[\s\S]*?\n```)/)
-              const transcriptBlock = transcriptBlockMatch?.[1] || ''
-              const newBody = `# ${noteTitle}\n\n` + cleanedNotes + (transcriptBlock ? '\n\n' + transcriptBlock : '')
+              const existingBody = body.replace(/^#\s+[^\n]+\n+/, '')
+              const newBody = `# ${noteTitle}\n\n${cleanedNotes.trim()}\n\n${existingBody.trimStart()}`.trimEnd() + '\n'
               const newContent = fm ? `${fm}\n${newBody}` : newBody
               await window.ipc.invoke('workspace:writeFile', {
                 path: notePath,

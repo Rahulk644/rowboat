@@ -1,74 +1,118 @@
 import { mergeAttributes, Node } from '@tiptap/react'
 import { ReactNodeViewRenderer, NodeViewWrapper } from '@tiptap/react'
-import { ChevronDown, FileText } from 'lucide-react'
+import { Check, ChevronDown, FileText, Pencil, X } from 'lucide-react'
 import { blocks } from '@x/shared'
-import { useState, useMemo } from 'react'
+import { useMemo, useState } from 'react'
+import {
+  applyTranscriptSegmentRevisions,
+  normalizeTranscriptSegments,
+  parseTranscriptV2Block,
+  publishTranscriptSegmentRevisions,
+  type SpeakerCorrectionRequest,
+  type TranscriptFinality,
+  type TranscriptSpeaker,
+} from '@/lib/meeting-transcript-v2'
 
 interface TranscriptEntry {
-  speaker: string
+  segmentId?: string
+  meetingId?: string
+  speaker: TranscriptSpeaker
   text: string
+  overlap: boolean
+  finality: TranscriptFinality
 }
 
-function parseTranscript(raw: string): TranscriptEntry[] {
+function parseLegacyTranscript(raw: string): TranscriptEntry[] {
   const entries: TranscriptEntry[] = []
   const lines = raw.split('\n')
   for (const line of lines) {
     const trimmed = line.trim()
     if (!trimmed) continue
-    // Match **Speaker Name:** text or **You:** text
     const match = trimmed.match(/^\*\*(.+?):\*\*\s*(.*)$/)
     if (match) {
-      entries.push({ speaker: match[1], text: match[2] })
+      entries.push({
+        speaker: { kind: 'unknown', displayName: match[1] },
+        text: match[2],
+        overlap: false,
+        finality: 'final',
+      })
     } else if (entries.length > 0) {
-      // Continuation line — append to last entry
-      entries[entries.length - 1].text += ' ' + trimmed
+      entries[entries.length - 1].text += ` ${trimmed}`
     }
   }
   return entries
 }
 
+function parseTranscript(raw: string): TranscriptEntry[] {
+  const v2 = parseTranscriptV2Block(raw)
+  if (v2) {
+    return v2.segments.map(segment => ({
+      segmentId: segment.segmentId,
+      meetingId: segment.meetingId,
+      speaker: segment.speaker,
+      text: segment.text,
+      overlap: segment.overlap,
+      finality: segment.finality,
+    }))
+  }
+
+  try {
+    const legacy = blocks.TranscriptBlockSchema.parse(JSON.parse(raw))
+    return parseLegacyTranscript(legacy.transcript)
+  } catch {
+    return []
+  }
+}
+
 function speakerColor(speaker: string): string {
-  // Simple hash to pick a consistent color per speaker
   let hash = 0
   for (let i = 0; i < speaker.length; i++) {
     hash = speaker.charCodeAt(i) + ((hash << 5) - hash)
   }
-  const colors = [
-    '#3b82f6',  // blue
-    '#06b6d4',  // cyan
-    '#6366f1',  // indigo
-    '#8b5cf6',  // purple
-    '#0ea5e9',  // sky
-    '#2563eb',  // blue darker
-    '#7c3aed',  // violet
-  ]
+  const colors = ['#3b82f6', '#06b6d4', '#6366f1', '#8b5cf6', '#0ea5e9', '#2563eb', '#7c3aed']
   return colors[Math.abs(hash) % colors.length]
 }
 
-function TranscriptBlockView({ node, getPos, editor }: {
+/**
+ * The renderer has no identity authority. This narrow IPC boundary submits a
+ * meeting-local correction to the bridge, which records the evidence and may
+ * return a higher segment revision. The optional profile checkbox remains off
+ * until the person explicitly opts in.
+ */
+async function submitSpeakerCorrection(request: SpeakerCorrectionRequest): Promise<unknown> {
+  type CorrectionIpc = {
+    invoke(channel: 'meeting:transcription:correctSpeaker', args: SpeakerCorrectionRequest): Promise<unknown>
+  }
+  return (window.ipc as unknown as CorrectionIpc).invoke('meeting:transcription:correctSpeaker', request)
+}
+
+function correctionSegments(value: unknown) {
+  const direct = normalizeTranscriptSegments(value)
+  if (direct.length > 0) return direct
+  if (typeof value === 'object' && value !== null && 'segment' in value) {
+    return normalizeTranscriptSegments((value as { segment: unknown }).segment)
+  }
+  return []
+}
+
+function TranscriptBlockView({ node, getPos, editor, updateAttributes }: {
   node: { attrs: Record<string, unknown> }
   getPos: () => number | undefined
+  updateAttributes: (attrs: Record<string, unknown>) => void
+  // TipTap's NodeView editor type is intentionally broad at this boundary.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   editor: any
 }) {
   const raw = node.attrs.data as string
-  let config: blocks.TranscriptBlock | null = null
+  const entries = useMemo(() => parseTranscript(raw), [raw])
+  const isV2 = useMemo(() => parseTranscriptV2Block(raw) !== null, [raw])
 
-  try {
-    config = blocks.TranscriptBlockSchema.parse(JSON.parse(raw))
-  } catch {
-    // fallback below
-  }
-
-  // Auto-detect: expand if this is the first real block (live recording),
-  // collapse if there's other content above (notes have been generated)
   const isFirstBlock = useMemo(() => {
     try {
       const pos = getPos()
       if (pos === undefined) return false
       const firstChild = editor?.state?.doc?.firstChild
       if (!firstChild) return true
-      // If the transcript block is right after the first node (heading), it's the main content
       return pos <= (firstChild.nodeSize ?? 0) + 1
     } catch {
       return false
@@ -76,13 +120,50 @@ function TranscriptBlockView({ node, getPos, editor }: {
   }, [getPos, editor])
 
   const [expanded, setExpanded] = useState(isFirstBlock)
+  const [editingSegmentId, setEditingSegmentId] = useState<string | null>(null)
+  const [displayName, setDisplayName] = useState('')
+  const [rememberVoice, setRememberVoice] = useState(false)
+  const [correctionError, setCorrectionError] = useState<string | null>(null)
+  const [saving, setSaving] = useState(false)
 
-  const entries = useMemo(() => {
-    if (!config) return []
-    return parseTranscript(config.transcript)
-  }, [config])
+  const startCorrection = (entry: TranscriptEntry) => {
+    if (!entry.segmentId) return
+    setEditingSegmentId(entry.segmentId)
+    setDisplayName(entry.speaker.displayName === 'Unknown speaker' ? '' : entry.speaker.displayName)
+    setRememberVoice(false)
+    setCorrectionError(null)
+  }
 
-  if (!config) {
+  const saveCorrection = async (entry: TranscriptEntry) => {
+    const nextName = displayName.trim()
+    if (!entry.segmentId || !nextName) return
+    setSaving(true)
+    setCorrectionError(null)
+    try {
+      const result = await submitSpeakerCorrection({
+        meetingId: entry.meetingId,
+        segmentId: entry.segmentId,
+        displayName: nextName,
+        rememberVoice,
+      })
+      const revised = correctionSegments(result)
+      const current = parseTranscriptV2Block(raw)
+      if (!current || revised.length === 0) {
+        throw new Error('The correction response did not include a revised transcript segment')
+      }
+      updateAttributes({
+        data: JSON.stringify(applyTranscriptSegmentRevisions(current, revised)),
+      })
+      publishTranscriptSegmentRevisions(revised)
+      setEditingSegmentId(null)
+    } catch {
+      setCorrectionError('Could not save this correction yet.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (entries.length === 0 && !isV2) {
     return (
       <NodeViewWrapper className="transcript-block-wrapper" data-type="transcript-block">
         <div className="transcript-block-card transcript-block-error">
@@ -95,11 +176,12 @@ function TranscriptBlockView({ node, getPos, editor }: {
 
   return (
     <NodeViewWrapper className="transcript-block-wrapper" data-type="transcript-block">
-      <div className="transcript-block-card" onMouseDown={(e) => e.stopPropagation()}>
+      <div className="transcript-block-card" onMouseDown={(event) => event.stopPropagation()}>
         <button
+          type="button"
           className="transcript-block-toggle"
-          onClick={(e) => { e.stopPropagation(); setExpanded(!expanded) }}
-          onMouseDown={(e) => e.stopPropagation()}
+          onClick={(event) => { event.stopPropagation(); setExpanded(!expanded) }}
+          onMouseDown={(event) => event.stopPropagation()}
         >
           <ChevronDown size={14} className={`transcript-block-chevron ${expanded ? 'transcript-block-chevron-open' : ''}`} />
           <FileText size={14} />
@@ -107,17 +189,66 @@ function TranscriptBlockView({ node, getPos, editor }: {
         </button>
         {expanded && (
           <div className="transcript-block-content">
-            {entries.length > 0 ? (
-              entries.map((entry, i) => (
-                <div key={i} className="transcript-entry">
-                  <span className="transcript-speaker" style={{ color: speakerColor(entry.speaker) }}>
-                    {entry.speaker}
-                  </span>
+            {entries.length > 0 ? entries.map((entry, index) => {
+              const isEditing = editingSegmentId === entry.segmentId
+              return (
+                <div key={entry.segmentId ?? `${entry.speaker.displayName}-${index}`} className={`transcript-entry transcript-entry-${entry.finality}`}>
+                  <div className="transcript-entry-meta">
+                    <span className="transcript-speaker" style={{ color: speakerColor(entry.speaker.displayName) }}>
+                      {entry.speaker.displayName}
+                    </span>
+                    {entry.overlap && <span className="transcript-overlap-badge">Overlapping speech</span>}
+                    {entry.finality === 'interim' && <span className="transcript-interim-badge">Live</span>}
+                    {entry.segmentId && (
+                      <button
+                        type="button"
+                        className="transcript-speaker-correct"
+                        aria-label={`Correct speaker ${entry.speaker.displayName}`}
+                        onClick={() => startCorrection(entry)}
+                      >
+                        <Pencil size={12} />
+                      </button>
+                    )}
+                  </div>
                   <span className="transcript-text">{entry.text}</span>
+                  {isEditing && (
+                    <form
+                      className="transcript-speaker-correction"
+                      onSubmit={(event) => { event.preventDefault(); void saveCorrection(entry) }}
+                    >
+                      <label>
+                        Speaker name
+                        <input
+                          type="text"
+                          autoFocus
+                          value={displayName}
+                          onChange={(event) => setDisplayName(event.target.value)}
+                          placeholder="Name this speaker"
+                        />
+                      </label>
+                      <label className="transcript-remember-voice">
+                        <input
+                          type="checkbox"
+                          checked={rememberVoice}
+                          onChange={(event) => setRememberVoice(event.target.checked)}
+                        />
+                        Remember this voice for future meetings (stores a voice embedding)
+                      </label>
+                      {correctionError && <span className="transcript-correction-error">{correctionError}</span>}
+                      <div className="transcript-correction-actions">
+                        <button type="submit" disabled={!displayName.trim() || saving}>
+                          <Check size={13} /> Save for this meeting
+                        </button>
+                        <button type="button" onClick={() => setEditingSegmentId(null)} disabled={saving}>
+                          <X size={13} /> Cancel
+                        </button>
+                      </div>
+                    </form>
+                  )}
                 </div>
-              ))
-            ) : (
-              <div className="transcript-raw">{config.transcript}</div>
+              )
+            }) : (
+              <div className="transcript-raw">Waiting for the first transcript segment…</div>
             )}
           </div>
         )}
@@ -134,9 +265,7 @@ export const TranscriptBlockExtension = Node.create({
   draggable: false,
 
   addAttributes() {
-    return {
-      data: { default: '{}' },
-    }
+    return { data: { default: '{}' } }
   },
 
   parseHTML() {
@@ -147,7 +276,7 @@ export const TranscriptBlockExtension = Node.create({
         const code = element.querySelector('code')
         if (!code) return false
         const cls = code.className || ''
-        if (cls.includes('language-transcript')) {
+        if (cls.includes('language-transcript-v2') || cls.includes('language-transcript')) {
           return { data: code.textContent || '{}' }
         }
         return false
@@ -167,7 +296,8 @@ export const TranscriptBlockExtension = Node.create({
     return {
       markdown: {
         serialize(state: { write: (text: string) => void; closeBlock: (node: unknown) => void }, node: { attrs: { data: string } }) {
-          state.write('```transcript\n' + node.attrs.data + '\n```')
+          const isV2 = parseTranscriptV2Block(node.attrs.data) !== null
+          state.write(`\`\`\`${isV2 ? 'transcript-v2' : 'transcript'}\n${node.attrs.data}\n\`\`\``)
           state.closeBlock(node)
         },
         parse: {},

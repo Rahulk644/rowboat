@@ -1,9 +1,21 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import { buildDeepgramListenUrl } from '@/lib/deepgram-listen-url';
 import { finalizeDeepgramStream } from '@/lib/deepgram-finalize';
 import { useRowboatAccount } from '@/hooks/useRowboatAccount';
 import { fetchRowboatConfig } from '@/hooks/use-rowboat-config';
+import {
+    createTranscriptV2Block,
+    normalizeTranscriptSegments,
+    removeTranscriptSegment,
+    renderNewMeetingNote,
+    replaceOwnedTranscriptV2Block,
+    subscribeTranscriptSegmentRevisions,
+    type TranscriptChannel,
+    type TranscriptSegment,
+    unknownSpeaker,
+    upsertTranscriptSegments,
+} from '@/lib/meeting-transcript-v2';
 
 export type MeetingTranscriptionState = 'idle' | 'connecting' | 'recording' | 'stopping';
 
@@ -28,12 +40,8 @@ const SELF_HOSTED_BATCH_SAMPLES = 8_960;
 const SELF_HOSTED_MAX_PENDING_BATCHES = 24;
 const SELF_HOSTED_RECONNECT_DELAYS_MS = [250, 500, 1_000, 2_000, 4_000];
 
-// RMS threshold: system audio above this = "active" (speakers playing)
-const SYSTEM_AUDIO_GATE_THRESHOLD = 0.005;
-
 // RMS threshold for "someone is talking" on either channel. Drives silence
-// detection — kept a touch above the gate threshold so faint room noise on the
-// mic doesn't read as speech and keep a finished recording alive.
+// detection while staying above faint room-noise levels on the microphone.
 const SPEECH_RMS_THRESHOLD = 0.01;
 
 // Silence handling. "Silence" = no audio above SPEECH_RMS_THRESHOLD on EITHER
@@ -90,16 +98,16 @@ async function detectHeadphones(): Promise<boolean> {
 // ---------------------------------------------------------------------------
 // Transcript formatting
 // ---------------------------------------------------------------------------
-interface TranscriptEntry {
-    speaker: string;
-    text: string;
-}
-
 interface SelfHostedSnapshot {
     full: string;
     committed: string;
     tentative: string;
     final: boolean;
+    revision?: number;
+    inputMs?: number;
+    /** v2 bridge events carry revisioned interval-bearing records. */
+    version?: number;
+    segments?: unknown[];
 }
 
 type SelfHostedChannel = 'mic' | 'system';
@@ -130,7 +138,7 @@ export interface CalendarEventMeta {
     source?: string
 }
 
-function formatTranscript(entries: TranscriptEntry[], date: string, calendarEvent?: CalendarEventMeta): string {
+function formatTranscript(date: string, calendarEvent?: CalendarEventMeta): string {
     const noteTitle = calendarEvent?.summary || 'Meeting Notes';
     const lines = [
         '---',
@@ -160,19 +168,7 @@ function formatTranscript(entries: TranscriptEntry[], date: string, calendarEven
         `# ${noteTitle}`,
         '',
     );
-    // Build the raw transcript text
-    const transcriptLines: string[] = [];
-    for (let i = 0; i < entries.length; i++) {
-        if (i > 0 && entries[i].speaker !== entries[i - 1].speaker) {
-            transcriptLines.push('');
-        }
-        transcriptLines.push(`**${entries[i].speaker}:** ${entries[i].text}`);
-        transcriptLines.push('');
-    }
-    const transcriptText = transcriptLines.join('\n').trim();
-    const transcriptData = JSON.stringify({ transcript: transcriptText });
-    lines.push('```transcript', transcriptData, '```');
-    return lines.join('\n');
+    return renderNewMeetingNote(lines.join('\n'), createTranscriptV2Block([]));
 }
 
 // ---------------------------------------------------------------------------
@@ -183,6 +179,7 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
     const [state, setState] = useState<MeetingTranscriptionState>('idle');
     const wsRef = useRef<WebSocket | null>(null);
     const selfHostedMeetingIdRef = useRef<string | null>(null);
+    const transcriptMeetingIdRef = useRef<string | null>(null);
     const selfHostedCommittedRef = useRef<Record<SelfHostedChannel, string>>({ mic: '', system: '' });
     const selfHostedPcmRef = useRef({
         mic: new Int16Array(SELF_HOSTED_BATCH_SAMPLES),
@@ -196,10 +193,12 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
     const systemStreamRef = useRef<MediaStream | null>(null);
     const processorRef = useRef<ScriptProcessorNode | null>(null);
     const audioCtxRef = useRef<AudioContext | null>(null);
-    const transcriptRef = useRef<TranscriptEntry[]>([]);
-    const interimRef = useRef<Map<number, { speaker: string; text: string }>>(new Map());
+    const transcriptSegmentsRef = useRef<TranscriptSegment[]>([]);
+    const legacySegmentSequenceRef = useRef<Record<SelfHostedChannel, number>>({ mic: 0, system: 0 });
+    const legacyInterimRevisionRef = useRef<Record<SelfHostedChannel, number>>({ mic: 0, system: 0 });
     const notePathRef = useRef<string>('');
     const writeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const transcriptBlockMissingNotifiedRef = useRef(false);
     // Silence detection: timestamp of the last speech-level audio on either
     // channel, plus the interval that checks it. calendarEndMsRef holds the
     // linked event's end time (null if none).
@@ -213,25 +212,33 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
     const trackPollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const onAutoStopRef = useRef(onAutoStop);
     onAutoStopRef.current = onAutoStop;
-    const dateRef = useRef<string>('');
-    const calendarEventRef = useRef<CalendarEventMeta | undefined>(undefined);
 
     const writeTranscriptToFile = useCallback(async () => {
-        if (!notePathRef.current) return;
-        const entries = [...transcriptRef.current];
-        for (const interim of interimRef.current.values()) {
-            if (!interim.text) continue;
-            if (entries.length > 0 && entries[entries.length - 1].speaker === interim.speaker) {
-                entries[entries.length - 1] = { speaker: interim.speaker, text: entries[entries.length - 1].text + ' ' + interim.text };
-            } else {
-                entries.push({ speaker: interim.speaker, text: interim.text });
-            }
-        }
-        if (entries.length === 0) return;
-        const content = formatTranscript(entries, dateRef.current, calendarEventRef.current);
+        const notePath = notePathRef.current;
+        if (!notePath) return;
+
+        // Do not regenerate the note around the transcript. A person can be
+        // typing scratchpad notes or editing generated notes while capture is
+        // live, and our sole ownership boundary is the transcript-v2 fence.
         try {
+            const existing = await window.ipc.invoke('workspace:readFile', { path: notePath, encoding: 'utf8' });
+            const content = replaceOwnedTranscriptV2Block(
+                existing.data,
+                createTranscriptV2Block(transcriptSegmentsRef.current),
+            );
+            if (content === null) {
+                console.warn('[meeting] Transcript block is missing; preserving the user-edited note');
+                if (!transcriptBlockMissingNotifiedRef.current) {
+                    transcriptBlockMissingNotifiedRef.current = true;
+                    toast.error('Live transcript paused', {
+                        description: 'Its transcript block was removed from this note. Recording continues safely.',
+                        duration: 10_000,
+                    });
+                }
+                return;
+            }
             await window.ipc.invoke('workspace:writeFile', {
-                path: notePathRef.current,
+                path: notePath,
                 data: content,
                 opts: { encoding: 'utf8' },
             });
@@ -247,21 +254,55 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
         }, 1000);
     }, [writeTranscriptToFile]);
 
+    const upsertSegments = useCallback((incoming: TranscriptSegment[]) => {
+        if (incoming.length === 0) return;
+        transcriptSegmentsRef.current = upsertTranscriptSegments(transcriptSegmentsRef.current, incoming);
+        scheduleDebouncedWrite();
+    }, [scheduleDebouncedWrite]);
+
+    // Corrections originate from a TipTap NodeView, not this hook. Sync its
+    // returned higher revision before any subsequent debounced file write.
+    useEffect(() => subscribeTranscriptSegmentRevisions((segments) => {
+        const meetingId = transcriptMeetingIdRef.current;
+        if (!meetingId) return;
+        upsertSegments(segments.filter(segment => segment.meetingId === meetingId));
+    }), [upsertSegments]);
+
     const applySelfHostedSnapshot = useCallback((channel: SelfHostedChannel, snapshot: SelfHostedSnapshot) => {
-        const channelIndex = channel === 'mic' ? 0 : 1;
-        const speaker = channel === 'mic' ? 'You' : 'Remote participant';
+        // Canonical bridge events have segment IDs, revisions, intervals, and
+        // resolved speaker evidence. Prefer them wholesale over the legacy
+        // text-prefix protocol.
+        const v2Segments = normalizeTranscriptSegments(snapshot);
+        if (v2Segments.length > 0) {
+            const meetingId = transcriptMeetingIdRef.current ?? undefined;
+            upsertSegments(v2Segments.map(segment => ({ ...segment, meetingId: segment.meetingId ?? meetingId })));
+            return;
+        }
+
         const previousCommitted = selfHostedCommittedRef.current[channel];
         const currentCommitted = snapshot.final ? snapshot.full : snapshot.committed;
 
         if (currentCommitted.startsWith(previousCommitted)) {
             const delta = currentCommitted.slice(previousCommitted.length).trim();
             if (delta) {
-                const entries = transcriptRef.current;
-                if (entries.length > 0 && entries[entries.length - 1].speaker === speaker) {
-                    entries[entries.length - 1].text += ` ${delta}`;
-                } else {
-                    entries.push({ speaker, text: delta });
-                }
+                const sequence = legacySegmentSequenceRef.current[channel]++;
+                const endSample = Math.max(0, Math.round((snapshot.inputMs ?? 0) * 16));
+                upsertSegments([{
+                    meetingId: transcriptMeetingIdRef.current ?? undefined,
+                    segmentId: `legacy:${channel}:${sequence}`,
+                    revision: Math.max(0, snapshot.revision ?? 0),
+                    startSample: endSample,
+                    endSample,
+                    timingConfidence: 'low',
+                    channel,
+                    text: delta,
+                    finality: snapshot.final ? 'final' : 'stable',
+                    clusterIds: [],
+                    overlap: false,
+                    // A legacy snapshot has no trustworthy identity. In
+                    // particular, a mic snapshot is not evidence of `You`.
+                    speaker: unknownSpeaker(),
+                }]);
             }
             selfHostedCommittedRef.current[channel] = currentCommitted;
         } else if (currentCommitted !== previousCommitted) {
@@ -271,13 +312,30 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
             console.warn('[meeting] Self-hosted committed prefix changed unexpectedly');
         }
 
+        const interimId = `legacy:${channel}:interim`;
         if (snapshot.final || !snapshot.tentative.trim()) {
-            interimRef.current.delete(channelIndex);
+            transcriptSegmentsRef.current = removeTranscriptSegment(transcriptSegmentsRef.current, interimId);
         } else {
-            interimRef.current.set(channelIndex, { speaker, text: snapshot.tentative.trim() });
+            const nextRevision = legacyInterimRevisionRef.current[channel] + 1;
+            legacyInterimRevisionRef.current[channel] = nextRevision;
+            const endSample = Math.max(0, Math.round((snapshot.inputMs ?? 0) * 16));
+            upsertSegments([{
+                meetingId: transcriptMeetingIdRef.current ?? undefined,
+                segmentId: interimId,
+                revision: nextRevision,
+                startSample: endSample,
+                endSample,
+                timingConfidence: 'low',
+                channel,
+                text: snapshot.tentative.trim(),
+                finality: 'interim',
+                clusterIds: [],
+                overlap: false,
+                speaker: unknownSpeaker(),
+            }]);
         }
         scheduleDebouncedWrite();
-    }, [scheduleDebouncedWrite]);
+    }, [scheduleDebouncedWrite, upsertSegments]);
 
     const queueSelfHostedBatch = useCallback((mic: Int16Array, system: Int16Array) => {
         const meetingId = selfHostedMeetingIdRef.current;
@@ -517,13 +575,18 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
         const usingHeadphones = headphoneResult.status === 'fulfilled' ? headphoneResult.value : false;
         console.log(`[meeting] Audio output mode: ${usingHeadphones ? 'headphones' : 'speakers'}`);
 
-        transcriptRef.current = [];
-        interimRef.current = new Map();
+        transcriptSegmentsRef.current = [];
+        legacySegmentSequenceRef.current = { mic: 0, system: 0 };
+        legacyInterimRevisionRef.current = { mic: 0, system: 0 };
+        transcriptBlockMissingNotifiedRef.current = false;
         selfHostedCommittedRef.current = { mic: '', system: '' };
         selfHostedPcmRef.current.length = 0;
         selfHostedFeedTailRef.current = Promise.resolve();
         selfHostedPendingBatchesRef.current = 0;
         selfHostedFailureShownRef.current = false;
+        transcriptMeetingIdRef.current = transcriptionResult.value.kind === 'self-hosted'
+            ? transcriptionResult.value.meetingId
+            : `rowboat-${crypto.randomUUID()}`;
 
         if (transcriptionResult.value.kind === 'self-hosted') {
             selfHostedMeetingIdRef.current = transcriptionResult.value.meetingId;
@@ -539,29 +602,58 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
                 if (!transcript) return;
 
                 const channelIndex = data.channel_index?.[0] ?? 0;
-                const isMic = channelIndex === 0;
-
-                // Channel 0 = mic = "You", Channel 1 = system audio with diarization
-                let speaker: string;
-                if (isMic) {
-                    speaker = 'You';
-                } else {
-                    // Use Deepgram diarization speaker ID for system audio channel
-                    const words = data.channel.alternatives[0].words;
-                    const speakerId = words?.[0]?.speaker;
-                    speaker = speakerId != null ? `Speaker ${speakerId}` : 'System audio';
-                }
+                const channel: TranscriptChannel = channelIndex === 0 ? 'mic' : 'system';
+                const words = data.channel.alternatives[0].words as Array<{
+                    start?: number
+                    end?: number
+                    speaker?: number | string
+                }> | undefined;
+                const firstWord = words?.[0];
+                const lastWord = words?.[words.length - 1];
+                const startSample = Math.max(0, Math.round((firstWord?.start ?? 0) * 16_000));
+                const endSample = Math.max(startSample, Math.round((lastWord?.end ?? firstWord?.end ?? firstWord?.start ?? 0) * 16_000));
+                const rawSpeakerId = channel === 'system' ? firstWord?.speaker : undefined;
+                const hasCluster = rawSpeakerId !== undefined && rawSpeakerId !== null;
+                const speaker = hasCluster
+                    ? { kind: 'cluster' as const, id: String(rawSpeakerId), displayName: `Speaker ${rawSpeakerId}` }
+                    : unknownSpeaker();
+                const interimId = `deepgram:${channel}:interim`;
 
                 if (data.is_final) {
-                    interimRef.current.delete(channelIndex);
-                    const entries = transcriptRef.current;
-                    if (entries.length > 0 && entries[entries.length - 1].speaker === speaker) {
-                        entries[entries.length - 1].text += ' ' + transcript;
-                    } else {
-                        entries.push({ speaker, text: transcript });
-                    }
+                    transcriptSegmentsRef.current = removeTranscriptSegment(transcriptSegmentsRef.current, interimId);
+                    const sequence = legacySegmentSequenceRef.current[channel]++;
+                    upsertSegments([{
+                        meetingId: transcriptMeetingIdRef.current ?? undefined,
+                        segmentId: `deepgram:${channel}:${sequence}`,
+                        revision: 0,
+                        startSample,
+                        endSample,
+                        timingConfidence: words?.length ? 'medium' : 'low',
+                        channel,
+                        text: transcript,
+                        finality: 'final',
+                        clusterIds: hasCluster ? [String(rawSpeakerId)] : [],
+                        overlap: false,
+                        speaker,
+                        attributionSource: hasCluster ? 'deepgram_diarization' : undefined,
+                    }]);
                 } else {
-                    interimRef.current.set(channelIndex, { speaker, text: transcript });
+                    const currentInterim = transcriptSegmentsRef.current.find(segment => segment.segmentId === interimId);
+                    upsertSegments([{
+                        meetingId: transcriptMeetingIdRef.current ?? undefined,
+                        segmentId: interimId,
+                        revision: (currentInterim?.revision ?? -1) + 1,
+                        startSample,
+                        endSample,
+                        timingConfidence: words?.length ? 'medium' : 'low',
+                        channel,
+                        text: transcript,
+                        finality: 'interim',
+                        clusterIds: hasCluster ? [String(rawSpeakerId)] : [],
+                        overlap: false,
+                        speaker,
+                        attributionSource: hasCluster ? 'deepgram_diarization' : undefined,
+                    }]);
                 }
                 scheduleDebouncedWrite();
             };
@@ -650,8 +742,9 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
             const micRaw = e.inputBuffer.getChannelData(0);
             const sysRaw = e.inputBuffer.getChannelData(1);
 
-            // RMS of each channel, computed once per frame and reused for
-            // silence detection and gating the mic in speaker mode.
+            // RMS of each channel is used for silence detection only. Audio
+            // routing/AEC belongs to the meeting bridge; renderer capture must
+            // retain both channels during double-talk.
             let micSum = 0;
             for (let i = 0; i < micRaw.length; i++) micSum += micRaw[i] * micRaw[i];
             const micRms = Math.sqrt(micSum / micRaw.length);
@@ -660,29 +753,15 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
             const sysRms = Math.sqrt(sysSum / sysRaw.length);
 
             // Reset the silence clock whenever EITHER channel has speech-level
-            // audio. Uses the raw mic (pre-gating) so the user's own voice counts
-            // even in speaker mode where the outgoing mic gets muted.
+            // audio. Both channels continue to ASR even when they overlap.
             if (micRms > SPEECH_RMS_THRESHOLD || sysRms > SPEECH_RMS_THRESHOLD) {
                 lastAudioActivityRef.current = Date.now();
             }
 
-            // Mode 1 (headphones): pass both streams through unmodified
-            // Mode 2 (speakers): gate/mute mic when system audio is active
-            let micOut: Float32Array;
-            if (usingHeadphones) {
-                micOut = micRaw;
-            } else if (sysRms > SYSTEM_AUDIO_GATE_THRESHOLD) {
-                // System audio is playing — mute mic to prevent bleed
-                micOut = new Float32Array(micRaw.length); // all zeros
-            } else {
-                // System audio is silent — pass mic through
-                micOut = micRaw;
-            }
-
             if (selfHostedMeetingIdRef.current) {
                 const buffered = selfHostedPcmRef.current;
-                for (let i = 0; i < micOut.length; i++) {
-                    buffered.mic[buffered.length] = floatToPcm16(micOut[i]);
+                for (let i = 0; i < micRaw.length; i++) {
+                    buffered.mic[buffered.length] = floatToPcm16(micRaw[i]);
                     buffered.system[buffered.length] = floatToPcm16(sysRaw[i]);
                     buffered.length++;
                     if (buffered.length === SELF_HOSTED_BATCH_SAMPLES) {
@@ -696,9 +775,9 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
             if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
 
             // Interleave mic (ch0) + system audio (ch1) into stereo int16 PCM
-            const int16 = new Int16Array(micOut.length * 2);
-            for (let i = 0; i < micOut.length; i++) {
-                int16[i * 2] = floatToPcm16(micOut[i]);
+            const int16 = new Int16Array(micRaw.length * 2);
+            for (let i = 0; i < micRaw.length; i++) {
+                int16[i * 2] = floatToPcm16(micRaw[i]);
                 int16[i * 2 + 1] = floatToPcm16(sysRaw[i]);
             }
             wsRef.current.send(int16.buffer);
@@ -710,7 +789,6 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
         // Create the note file, organized by date like voice memos
         const now = new Date();
         const dateStr = now.toISOString();
-        dateRef.current = dateStr;
         const dateFolder = dateStr.split('T')[0]; // YYYY-MM-DD
         const timestamp = dateStr.replace(/:/g, '-').replace(/\.\d+Z$/, '');
         const filename = calendarEvent?.summary
@@ -727,14 +805,13 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
             } catch { /* fall through with the unsuffixed path */ }
         }
         notePathRef.current = notePath;
-        calendarEventRef.current = calendarEvent;
 
         // Parse the linked event's end time (timed events only) so the silence
         // window can shorten once the meeting is past its scheduled end.
         const calEndMs = calendarEvent?.end?.dateTime ? Date.parse(calendarEvent.end.dateTime) : NaN;
         calendarEndMsRef.current = Number.isFinite(calEndMs) ? calEndMs : null;
 
-        const initialContent = formatTranscript([], dateStr, calendarEvent);
+        const initialContent = formatTranscript(dateStr, calendarEvent);
         await window.ipc.invoke('workspace:writeFile', {
             path: notePath,
             data: initialContent,
@@ -782,7 +859,7 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
 
         setState('recording');
         return notePath;
-    }, [state, cleanup, scheduleDebouncedWrite, refreshRowboatAccount, queueSelfHostedBatch]);
+    }, [state, cleanup, scheduleDebouncedWrite, refreshRowboatAccount, queueSelfHostedBatch, upsertSegments]);
 
     const stop = useCallback(async () => {
         if (state !== 'recording') return;
@@ -816,8 +893,6 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
         }
         cleanup();
         await writeTranscriptToFile();
-        interimRef.current = new Map();
-
         setState('idle');
     }, [state, cleanup, stopInputCapture, writeTranscriptToFile, flushSelfHostedPcm, applySelfHostedSnapshot]);
 
