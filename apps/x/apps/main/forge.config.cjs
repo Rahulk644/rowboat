@@ -11,6 +11,15 @@ const pkg = require('./package.json');
 // Ubuntu and shouldn't attempt to ship an Arch package.
 const SKIP_PACMAN = process.env.ROWBOAT_SKIP_PACMAN === '1';
 const SKIP_CODE_SIGNING = process.env.ROWBOAT_SKIP_CODE_SIGNING === '1';
+// The native meeting bridge is an alpha resource. Keep normal Rowboat
+// packages byte-for-byte on their current path unless this exact build flag is
+// deliberately provided by the release engineer.
+const MEETING_BRIDGE_ALPHA = process.env.ROWBOAT_MEETING_BRIDGE_ALPHA === '1';
+const MEETING_BRIDGE_STAGE_DIR = path.join(__dirname, '.package', 'resources', 'meeting-bridge');
+const MEETING_BRIDGE_STAGE_SCRIPT = path.resolve(
+    __dirname,
+    '../../../../native/meeting-bridge/scripts/stage.mjs',
+);
 
 // Windows code signing via Azure Trusted Signing — CI-only. The GitHub workflow
 // downloads the Azure dlib, writes metadata.json, and exports these env vars;
@@ -254,6 +263,11 @@ module.exports = {
         // from trying to analyze/copy node_modules, which fails with pnpm's symlinked
         // workspaces.
         prune: false,
+        // Electron Packager copies this directory to
+        // process.resourcesPath/meeting-bridge. It is absent from normal
+        // packages; the alpha script creates it deterministically in
+        // generateAssets before Packager reads it.
+        ...(MEETING_BRIDGE_ALPHA ? { extraResource: [MEETING_BRIDGE_STAGE_DIR] } : {}),
         // Strip the workspace src/node_modules (paths are ANCHORED to the app root), BUT
         // always keep everything under `.package/` — that's our staged output: the
         // bundled main process, the ACP adapters + their dependency closure (staged by
@@ -362,7 +376,7 @@ module.exports = {
         // Hook signature: (forgeConfig, platform, arch)
         // Note: Console output only shows if DEBUG or CI env vars are set
         generateAssets: async (forgeConfig, platform, arch) => {
-            const { execSync } = require('child_process');
+            const { execSync, execFileSync } = require('child_process');
             const fs = require('fs');
 
             const packageDir = path.join(__dirname, '.package');
@@ -418,6 +432,24 @@ module.exports = {
                 cwd: __dirname,
                 stdio: 'inherit'
             });
+
+            if (MEETING_BRIDGE_ALPHA) {
+                console.log(`Building and staging meeting bridge alpha for ${platform}/${arch}...`);
+                // Fixed script + argument vector: platform and architecture
+                // are validated by the script and never interpolated into a
+                // shell command.
+                execFileSync(process.execPath, [
+                    MEETING_BRIDGE_STAGE_SCRIPT,
+                    '--platform', platform,
+                    '--arch', arch,
+                    '--repository-root', path.resolve(__dirname, '../../../..'),
+                    '--output-root', path.join(packageDir, 'resources'),
+                ], {
+                    cwd: __dirname,
+                    stdio: 'inherit',
+                    shell: false,
+                });
+            }
 
             // Copy preload dist into staging directory
             console.log('Copying preload...');
