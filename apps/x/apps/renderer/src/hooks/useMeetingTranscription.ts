@@ -16,6 +16,10 @@ import {
     unknownSpeaker,
     upsertTranscriptSegments,
 } from '@/lib/meeting-transcript-v2';
+import {
+    SelfHostedMeetingAudioClock,
+    type CapturedSelfHostedAudio,
+} from '@/lib/self-hosted-meeting-audio-clock';
 
 export type MeetingTranscriptionState = 'idle' | 'connecting' | 'recording' | 'stopping';
 
@@ -189,6 +193,7 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
     const selfHostedFeedTailRef = useRef<Promise<void>>(Promise.resolve());
     const selfHostedPendingBatchesRef = useRef(0);
     const selfHostedFailureShownRef = useRef(false);
+    const selfHostedAudioClockRef = useRef(new SelfHostedMeetingAudioClock());
     const micStreamRef = useRef<MediaStream | null>(null);
     const systemStreamRef = useRef<MediaStream | null>(null);
     const processorRef = useRef<ScriptProcessorNode | null>(null);
@@ -341,6 +346,11 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
         const meetingId = selfHostedMeetingIdRef.current;
         if (!meetingId) return;
         if (selfHostedPendingBatchesRef.current >= SELF_HOSTED_MAX_PENDING_BATCHES) {
+            // The dropped pair still occupied capture time. Advance sample
+            // positions and flag the next admitted packet rather than hiding
+            // the gap behind contiguous-looking transcript timing.
+            selfHostedAudioClockRef.current.discard('mic', mic.length);
+            selfHostedAudioClockRef.current.discard('system', system.length);
             console.error('[meeting] Self-hosted transcription backlog full; dropping one bounded audio batch');
             if (!selfHostedFailureShownRef.current) {
                 selfHostedFailureShownRef.current = true;
@@ -353,41 +363,57 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
         }
         const micBase64 = pcm16ToBase64(mic);
         const systemBase64 = pcm16ToBase64(system);
+        const micPacket = selfHostedAudioClockRef.current.capture('mic', mic.length);
+        const systemPacket = selfHostedAudioClockRef.current.capture('system', system.length);
         selfHostedPendingBatchesRef.current++;
         selfHostedFeedTailRef.current = selfHostedFeedTailRef.current.then(async () => {
-            let lastError: unknown;
-            for (let attempt = 0; attempt <= SELF_HOSTED_RECONNECT_DELAYS_MS.length; attempt++) {
-                try {
-                    // Apply neither channel until both requests succeed. If the
-                    // second request fails, restarting both sessions and replaying
-                    // the pair cannot duplicate an already-rendered mic segment.
-                    const micSnapshot = await window.ipc.invoke('meeting:transcription:feed', {
-                        meetingId,
-                        channel: 'mic',
-                        pcmBase64: micBase64,
-                    });
-                    const systemSnapshot = await window.ipc.invoke('meeting:transcription:feed', {
-                        meetingId,
-                        channel: 'system',
-                        pcmBase64: systemBase64,
-                    });
-                    applySelfHostedSnapshot('mic', micSnapshot);
-                    applySelfHostedSnapshot('system', systemSnapshot);
-                    selfHostedFailureShownRef.current = false;
-                    return;
-                } catch (error) {
-                    lastError = error;
-                    const delay = SELF_HOSTED_RECONNECT_DELAYS_MS[attempt];
-                    if (delay === undefined || selfHostedMeetingIdRef.current !== meetingId) break;
-                    console.warn(`[meeting] Self-hosted transport interrupted; reconnecting in ${delay}ms`);
-                    await wait(delay);
-                    await window.ipc.invoke('meeting:transcription:restart', { meetingId });
-                    // The worker starts a fresh epoch. Keep prior transcript
-                    // entries, but compare new stable prefixes from zero.
-                    selfHostedCommittedRef.current = { mic: '', system: '' };
+            const feedChannel = async (
+                channel: SelfHostedChannel,
+                packet: CapturedSelfHostedAudio,
+                pcmBase64: string,
+            ): Promise<void> => {
+                let lastError: unknown;
+                for (let attempt = 0; attempt <= SELF_HOSTED_RECONNECT_DELAYS_MS.length; attempt++) {
+                    try {
+                        const snapshot = await window.ipc.invoke('meeting:transcription:feed', {
+                            meetingId,
+                            channel,
+                            pcmBase64,
+                            audio: selfHostedAudioClockRef.current.metadataFor(packet),
+                        });
+                        selfHostedAudioClockRef.current.acknowledge(channel);
+                        // Once one channel is acknowledged, it is rendered and
+                        // never replayed because its sibling later fails.
+                        applySelfHostedSnapshot(channel, snapshot);
+                        return;
+                    } catch (error) {
+                        lastError = error;
+                        const delay = SELF_HOSTED_RECONNECT_DELAYS_MS[attempt];
+                        if (delay === undefined || selfHostedMeetingIdRef.current !== meetingId) break;
+                        console.warn(`[meeting] ${channel} transcription interrupted; reconnecting in ${delay}ms`);
+                        await wait(delay);
+                        await window.ipc.invoke('meeting:transcription:restartChannel', { meetingId, channel });
+                        // Legacy snapshots begin a fresh worker prefix. Canonical
+                        // v2 segment IDs/revisions remain independently safe.
+                        selfHostedCommittedRef.current[channel] = '';
+                    }
                 }
+                selfHostedAudioClockRef.current.markTransportDrop(channel);
+                throw lastError;
+            };
+
+            let micAcknowledged = false;
+            try {
+                await feedChannel('mic', micPacket, micBase64);
+                micAcknowledged = true;
+                await feedChannel('system', systemPacket, systemBase64);
+                selfHostedFailureShownRef.current = false;
+            } catch (error) {
+                // A failed mic prevents this pair's system PCM from being
+                // attempted at all, so its next packet must expose that gap.
+                if (!micAcknowledged) selfHostedAudioClockRef.current.markTransportDrop('system');
+                throw error;
             }
-            throw lastError;
         }).catch((error) => {
             console.error('[meeting] Self-hosted transcription feed failed:', error);
             if (!selfHostedFailureShownRef.current) {
@@ -584,6 +610,7 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
         selfHostedFeedTailRef.current = Promise.resolve();
         selfHostedPendingBatchesRef.current = 0;
         selfHostedFailureShownRef.current = false;
+        selfHostedAudioClockRef.current = new SelfHostedMeetingAudioClock();
         transcriptMeetingIdRef.current = transcriptionResult.value.kind === 'self-hosted'
             ? transcriptionResult.value.meetingId
             : `rowboat-${crypto.randomUUID()}`;
@@ -782,6 +809,21 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
             }
             wsRef.current.send(int16.buffer);
         };
+
+        // Start the evidence sidecar immediately before connecting the graph,
+        // so the bridge Start and renderer audio clock share the capture
+        // origin. A bridge failure is attribution-only: it must never prevent
+        // the active PCM transcription fallback from starting.
+        const selfHostedCaptureMeetingId = selfHostedMeetingIdRef.current;
+        if (selfHostedCaptureMeetingId) {
+            try {
+                await window.ipc.invoke('meeting:transcription:captureReady', {
+                    meetingId: selfHostedCaptureMeetingId,
+                });
+            } catch (error) {
+                console.error('[meeting] Failed to mark capture ready:', error);
+            }
+        }
 
         merger.connect(processor);
         processor.connect(audioCtx.destination);
