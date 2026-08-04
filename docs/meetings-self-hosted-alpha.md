@@ -102,6 +102,10 @@ printf '%s\n' '{"type":"ping","request_id":"smoke"}' | cargo run
 The default binary emits a ready event and answers ping. It does not prove mic,
 system audio, Zoom, macOS TCC, or a two-person call.
 
+For an opt-in Electron package that stages the helper at the runtime path, use
+the deterministic [alpha packaging guide](../native/meeting-bridge/PACKAGING.md).
+Normal Rowboat packages remain unchanged unless the explicit build flag is set.
+
 ### FlexAudio A/B
 
 FlexAudio is optional and off by default:
