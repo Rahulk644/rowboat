@@ -132,6 +132,7 @@ type ActiveMeeting = {
   channels: Record<MeetingAudioChannel, ChannelState>;
   segments: Map<string, MeetingTranscriptSegment>;
   corrections: Map<string, { displayName: string; rememberVoice: boolean }>;
+  speakerEvidence: MeetingSpeakerEvidence[];
 };
 
 const SnapshotSchema = z.object({
@@ -157,6 +158,8 @@ const AudioFeedMetadataSchema = z.object({
 
 const MAX_PCM_BYTES = 64 * 1024;
 const SAMPLE_RATE = 16_000;
+const MAX_SPEAKER_EVIDENCE = 1_024;
+const SPEAKER_EVIDENCE_HISTORY_SAMPLES = SAMPLE_RATE * 120;
 const DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]']);
 
@@ -279,6 +282,7 @@ export class SelfHostedMeetingTranscription {
         channels: { mic: newChannelState(id, 'mic'), system: newChannelState(id, 'system') },
         segments: new Map(),
         corrections: new Map(),
+        speakerEvidence: [],
       });
     } catch (error) {
       await this.bestEffortReset(config, sessions.mic);
@@ -387,9 +391,22 @@ export class SelfHostedMeetingTranscription {
     options: SpeakerEvidenceApplicationOptions = {},
   ): { segments: MeetingTranscriptSegment[] } {
     const active = this.requireActive(meetingId);
+    this.retainSpeakerEvidence(active, evidence);
+    const updated = this.resolveStoredSpeakerEvidence(active, active.segments.keys(), options);
+    this.pruneSpeakerEvidence(active);
+    return { segments: updated };
+  }
+
+  private resolveStoredSpeakerEvidence(
+    active: ActiveMeeting,
+    segmentIds: Iterable<string>,
+    options: SpeakerEvidenceApplicationOptions = {},
+  ): MeetingTranscriptSegment[] {
     const updated: MeetingTranscriptSegment[] = [];
-    for (const segment of active.segments.values()) {
-      const segmentEvidence = evidence.filter((item) => (
+    for (const segmentIdValue of segmentIds) {
+      const segment = active.segments.get(segmentIdValue);
+      if (!segment) continue;
+      const segmentEvidence = active.speakerEvidence.filter((item) => (
         item.endSample > segment.startSample && item.startSample < segment.endSample
       ));
       const voiceProfile = options.voiceProfilesBySegment?.[segment.segmentId];
@@ -413,11 +430,58 @@ export class SelfHostedMeetingTranscription {
       active.segments.set(upsert.segmentId, upsert);
       updated.push(upsert);
     }
-    return {
-      segments: updated.sort((a, b) => (
-        a.epoch - b.epoch || a.startSample - b.startSample || a.segmentId.localeCompare(b.segmentId)
-      )),
-    };
+    return updated.sort((a, b) => (
+      a.epoch - b.epoch || a.startSample - b.startSample || a.segmentId.localeCompare(b.segmentId)
+    ));
+  }
+
+  private retainSpeakerEvidence(active: ActiveMeeting, evidence: readonly MeetingSpeakerEvidence[]): void {
+    for (const raw of evidence) {
+      const startSample = Number.isSafeInteger(raw.startSample) ? raw.startSample : -1;
+      const endSample = Number.isSafeInteger(raw.endSample) ? raw.endSample : -1;
+      if (startSample < 0 || endSample <= startSample) continue;
+      const source = typeof raw.source === 'string' ? raw.source.trim().slice(0, 80) : '';
+      if (!source) continue;
+      const participantId = typeof raw.participantId === 'string' ? raw.participantId.trim().slice(0, 160) || undefined : undefined;
+      const displayName = typeof raw.displayName === 'string' ? raw.displayName.trim().slice(0, 160) || undefined : undefined;
+      const confidence = Number.isFinite(raw.confidence) ? Math.max(0, Math.min(1, raw.confidence)) : 0;
+      const normalized: MeetingSpeakerEvidence = {
+        source, participantId, displayName,
+        isSelf: raw.isSelf === true,
+        isActive: raw.isActive === true,
+        isMuted: raw.isMuted === true,
+        startSample, endSample, confidence,
+      };
+      const duplicate = active.speakerEvidence.some((item) => (
+        item.source === normalized.source
+        && item.participantId === normalized.participantId
+        && item.displayName === normalized.displayName
+        && item.isSelf === normalized.isSelf
+        && item.isActive === normalized.isActive
+        && item.isMuted === normalized.isMuted
+        && item.startSample === normalized.startSample
+        && item.endSample === normalized.endSample
+        && item.confidence === normalized.confidence
+      ));
+      if (!duplicate) active.speakerEvidence.push(normalized);
+    }
+    active.speakerEvidence.sort((a, b) => a.endSample - b.endSample || a.startSample - b.startSample);
+    if (active.speakerEvidence.length > MAX_SPEAKER_EVIDENCE) {
+      active.speakerEvidence.splice(0, active.speakerEvidence.length - MAX_SPEAKER_EVIDENCE);
+    }
+  }
+
+  private pruneSpeakerEvidence(active: ActiveMeeting): void {
+    const finalizedEnd = [...active.segments.values()]
+      .filter((segment) => segment.finality === 'final')
+      .reduce((latest, segment) => Math.max(latest, segment.endSample), 0);
+    const latestObserved = Math.max(
+      finalizedEnd,
+      ...Object.values(active.channels).map((channel) => channel.nextSample),
+      ...active.speakerEvidence.map((item) => item.endSample),
+    );
+    const historyFloor = Math.max(finalizedEnd, latestObserved - SPEAKER_EVIDENCE_HISTORY_SAMPLES);
+    active.speakerEvidence = active.speakerEvidence.filter((item) => item.endSample > historyFloor);
   }
 
   async reset(meetingId: string): Promise<void> {
@@ -558,13 +622,19 @@ export class SelfHostedMeetingTranscription {
     const merged = mergeMeetingTranscriptSegments(active.segments.values(), updates);
     active.segments = new Map(merged.map((segment) => [segment.segmentId, segment]));
     const accepted = updates.filter((update) => active.segments.get(update.segmentId)?.revision === update.revision);
+    // AX/evidence often arrives before the corresponding ASR text because
+    // the stream has model look-ahead. Re-evaluate exactly the records this
+    // snapshot created or revised against the bounded retained history.
+    const attributed = this.resolveStoredSpeakerEvidence(active, accepted.map((segment) => segment.segmentId));
+    this.pruneSpeakerEvidence(active);
+    const emitted = mergeMeetingTranscriptSegments([], [...accepted, ...attributed]);
     return {
       ...worker,
       version: 2,
       epoch: state.epoch,
       feed,
       captureHealth: { ...state.health },
-      segments: accepted,
+      segments: emitted,
     };
   }
 

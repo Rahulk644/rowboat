@@ -237,3 +237,43 @@ test('main-process evidence batch names distinct intervals, preserves overlap, a
   ]);
   assert.deepEqual(rosterOnly, { segments: [] });
 });
+
+test('evidence received before delayed ASR is applied when its interval is created', async (t) => {
+  const originalUrl = process.env.ROWBOAT_MEETING_STT_URL;
+  const originalToken = process.env.ROWBOAT_MEETING_STT_TOKEN;
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    if (originalUrl === undefined) delete process.env.ROWBOAT_MEETING_STT_URL;
+    else process.env.ROWBOAT_MEETING_STT_URL = originalUrl;
+    if (originalToken === undefined) delete process.env.ROWBOAT_MEETING_STT_TOKEN;
+    else process.env.ROWBOAT_MEETING_STT_TOKEN = originalToken;
+    globalThis.fetch = originalFetch;
+  });
+  process.env.ROWBOAT_MEETING_STT_TOKEN = TOKEN;
+  process.env.ROWBOAT_MEETING_STT_URL = 'http://127.0.0.1:18091';
+  globalThis.fetch = async (input) => {
+    const url = new URL(input.toString());
+    const session = url.searchParams.get('session') ?? '';
+    if (url.pathname === '/stream/feed') {
+      return new Response(JSON.stringify({
+        session, full: 'Akbar speaks first', committed: 'Akbar speaks first', tentative: '', changed: true,
+        final: false, revision: 1, inputMs: 1_000, bufferedMs: 0,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({ ok: true, session }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  };
+
+  const provider = new SelfHostedMeetingTranscription();
+  await provider.begin('early evidence', 'en');
+  assert.deepEqual(provider.applySpeakerEvidence('early evidence', [
+    { source: 'zoom_ax', participantId: 'akbar', displayName: 'Akbar', isActive: true, startSample: 0, endSample: 16_000, confidence: 1 },
+  ]), { segments: [] });
+
+  const snapshot = await provider.feed('early evidence', 'system', Buffer.alloc(32_000).toString('base64'), {
+    startSample: 0, sampleCount: 16_000, sampleRate: 16_000, sequence: 0,
+  });
+  assert.equal(snapshot.segments.length, 1);
+  assert.equal(snapshot.segments[0]?.revision, 1);
+  assert.deepEqual(snapshot.segments[0]?.speaker, { kind: 'named', id: 'akbar', displayName: 'Akbar' });
+  assert.equal(snapshot.segments[0]?.attributionSource, 'zoom_ax');
+});
