@@ -124,7 +124,7 @@ test('a discontinuity resets only its worker session and starts a non-duplicatin
 
   const requests: string[] = [];
   let micWasReset = false;
-  globalThis.fetch = async (input, init) => {
+  globalThis.fetch = async (input) => {
     const url = new URL(input.toString());
     const session = url.searchParams.get('session') ?? '';
     requests.push(`${url.pathname}:${session}`);
