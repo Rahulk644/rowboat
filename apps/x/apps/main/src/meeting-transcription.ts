@@ -356,6 +356,21 @@ export class SelfHostedMeetingTranscription {
     await this.beginSessions(config, active.sessions, active.language);
   }
 
+  /**
+   * Recovers only the failed named ASR session. Callers must not replay a
+   * successfully acknowledged sibling channel: doing so would create a new
+   * interval for already-accepted PCM and eventually duplicate its text.
+   */
+  async restartChannel(meetingId: string, channel: MeetingAudioChannel): Promise<void> {
+    const config = this.requireConfig();
+    const active = this.requireActive(meetingId);
+    await this.serialized(async () => {
+      await this.request(config, '/stream/reset', active.sessions[channel]);
+      await this.request(config, '/stream/begin', active.sessions[channel], undefined, active.language);
+      this.beginNewEpoch(active.channels[channel], 'transcription channel restarted');
+    });
+  }
+
   /** In-memory meeting-local correction; durable voice enrollment stays opt-in and out of this slice. */
   correctSpeaker(
     meetingId: string | undefined,

@@ -1007,6 +1007,10 @@ export function setupIpcHandlers() {
       void meetingBridgeRuntime.restart(args.meetingId);
       return { success: true as const };
     },
+    'meeting:transcription:restartChannel': async (_event, args) => {
+      await selfHostedMeetingTranscription.restartChannel(args.meetingId, args.channel);
+      return { success: true as const };
+    },
     'meeting:transcription:reset': async (_event, args) => {
       try {
         await selfHostedMeetingTranscription.reset(args.meetingId);

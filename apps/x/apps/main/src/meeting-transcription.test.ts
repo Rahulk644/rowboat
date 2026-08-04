@@ -371,3 +371,57 @@ test('post-transcript evidence is delivered in the next snapshot exactly once', 
   });
   assert.deepEqual(afterDelivery.segments, []);
 });
+
+test('restartChannel resets only the failed ASR session and preserves sibling epoch', async (t) => {
+  const originalUrl = process.env.ROWBOAT_MEETING_STT_URL;
+  const originalToken = process.env.ROWBOAT_MEETING_STT_TOKEN;
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    if (originalUrl === undefined) delete process.env.ROWBOAT_MEETING_STT_URL;
+    else process.env.ROWBOAT_MEETING_STT_URL = originalUrl;
+    if (originalToken === undefined) delete process.env.ROWBOAT_MEETING_STT_TOKEN;
+    else process.env.ROWBOAT_MEETING_STT_TOKEN = originalToken;
+    globalThis.fetch = originalFetch;
+  });
+  process.env.ROWBOAT_MEETING_STT_TOKEN = TOKEN;
+  process.env.ROWBOAT_MEETING_STT_URL = 'http://127.0.0.1:18091';
+  const paths: string[] = [];
+  let micFeed = 0;
+  globalThis.fetch = async (input) => {
+    const url = new URL(input.toString());
+    const session = url.searchParams.get('session') ?? '';
+    paths.push(`${url.pathname}:${session}`);
+    if (url.pathname === '/stream/feed') {
+      const text = session.endsWith('.mic')
+        ? (micFeed++ === 0 ? 'mic first' : 'mic first second')
+        : 'remote first';
+      return new Response(JSON.stringify({
+        session, full: text, committed: text, tentative: '', changed: true,
+        final: false, revision: 1, inputMs: 0, bufferedMs: 0,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({ ok: true, session }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  };
+
+  const provider = new SelfHostedMeetingTranscription();
+  await provider.begin('partial pair', 'en');
+  const pcm = Buffer.from([0, 0, 1, 0]).toString('base64');
+  const firstMic = await provider.feed('partial pair', 'mic', pcm, {
+    startSample: 0, sampleCount: 2, sampleRate: 16_000, sequence: 0,
+  });
+  await provider.restartChannel('partial pair', 'system');
+  const nextMic = await provider.feed('partial pair', 'mic', pcm, {
+    startSample: 2, sampleCount: 2, sampleRate: 16_000, sequence: 1,
+  });
+  const retriedSystem = await provider.feed('partial pair', 'system', pcm, {
+    startSample: 0, sampleCount: 2, sampleRate: 16_000, sequence: 0,
+  });
+
+  assert.equal(firstMic.epoch, 0);
+  assert.equal(nextMic.epoch, 0);
+  assert.equal(nextMic.segments[0]?.text, 'second');
+  assert.equal(retriedSystem.epoch, 1);
+  assert.ok(paths.includes('/stream/reset:partial-pair.system'));
+  assert.ok(paths.includes('/stream/begin:partial-pair.system'));
+  assert.equal(paths.includes('/stream/reset:partial-pair.mic'), false);
+});

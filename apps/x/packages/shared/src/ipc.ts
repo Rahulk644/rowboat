@@ -1191,6 +1191,16 @@ const ipcSchemas = {
     req: z.object({ meetingId: z.string().min(1).max(120) }),
     res: z.object({ success: z.literal(true) }),
   },
+  // Recover just one named ASR channel after a partial pair failure. The
+  // renderer must retry only this channel's immutable batch; replaying an
+  // acknowledged sibling creates duplicate audio intervals.
+  'meeting:transcription:restartChannel': {
+    req: z.object({
+      meetingId: z.string().min(1).max(120),
+      channel: z.enum(['mic', 'system']),
+    }),
+    res: z.object({ success: z.literal(true) }),
+  },
   'meeting:transcription:reset': {
     req: z.object({ meetingId: z.string().min(1).max(120) }),
     res: z.object({ success: z.literal(true) }),
