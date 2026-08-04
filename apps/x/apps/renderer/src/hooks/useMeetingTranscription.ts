@@ -21,6 +21,13 @@ const DEEPGRAM_PARAMS = new URLSearchParams({
 });
 const DEEPGRAM_LISTEN_URL = `wss://api.deepgram.com/v1/listen?${DEEPGRAM_PARAMS.toString()}`;
 
+// Nemotron's qualified streaming profile consumes 560 ms chunks at 16 kHz.
+// Rowboat keeps microphone and system audio in separate named sessions so one
+// loaded model can preserve source identity without running a second worker.
+const SELF_HOSTED_BATCH_SAMPLES = 8_960;
+const SELF_HOSTED_MAX_PENDING_BATCHES = 24;
+const SELF_HOSTED_RECONNECT_DELAYS_MS = [250, 500, 1_000, 2_000, 4_000];
+
 // RMS threshold: system audio above this = "active" (speakers playing)
 const SYSTEM_AUDIO_GATE_THRESHOLD = 0.005;
 
@@ -88,6 +95,31 @@ interface TranscriptEntry {
     text: string;
 }
 
+interface SelfHostedSnapshot {
+    full: string;
+    committed: string;
+    tentative: string;
+    final: boolean;
+}
+
+type SelfHostedChannel = 'mic' | 'system';
+
+function pcm16ToBase64(pcm: Int16Array): string {
+    const bytes = new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return btoa(binary);
+}
+
+function floatToPcm16(sample: number): number {
+    const bounded = Math.max(-1, Math.min(1, sample));
+    return bounded < 0 ? bounded * 0x8000 : bounded * 0x7fff;
+}
+
+function wait(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 export interface CalendarEventMeta {
     summary?: string
     start?: { dateTime?: string; date?: string }
@@ -150,6 +182,16 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
     const { refresh: refreshRowboatAccount } = useRowboatAccount();
     const [state, setState] = useState<MeetingTranscriptionState>('idle');
     const wsRef = useRef<WebSocket | null>(null);
+    const selfHostedMeetingIdRef = useRef<string | null>(null);
+    const selfHostedCommittedRef = useRef<Record<SelfHostedChannel, string>>({ mic: '', system: '' });
+    const selfHostedPcmRef = useRef({
+        mic: new Int16Array(SELF_HOSTED_BATCH_SAMPLES),
+        system: new Int16Array(SELF_HOSTED_BATCH_SAMPLES),
+        length: 0,
+    });
+    const selfHostedFeedTailRef = useRef<Promise<void>>(Promise.resolve());
+    const selfHostedPendingBatchesRef = useRef(0);
+    const selfHostedFailureShownRef = useRef(false);
     const micStreamRef = useRef<MediaStream | null>(null);
     const systemStreamRef = useRef<MediaStream | null>(null);
     const processorRef = useRef<ScriptProcessorNode | null>(null);
@@ -205,6 +247,113 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
         }, 1000);
     }, [writeTranscriptToFile]);
 
+    const applySelfHostedSnapshot = useCallback((channel: SelfHostedChannel, snapshot: SelfHostedSnapshot) => {
+        const channelIndex = channel === 'mic' ? 0 : 1;
+        const speaker = channel === 'mic' ? 'You' : 'Remote participant';
+        const previousCommitted = selfHostedCommittedRef.current[channel];
+        const currentCommitted = snapshot.final ? snapshot.full : snapshot.committed;
+
+        if (currentCommitted.startsWith(previousCommitted)) {
+            const delta = currentCommitted.slice(previousCommitted.length).trim();
+            if (delta) {
+                const entries = transcriptRef.current;
+                if (entries.length > 0 && entries[entries.length - 1].speaker === speaker) {
+                    entries[entries.length - 1].text += ` ${delta}`;
+                } else {
+                    entries.push({ speaker, text: delta });
+                }
+            }
+            selfHostedCommittedRef.current[channel] = currentCommitted;
+        } else if (currentCommitted !== previousCommitted) {
+            // Stable committed prefixes must never be revised. Refuse to append
+            // conflicting text instead of duplicating or silently corrupting the
+            // meeting note; the next final snapshot remains recoverable in logs.
+            console.warn('[meeting] Self-hosted committed prefix changed unexpectedly');
+        }
+
+        if (snapshot.final || !snapshot.tentative.trim()) {
+            interimRef.current.delete(channelIndex);
+        } else {
+            interimRef.current.set(channelIndex, { speaker, text: snapshot.tentative.trim() });
+        }
+        scheduleDebouncedWrite();
+    }, [scheduleDebouncedWrite]);
+
+    const queueSelfHostedBatch = useCallback((mic: Int16Array, system: Int16Array) => {
+        const meetingId = selfHostedMeetingIdRef.current;
+        if (!meetingId) return;
+        if (selfHostedPendingBatchesRef.current >= SELF_HOSTED_MAX_PENDING_BATCHES) {
+            console.error('[meeting] Self-hosted transcription backlog full; dropping one bounded audio batch');
+            if (!selfHostedFailureShownRef.current) {
+                selfHostedFailureShownRef.current = true;
+                toast.error('Live transcription is falling behind', {
+                    description: 'Recording continues, but part of the live transcript may be missing.',
+                    duration: 10_000,
+                });
+            }
+            return;
+        }
+        const micBase64 = pcm16ToBase64(mic);
+        const systemBase64 = pcm16ToBase64(system);
+        selfHostedPendingBatchesRef.current++;
+        selfHostedFeedTailRef.current = selfHostedFeedTailRef.current.then(async () => {
+            let lastError: unknown;
+            for (let attempt = 0; attempt <= SELF_HOSTED_RECONNECT_DELAYS_MS.length; attempt++) {
+                try {
+                    // Apply neither channel until both requests succeed. If the
+                    // second request fails, restarting both sessions and replaying
+                    // the pair cannot duplicate an already-rendered mic segment.
+                    const micSnapshot = await window.ipc.invoke('meeting:transcription:feed', {
+                        meetingId,
+                        channel: 'mic',
+                        pcmBase64: micBase64,
+                    });
+                    const systemSnapshot = await window.ipc.invoke('meeting:transcription:feed', {
+                        meetingId,
+                        channel: 'system',
+                        pcmBase64: systemBase64,
+                    });
+                    applySelfHostedSnapshot('mic', micSnapshot);
+                    applySelfHostedSnapshot('system', systemSnapshot);
+                    selfHostedFailureShownRef.current = false;
+                    return;
+                } catch (error) {
+                    lastError = error;
+                    const delay = SELF_HOSTED_RECONNECT_DELAYS_MS[attempt];
+                    if (delay === undefined || selfHostedMeetingIdRef.current !== meetingId) break;
+                    console.warn(`[meeting] Self-hosted transport interrupted; reconnecting in ${delay}ms`);
+                    await wait(delay);
+                    await window.ipc.invoke('meeting:transcription:restart', { meetingId });
+                    // The worker starts a fresh epoch. Keep prior transcript
+                    // entries, but compare new stable prefixes from zero.
+                    selfHostedCommittedRef.current = { mic: '', system: '' };
+                }
+            }
+            throw lastError;
+        }).catch((error) => {
+            console.error('[meeting] Self-hosted transcription feed failed:', error);
+            if (!selfHostedFailureShownRef.current) {
+                selfHostedFailureShownRef.current = true;
+                toast.error('Live transcription connection lost', {
+                    description: 'Rowboat will keep the meeting open so you can stop and retry safely.',
+                    duration: 10_000,
+                });
+            }
+        }).finally(() => {
+            selfHostedPendingBatchesRef.current--;
+        });
+    }, [applySelfHostedSnapshot]);
+
+    const flushSelfHostedPcm = useCallback(() => {
+        const buffered = selfHostedPcmRef.current;
+        if (buffered.length === 0) return;
+        queueSelfHostedBatch(
+            buffered.mic.slice(0, buffered.length),
+            buffered.system.slice(0, buffered.length),
+        );
+        buffered.length = 0;
+    }, [queueSelfHostedBatch]);
+
     const stopInputCapture = useCallback(() => {
         if (processorRef.current) {
             processorRef.current.disconnect();
@@ -247,6 +396,13 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
             wsRef.current.close();
             wsRef.current = null;
         }
+        const selfHostedMeetingId = selfHostedMeetingIdRef.current;
+        if (selfHostedMeetingId) {
+            selfHostedMeetingIdRef.current = null;
+            void window.ipc.invoke('meeting:transcription:reset', {
+                meetingId: selfHostedMeetingId,
+            }).catch((error) => console.error('[meeting] Failed to reset self-hosted transcription:', error));
+        }
     }, [stopInputCapture]);
 
     const start = useCallback(async (calendarEvent?: CalendarEventMeta): Promise<string | null> => {
@@ -254,11 +410,20 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
         setState('connecting');
 
         // Run independent setup steps in parallel for faster startup
-        const [headphoneResult, wsResult, micResult, systemResult] = await Promise.allSettled([
+        const [headphoneResult, transcriptionResult, micResult, systemResult] = await Promise.allSettled([
             // 1. Detect headphones vs speakers
             detectHeadphones(),
-            // 2. Set up Deepgram WebSocket (account refresh + connect + wait for open)
+            // 2. Select the main-process self-hosted provider when configured;
+            // otherwise retain Rowboat's existing Deepgram path.
             (async () => {
+                const provider = await window.ipc.invoke('meeting:transcription:getProvider', null);
+                if (provider.reason) console.warn('[meeting] Self-hosted provider unavailable:', provider.reason);
+                if (provider.provider === 'self-hosted-nemotron') {
+                    const meetingId = `rowboat-${crypto.randomUUID()}`;
+                    await window.ipc.invoke('meeting:transcription:begin', { meetingId, language: 'en' });
+                    console.log('[meeting] Using self-hosted Nemotron provider');
+                    return { kind: 'self-hosted' as const, meetingId };
+                }
                 // Token from account refresh; websocket URL from the
                 // sign-in-independent bootstrap config store.
                 const [account, rowboatConfig] = await Promise.all([
@@ -289,7 +454,7 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
                 });
                 if (!ok) throw new Error('WebSocket failed to connect');
                 console.log('[meeting] WebSocket connected');
-                return ws;
+                return { kind: 'deepgram' as const, ws };
             })(),
             // 3. Get mic stream
             navigator.mediaDevices.getUserMedia({
@@ -316,12 +481,12 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
         ]);
 
         // Check for failures — clean up any successful resources if something failed
-        const failed = wsResult.status === 'rejected'
+        const failed = transcriptionResult.status === 'rejected'
             || micResult.status === 'rejected'
             || systemResult.status === 'rejected';
 
         if (failed) {
-            if (wsResult.status === 'rejected') console.error('[meeting] WebSocket setup failed:', wsResult.reason);
+            if (transcriptionResult.status === 'rejected') console.error('[meeting] Transcription setup failed:', transcriptionResult.reason);
             if (micResult.status === 'rejected') console.error('[meeting] Microphone access denied:', micResult.reason);
             if (systemResult.status === 'rejected') {
                 console.error('[meeting] System audio access denied:', systemResult.reason);
@@ -333,7 +498,15 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
                 }
             }
             // Clean up any resources that did succeed
-            if (wsResult.status === 'fulfilled') { wsResult.value.close(); }
+            if (transcriptionResult.status === 'fulfilled') {
+                if (transcriptionResult.value.kind === 'deepgram') {
+                    transcriptionResult.value.ws.close();
+                } else {
+                    void window.ipc.invoke('meeting:transcription:reset', {
+                        meetingId: transcriptionResult.value.meetingId,
+                    }).catch((error) => console.error('[meeting] Failed to reset partial transcription setup:', error));
+                }
+            }
             if (micResult.status === 'fulfilled') { micResult.value.getTracks().forEach(t => t.stop()); }
             if (systemResult.status === 'fulfilled') { systemResult.value.getTracks().forEach(t => t.stop()); }
             cleanup();
@@ -344,50 +517,60 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
         const usingHeadphones = headphoneResult.status === 'fulfilled' ? headphoneResult.value : false;
         console.log(`[meeting] Audio output mode: ${usingHeadphones ? 'headphones' : 'speakers'}`);
 
-        const ws = wsResult.value;
-        wsRef.current = ws;
-
-        // Set up WS message handler
         transcriptRef.current = [];
         interimRef.current = new Map();
-        ws.onmessage = (event) => {
-            const data = JSON.parse(event.data);
-            if (!data.channel?.alternatives?.[0]) return;
-            const transcript = data.channel.alternatives[0].transcript;
-            if (!transcript) return;
+        selfHostedCommittedRef.current = { mic: '', system: '' };
+        selfHostedPcmRef.current.length = 0;
+        selfHostedFeedTailRef.current = Promise.resolve();
+        selfHostedPendingBatchesRef.current = 0;
+        selfHostedFailureShownRef.current = false;
 
-            const channelIndex = data.channel_index?.[0] ?? 0;
-            const isMic = channelIndex === 0;
+        if (transcriptionResult.value.kind === 'self-hosted') {
+            selfHostedMeetingIdRef.current = transcriptionResult.value.meetingId;
+        } else {
+            const ws = transcriptionResult.value.ws;
+            wsRef.current = ws;
 
-            // Channel 0 = mic = "You", Channel 1 = system audio with diarization
-            let speaker: string;
-            if (isMic) {
-                speaker = 'You';
-            } else {
-                // Use Deepgram diarization speaker ID for system audio channel
-                const words = data.channel.alternatives[0].words;
-                const speakerId = words?.[0]?.speaker;
-                speaker = speakerId != null ? `Speaker ${speakerId}` : 'System audio';
-            }
+            // Set up WS message handler
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                if (!data.channel?.alternatives?.[0]) return;
+                const transcript = data.channel.alternatives[0].transcript;
+                if (!transcript) return;
 
-            if (data.is_final) {
-                interimRef.current.delete(channelIndex);
-                const entries = transcriptRef.current;
-                if (entries.length > 0 && entries[entries.length - 1].speaker === speaker) {
-                    entries[entries.length - 1].text += ' ' + transcript;
+                const channelIndex = data.channel_index?.[0] ?? 0;
+                const isMic = channelIndex === 0;
+
+                // Channel 0 = mic = "You", Channel 1 = system audio with diarization
+                let speaker: string;
+                if (isMic) {
+                    speaker = 'You';
                 } else {
-                    entries.push({ speaker, text: transcript });
+                    // Use Deepgram diarization speaker ID for system audio channel
+                    const words = data.channel.alternatives[0].words;
+                    const speakerId = words?.[0]?.speaker;
+                    speaker = speakerId != null ? `Speaker ${speakerId}` : 'System audio';
                 }
-            } else {
-                interimRef.current.set(channelIndex, { speaker, text: transcript });
-            }
-            scheduleDebouncedWrite();
-        };
 
-        ws.onclose = () => {
-            console.log('[meeting] WebSocket closed');
-            wsRef.current = null;
-        };
+                if (data.is_final) {
+                    interimRef.current.delete(channelIndex);
+                    const entries = transcriptRef.current;
+                    if (entries.length > 0 && entries[entries.length - 1].speaker === speaker) {
+                        entries[entries.length - 1].text += ' ' + transcript;
+                    } else {
+                        entries.push({ speaker, text: transcript });
+                    }
+                } else {
+                    interimRef.current.set(channelIndex, { speaker, text: transcript });
+                }
+                scheduleDebouncedWrite();
+            };
+
+            ws.onclose = () => {
+                console.log('[meeting] WebSocket closed');
+                wsRef.current = null;
+            };
+        }
 
         const micStream = micResult.value;
         micStreamRef.current = micStream;
@@ -464,8 +647,6 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
         processorRef.current = processor;
 
         processor.onaudioprocess = (e) => {
-            if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-
             const micRaw = e.inputBuffer.getChannelData(0);
             const sysRaw = e.inputBuffer.getChannelData(1);
 
@@ -498,13 +679,27 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
                 micOut = micRaw;
             }
 
+            if (selfHostedMeetingIdRef.current) {
+                const buffered = selfHostedPcmRef.current;
+                for (let i = 0; i < micOut.length; i++) {
+                    buffered.mic[buffered.length] = floatToPcm16(micOut[i]);
+                    buffered.system[buffered.length] = floatToPcm16(sysRaw[i]);
+                    buffered.length++;
+                    if (buffered.length === SELF_HOSTED_BATCH_SAMPLES) {
+                        queueSelfHostedBatch(buffered.mic.slice(), buffered.system.slice());
+                        buffered.length = 0;
+                    }
+                }
+                return;
+            }
+
+            if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+
             // Interleave mic (ch0) + system audio (ch1) into stereo int16 PCM
             const int16 = new Int16Array(micOut.length * 2);
             for (let i = 0; i < micOut.length; i++) {
-                const s0 = Math.max(-1, Math.min(1, micOut[i]));
-                const s1 = Math.max(-1, Math.min(1, sysRaw[i]));
-                int16[i * 2] = s0 < 0 ? s0 * 0x8000 : s0 * 0x7fff;
-                int16[i * 2 + 1] = s1 < 0 ? s1 * 0x8000 : s1 * 0x7fff;
+                int16[i * 2] = floatToPcm16(micOut[i]);
+                int16[i * 2 + 1] = floatToPcm16(sysRaw[i]);
             }
             wsRef.current.send(int16.buffer);
         };
@@ -587,20 +782,44 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
 
         setState('recording');
         return notePath;
-    }, [state, cleanup, scheduleDebouncedWrite, refreshRowboatAccount]);
+    }, [state, cleanup, scheduleDebouncedWrite, refreshRowboatAccount, queueSelfHostedBatch]);
 
     const stop = useCallback(async () => {
         if (state !== 'recording') return;
         setState('stopping');
 
         stopInputCapture();
-        await finalizeDeepgramStream(wsRef.current, 2200);
+        const selfHostedMeetingId = selfHostedMeetingIdRef.current;
+        try {
+            if (selfHostedMeetingId) {
+                flushSelfHostedPcm();
+                await selfHostedFeedTailRef.current;
+                const final = await window.ipc.invoke('meeting:transcription:finalize', {
+                    meetingId: selfHostedMeetingId,
+                });
+                applySelfHostedSnapshot('mic', final.mic);
+                applySelfHostedSnapshot('system', final.system);
+                selfHostedMeetingIdRef.current = null;
+            } else {
+                await finalizeDeepgramStream(wsRef.current, 2200);
+            }
+        } catch (error) {
+            console.error('[meeting] Failed to finalize transcription:', error);
+            toast.error('Could not finish the live transcript', {
+                description: 'Rowboat kept the transcript received before the connection failed.',
+                duration: 10_000,
+            });
+        } finally {
+            // finalize() releases remote slots even when it fails. Clear the
+            // renderer identity so cleanup cannot race a duplicate reset.
+            if (selfHostedMeetingId) selfHostedMeetingIdRef.current = null;
+        }
         cleanup();
         await writeTranscriptToFile();
         interimRef.current = new Map();
 
         setState('idle');
-    }, [state, cleanup, stopInputCapture, writeTranscriptToFile]);
+    }, [state, cleanup, stopInputCapture, writeTranscriptToFile, flushSelfHostedPcm, applySelfHostedSnapshot]);
 
     return { state, start, stop };
 }
