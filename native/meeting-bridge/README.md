@@ -22,6 +22,11 @@ PCM callback has produced a normalized 20 ms frame. A buffer full of zeroes is
 valid silence. An open handle with no callbacks remains `Starting` or
 `Recovering`.
 
+The optional `anarlog-ax` alpha is evidence-only: it can emit a bounded Zoom
+`speaker_evidence` record but cannot open, replace, pause, route, or otherwise
+claim anything about Rowboat audio capture. A speaker-evidence failure is
+explicitly separate from capture health.
+
 ## Local contract
 
 Each channel is independent and uses 16 kHz mono fixed 20 ms frames (320
@@ -111,6 +116,33 @@ requires the real macOS TCC/Zoom qualification listed in the manifest, and
 Electron main must own the permission UX and construct the source only after
 that gate passes.
 
+### Evidence-only alpha control flow
+
+On **macOS only**, a build with `--features anarlog-ax` treats a `start`
+command as an evidence-only session. It creates the `MacosZoomAnarlogProvider`,
+polls at most once every 250 ms, and emits only strict native-Zoom,
+explicit-active-speaker records. It deliberately does not emit an audio-frame,
+capture-health, or `Ready` event as a side effect. `stop` for the same meeting
+ends the evidence session.
+
+One Accessibility point never creates a speaker interval. The host retains it
+only as a baseline; after the next poll, it emits the already-observed interval
+between two matching named-active observations, only when that interval is
+200–750 ms. This avoids inventing future speech while satisfying the resolver's
+200 ms overlap requirement. Any missing, inactive, generic, wrong-meeting, or
+pre-existing observation resets continuity and is discarded before stdout.
+
+The command reader and AX poller communicate through a 32-command bounded
+channel; the main loop is the sole stdout writer and sleeps until either a
+command or the next poll deadline. Permission or backend failure stops the
+evidence session and emits one bounded error; it never leaves stale speaker
+evidence active or retries in a tight loop.
+
+Default/non-macOS builds retain the existing fail-closed `start` response:
+`source_configuration_required`. Electron main must continue using Rowboat's
+selected capture path for audio. Do not enable this alpha in a package until
+the TCC and physical Zoom tests in the source manifest have passed.
+
 The adapter never makes evidence up. It accepts participant/active-speaker data
 from a real provider, bounds it to 64 observations and 8 short signals, drops
 screen layout/AX trees, and retains `is_active = None` for roster-only rows.
@@ -133,7 +165,9 @@ Calendar, contacts, emails, and attendee inference are not part of this bridge.
    global loopback excluding the bridge process. Build artifacts are
    target-gated until a Windows physical acceptance packet exists.
 
-The current binary is intentionally a protocol smoke-test host. Electron main
-must construct sources through the library; this prevents an unreviewed command
-from selecting devices, sending secrets, or creating an accidental renderer
-audio path.
+The current binary is intentionally an audio-protocol smoke-test host. Electron
+main must construct audio sources through the library; this prevents an
+unreviewed command from selecting devices, sending secrets, or creating an
+accidental renderer audio path. The macOS `anarlog-ax` alpha is the narrow
+exception for **evidence only**, and still requires Electron main to own its
+feature flag, TCC UX, and physical qualification gate.
