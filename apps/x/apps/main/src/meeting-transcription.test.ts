@@ -277,3 +277,45 @@ test('evidence received before delayed ASR is applied when its interval is creat
   assert.deepEqual(snapshot.segments[0]?.speaker, { kind: 'named', id: 'akbar', displayName: 'Akbar' });
   assert.equal(snapshot.segments[0]?.attributionSource, 'zoom_ax');
 });
+
+test('a fast mic final does not prune evidence needed by delayed system ASR', async (t) => {
+  const originalUrl = process.env.ROWBOAT_MEETING_STT_URL;
+  const originalToken = process.env.ROWBOAT_MEETING_STT_TOKEN;
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    if (originalUrl === undefined) delete process.env.ROWBOAT_MEETING_STT_URL;
+    else process.env.ROWBOAT_MEETING_STT_URL = originalUrl;
+    if (originalToken === undefined) delete process.env.ROWBOAT_MEETING_STT_TOKEN;
+    else process.env.ROWBOAT_MEETING_STT_TOKEN = originalToken;
+    globalThis.fetch = originalFetch;
+  });
+  process.env.ROWBOAT_MEETING_STT_TOKEN = TOKEN;
+  process.env.ROWBOAT_MEETING_STT_URL = 'http://127.0.0.1:18091';
+  globalThis.fetch = async (input) => {
+    const url = new URL(input.toString());
+    const session = url.searchParams.get('session') ?? '';
+    if (url.pathname === '/stream/feed') {
+      const mic = session.endsWith('.mic');
+      const text = mic ? 'local final' : 'remote delayed';
+      return new Response(JSON.stringify({
+        session, full: text, committed: text, tentative: '', changed: true,
+        final: mic, revision: 1, inputMs: mic ? 2_000 : 1_000, bufferedMs: 0,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({ ok: true, session }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  };
+
+  const provider = new SelfHostedMeetingTranscription();
+  await provider.begin('cross channel watermark', 'en');
+  provider.applySpeakerEvidence('cross channel watermark', [
+    { source: 'zoom_ax', participantId: 'akbar', displayName: 'Akbar', isActive: true, startSample: 0, endSample: 16_000, confidence: 1 },
+  ]);
+  await provider.feed('cross channel watermark', 'mic', Buffer.alloc(64_000).toString('base64'), {
+    startSample: 0, sampleCount: 32_000, sampleRate: 16_000, sequence: 0,
+  });
+  const delayedSystem = await provider.feed('cross channel watermark', 'system', Buffer.alloc(32_000).toString('base64'), {
+    startSample: 0, sampleCount: 16_000, sampleRate: 16_000, sequence: 0,
+  });
+  assert.deepEqual(delayedSystem.segments[0]?.speaker, { kind: 'named', id: 'akbar', displayName: 'Akbar' });
+  assert.equal(delayedSystem.segments[0]?.revision, 1);
+});

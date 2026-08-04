@@ -472,16 +472,18 @@ export class SelfHostedMeetingTranscription {
   }
 
   private pruneSpeakerEvidence(active: ActiveMeeting): void {
-    const finalizedEnd = [...active.segments.values()]
-      .filter((segment) => segment.finality === 'final')
-      .reduce((latest, segment) => Math.max(latest, segment.endSample), 0);
     const latestObserved = Math.max(
-      finalizedEnd,
       ...Object.values(active.channels).map((channel) => channel.nextSample),
       ...active.speakerEvidence.map((item) => item.endSample),
     );
-    const historyFloor = Math.max(finalizedEnd, latestObserved - SPEAKER_EVIDENCE_HISTORY_SAMPLES);
+    // Do not use a single finalization watermark here: mic and system ASR
+    // sessions advance independently, so a fast mic final can precede a
+    // delayed system segment that still needs the same AX observation.
+    const historyFloor = Math.max(0, latestObserved - SPEAKER_EVIDENCE_HISTORY_SAMPLES);
     active.speakerEvidence = active.speakerEvidence.filter((item) => item.endSample > historyFloor);
+    if (active.speakerEvidence.length > MAX_SPEAKER_EVIDENCE) {
+      active.speakerEvidence.splice(0, active.speakerEvidence.length - MAX_SPEAKER_EVIDENCE);
+    }
   }
 
   async reset(meetingId: string): Promise<void> {
