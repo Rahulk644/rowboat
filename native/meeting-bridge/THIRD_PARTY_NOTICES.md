@@ -13,12 +13,17 @@
 ## Anarlog
 
 - Source: <https://github.com/fastrepl/anarlog>
-- Intended pinned revision: `609ee772801f29292e4edee453f269089ebf0e8b`
+- Pinned revision: `609ee772801f29292e4edee453f269089ebf0e8b`
 - License: MIT
-- Use: future macOS bounded `meeting_ax` provider only
-- Status: not yet vendored or linked. This crate has an adapter contract only;
-  copying/adding the module requires its license text, exact source manifest,
-  checksum, local patch list, and TCC qualification first.
+- Use: optional macOS native-Zoom bounded `meeting_ax` provider only
+- Local source manifest: [`vendor/anarlog-meeting-ax/MANIFEST.md`](vendor/anarlog-meeting-ax/MANIFEST.md)
+- Included behavior: a narrow adaptation of Anarlog's bounded AX traversal,
+  Zoom meeting-window validation, and explicit active-speaker label parser.
+  It is compiled only with `--features anarlog-ax` on macOS. Browser paths,
+  chat capture/mutation, Calendar, contacts, and all other Anarlog modules are
+  excluded.
+- Qualification: TCC Accessibility plus a physical native-Zoom participant
+  test remains required before this optional provider is enabled in a package.
 
 No proprietary application code, private credentials, sessions, endpoints, or
 Calendar-derived identity data are included in this component.

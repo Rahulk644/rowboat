@@ -13,6 +13,10 @@ default = []
 # qualification gates pass on real macOS and Windows machines. The revision is
 # pinned rather than tracking a branch so the A/B result is reproducible.
 flexaudio = ["dep:flexaudio"]
+# Anarlog's `meeting_ax` implementation is MIT-licensed.  We vendor only the
+# bounded native Zoom inspection path behind an explicit macOS feature; it
+# never enables a browser extension, Calendar identity, or AX mutation.
+anarlog-ax = ["dep:cidre", "dep:macos-accessibility-client"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -23,6 +27,12 @@ thiserror = "2"
 # audited revision: 7e41bbd0b03c4f52260926fa0148ca0e0179fda1
 # See README.md for the qualification and rollback requirements.
 flexaudio = { git = "https://github.com/Studio-Sadola/flexaudio", rev = "7e41bbd0b03c4f52260926fa0148ca0e0179fda1", package = "flexaudio", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Transitive dependency versions are locked from the audited Anarlog revision
+# in Cargo.lock.  The code uses only its safe AX/NS wrappers.
+cidre = { version = "=0.15.0", features = ["ax"], optional = true }
+macos-accessibility-client = { version = "=0.0.1", optional = true }
 
 [lints.rust]
 unsafe_code = "forbid"

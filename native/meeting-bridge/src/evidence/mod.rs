@@ -6,6 +6,8 @@ mod anarlog_ax;
 
 use serde::Serialize;
 
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+pub use anarlog_ax::MacosZoomAnarlogProvider;
 pub use anarlog_ax::{
     normalize_anarlog_inspection, AnarlogAxProvider, AnarlogAxSource, AnarlogInspection,
     AnarlogParticipantStream,

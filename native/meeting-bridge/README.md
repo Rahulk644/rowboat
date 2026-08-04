@@ -48,6 +48,10 @@ cd native/meeting-bridge
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+
+# macOS-only Zoom Accessibility provider; compile and fixture-test it explicitly.
+cargo clippy --all-targets --features anarlog-ax -- -D warnings
+cargo test --features anarlog-ax
 ```
 
 The default build has no audio backend dependency, which keeps protocol and
@@ -88,11 +92,24 @@ contracts and VPS transport do not change.
 
 ## Anarlog evidence boundary
 
-The `evidence::AnarlogAxSource` maps the fields from Anarlog's bounded
-`meeting_ax` inspection into the bridge contract. It is deliberately a provider
-interface rather than copied code in this first slice: Anarlog is MIT but its
-module is currently workspace-coupled and needs a reviewed vendor manifest,
-license notice, and real macOS TCC/Zoom/Meet qualification before shipping.
+The optional macOS `anarlog-ax` feature includes
+`evidence::MacosZoomAnarlogProvider`, a small MIT-licensed adaptation of
+Anarlog's bounded `meeting_ax` Zoom inspection. Its exact upstream revision,
+license, source checksums, retained limits, exclusions, dependency choices,
+and physical qualification gate are in
+[`vendor/anarlog-meeting-ax/MANIFEST.md`](vendor/anarlog-meeting-ax/MANIFEST.md).
+
+It performs a non-prompting Accessibility trust check, looks up only the
+native Zoom bundle (`us.zoom.xos`), applies Anarlog's 0.6-second AX messaging
+timeout and 18-depth/1,800-node limits, and emits a name only from an explicit
+active-speaker label. Multiple plausible Zoom windows, inaccessible trees,
+generic labels, and roster-only rows produce no active-speaker claim. The
+provider never scans browser tabs or reads editable input values.
+
+The feature compiling is not permission to enable it in a user build. It still
+requires the real macOS TCC/Zoom qualification listed in the manifest, and
+Electron main must own the permission UX and construct the source only after
+that gate passes.
 
 The adapter never makes evidence up. It accepts participant/active-speaker data
 from a real provider, bounds it to 64 observations and 8 short signals, drops

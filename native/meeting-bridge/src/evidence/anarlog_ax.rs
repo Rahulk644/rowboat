@@ -1,12 +1,28 @@
 //! Compatibility boundary for Anarlog's MIT `meeting_ax` module.
 //!
-//! We do not fabricate Accessibility evidence. The actual macOS provider is
-//! left outside this crate until its pinned, workspace-coupled module is
-//! vendored with notices and qualified against a real TCC-enabled Zoom/Meet
-//! session. This file preserves the exact bounded translation shape so that
-//! vendor/wrapper work cannot accidentally leak an AX tree into Rowboat.
+//! The macOS provider is a deliberately small adaptation of the pinned,
+//! MIT-licensed source recorded in `vendor/anarlog-meeting-ax`. It has not
+//! passed a physical TCC-enabled Zoom qualification yet, so callers must not
+//! enable it for users solely because the feature compiles. This module keeps
+//! the provider and translation boundary narrow enough that it cannot leak an
+//! AX tree into Rowboat.
 
 use super::{EvidenceError, EvidenceSource, MeetingEvidenceSource, SpeakerEvidence};
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+use std::{collections::HashSet, time::Instant};
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+use cidre::{arc, ax, ns};
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+const ZOOM_BUNDLE_ID: &str = "us.zoom.xos";
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+const MAX_TREE_DEPTH: usize = 18;
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+const MAX_NODES: usize = 1_800;
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+const MAX_WINDOWS: usize = 8;
 
 /// The fields the bridge accepts from Anarlog's participant stream. Screen
 /// bounds are intentionally excluded: Rowboat needs evidence, not layout.
@@ -30,11 +46,370 @@ pub struct AnarlogInspection {
     pub active_speakers: Vec<AnarlogParticipantStream>,
 }
 
-/// Minimal provider needed by the adapter. A production implementation must
-/// call the audited Anarlog module and must use its own bounded AX traversal;
-/// it cannot substitute browser title text or a Calendar participant list.
+/// Minimal provider needed by the adapter. A provider must use a bounded AX
+/// traversal; it cannot substitute browser title text or a Calendar
+/// participant list.
 pub trait AnarlogAxProvider: Send {
     fn inspect(&mut self) -> Result<Vec<AnarlogInspection>, EvidenceError>;
+}
+
+/// Concrete, macOS-only native Zoom provider adapted from Anarlog's bounded
+/// `meeting_ax` source at the revision recorded in `vendor/anarlog-meeting-ax`.
+///
+/// It has intentionally narrow scope: it inspects only Zoom's native process,
+/// only after TCC Accessibility trust is granted, and emits only labels with an
+/// explicit active-speaker state. It neither traverses browser tabs nor emits
+/// raw Accessibility nodes, window titles, or arbitrary values.
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+#[derive(Debug)]
+pub struct MacosZoomAnarlogProvider {
+    meeting_started_at: Instant,
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+impl MacosZoomAnarlogProvider {
+    /// `meeting_started_at` must use the same monotonic origin as the capture
+    /// clock supplied to the bridge. This keeps observations alignable with
+    /// transcript audio intervals without exposing wall-clock meeting data.
+    #[must_use]
+    pub fn new(meeting_started_at: Instant) -> Self {
+        Self { meeting_started_at }
+    }
+
+    fn observed_at_sample(&self) -> u64 {
+        let micros = self.meeting_started_at.elapsed().as_micros();
+        micros.saturating_mul(16).min(u128::from(u64::MAX)) as u64
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+impl AnarlogAxProvider for MacosZoomAnarlogProvider {
+    fn inspect(&mut self) -> Result<Vec<AnarlogInspection>, EvidenceError> {
+        if !macos_accessibility_client::accessibility::application_is_trusted() {
+            return Err(EvidenceError::PermissionDenied);
+        }
+
+        let observed_at_sample = self.observed_at_sample();
+        let bundle_id = ns::String::with_str(ZOOM_BUNDLE_ID);
+        let mut inspections = Vec::new();
+        for app in ns::RunningApp::with_bundle_id(&bundle_id).iter() {
+            let ax_app = ax::UiElement::with_app_pid(app.pid());
+            // Anarlog's per-process cap prevents an unresponsive AX target
+            // from stalling capture/transport. Treat any inaccessible tree as
+            // no evidence rather than guessing a speaker.
+            let _ = ax_app.set_messaging_timeout_secs(0.6);
+            if let Some(active_speakers) = inspect_zoom_process(&ax_app) {
+                inspections.push(AnarlogInspection {
+                    platform: "zoom".to_string(),
+                    surface: "native".to_string(),
+                    observed_at_sample,
+                    active_speakers,
+                });
+            }
+        }
+        Ok(inspections)
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn inspect_zoom_process(ax_app: &ax::UiElement) -> Option<Vec<AnarlogParticipantStream>> {
+    let mut windows = Vec::new();
+    let mut visited = 0;
+    if !collect_windows(ax_app, 0, &mut visited, &mut windows) || windows.len() > MAX_WINDOWS {
+        return None;
+    }
+
+    let mut candidates = Vec::new();
+    for window in windows {
+        let mut nodes = Vec::new();
+        if !collect_nodes(&window, 0, &mut nodes) {
+            return None;
+        }
+        if zoom_meeting_window_is_validated(&nodes) {
+            candidates.push(nodes);
+        }
+    }
+
+    // More than one plausible Zoom meeting window is ambiguous. The bridge
+    // has no permission to choose based on title/layout heuristics.
+    if candidates.len() != 1 {
+        return None;
+    }
+    Some(find_zoom_active_speakers(&candidates.pop()?))
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn collect_windows(
+    element: &ax::UiElement,
+    depth: usize,
+    visited: &mut usize,
+    windows: &mut Vec<arc::R<ax::UiElement>>,
+) -> bool {
+    if depth > MAX_TREE_DEPTH || *visited >= MAX_NODES {
+        return false;
+    }
+    *visited += 1;
+
+    let Ok(role) = element.role() else {
+        return false;
+    };
+    let role = role.to_string();
+    if role == "AXWindow" {
+        windows.push(element.retained());
+        return windows.len() <= MAX_WINDOWS;
+    }
+
+    let Ok(children) = element.children() else {
+        return !ax_role_may_have_children(&role);
+    };
+    children
+        .iter()
+        .all(|child| collect_windows(child, depth + 1, visited, windows))
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn collect_nodes(element: &ax::UiElement, depth: usize, nodes: &mut Vec<ZoomAxNode>) -> bool {
+    if depth > MAX_TREE_DEPTH || nodes.len() >= MAX_NODES {
+        return false;
+    }
+    nodes.push(snapshot_node(element));
+
+    let Ok(children) = element.children() else {
+        return !ax_role_may_have_children(
+            nodes
+                .last()
+                .and_then(|node| node.role.as_deref())
+                .unwrap_or_default(),
+        );
+    };
+    children
+        .iter()
+        .all(|child| collect_nodes(child, depth + 1, nodes))
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn ax_role_may_have_children(role: &str) -> bool {
+    matches!(
+        role,
+        "AXApplication"
+            | "AXWindow"
+            | "AXGroup"
+            | "AXScrollArea"
+            | "AXList"
+            | "AXTable"
+            | "AXOutline"
+            | "AXRow"
+            | "AXCell"
+            | "AXSheet"
+            | "AXSplitGroup"
+            | "AXToolbar"
+            | "AXTabGroup"
+            | "AXMenuBar"
+            | "AXMenu"
+            | "AXPopover"
+            | "AXBrowser"
+            | "AXLayoutArea"
+    )
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+#[derive(Debug)]
+struct ZoomAxNode {
+    element_hash: usize,
+    role: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
+    placeholder: Option<String>,
+    value: Option<String>,
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn snapshot_node(element: &ax::UiElement) -> ZoomAxNode {
+    let role = element.role().ok().map(|role| role.to_string());
+    let settable_value = element.is_settable(ax::attr::value()).unwrap_or(false);
+    let is_input = matches!(
+        role.as_deref(),
+        Some("AXTextArea") | Some("AXTextField") | Some("AXSecureTextField")
+    );
+    ZoomAxNode {
+        element_hash: element.hash(),
+        role,
+        title: string_attr(element, ax::attr::title()),
+        description: string_attr(element, ax::attr::desc()),
+        placeholder: string_attr(element, ax::attr::placeholder_value()),
+        // Never read input values; speaker evidence lives in non-editable AX
+        // labels. This is stricter than a generic accessibility snapshot.
+        value: (!settable_value && !is_input)
+            .then(|| string_attr(element, ax::attr::value()))
+            .flatten(),
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn string_attr(element: &ax::UiElement, attr: &ax::Attr) -> Option<String> {
+    element
+        .attr_value(attr)
+        .ok()?
+        .try_as_string()
+        .map(|value| value.to_string())
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn node_labels(node: &ZoomAxNode) -> impl Iterator<Item = &str> {
+    [
+        node.title.as_deref(),
+        node.placeholder.as_deref(),
+        node.description.as_deref(),
+        node.value.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn zoom_meeting_window_is_validated(nodes: &[ZoomAxNode]) -> bool {
+    nodes.iter().any(|node| {
+        let role_matches = matches!(node.role.as_deref(), Some("AXGroup") | Some("AXCell"));
+        let has_audio_state = node_labels(node).any(|label| {
+            let label = label.to_ascii_lowercase();
+            label.contains("computer audio") || label.contains("no audio connected")
+        });
+        role_matches && has_audio_state && node_labels(node).any(is_zoom_video_evidence_label)
+    })
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn is_zoom_video_evidence_label(label: &str) -> bool {
+    let lower = label.trim().to_ascii_lowercase();
+    lower == "video tile"
+        || lower
+            .strip_prefix("video render ")
+            .and_then(|rest| rest.split_once(','))
+            .is_some_and(|(name, state)| {
+                !name.trim().is_empty()
+                    && (state.contains("computer audio") || state.contains("no audio connected"))
+            })
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn find_zoom_active_speakers(nodes: &[ZoomAxNode]) -> Vec<AnarlogParticipantStream> {
+    let mut names = HashSet::new();
+    let mut streams = Vec::new();
+    for node in nodes {
+        if !matches!(
+            node.role.as_deref(),
+            Some("AXGroup") | Some("AXCell") | Some("AXRow")
+        ) {
+            continue;
+        }
+        let Some((label, name, is_self)) =
+            node_labels(node).find_map(parse_zoom_active_speaker_label)
+        else {
+            continue;
+        };
+        if !names.insert(name.to_ascii_lowercase()) {
+            continue;
+        }
+        let mut signals = vec!["speaker-state-label".to_string()];
+        if label.to_ascii_lowercase().starts_with("video render ") {
+            signals.push("video-label".to_string());
+        }
+        streams.push(AnarlogParticipantStream {
+            participant_id: Some(format!("ax-element-{:x}", node.element_hash)),
+            participant_name: Some(name),
+            is_self: Some(is_self),
+            is_active_speaker: Some(true),
+            is_muted: None,
+            confidence: 0.95,
+            signals,
+        });
+    }
+    streams
+}
+
+/// Adapted from Anarlog's `participant_name_from_speaker_label` at the pinned
+/// revision. It accepts only explicit speaker-state labels and rejects generic
+/// subject words, so a participant roster cannot become a false speaker claim.
+#[cfg(any(test, all(target_os = "macos", feature = "anarlog-ax")))]
+fn parse_zoom_active_speaker_label(label: &str) -> Option<(&str, String, bool)> {
+    let label = label.trim();
+    let lower = label.to_ascii_lowercase();
+    let is_self = lower.ends_with(" (you)");
+    let without_self = if is_self {
+        &label[..label.len() - " (you)".len()]
+    } else {
+        label
+    };
+    let lower = without_self.to_ascii_lowercase();
+    let name = if lower.starts_with("active speaker: ") {
+        &without_self["active speaker: ".len()..]
+    } else if lower.ends_with(" is speaking") {
+        &without_self[..without_self.len() - " is speaking".len()]
+    } else if let Some(index) = explicit_speaker_marker_index(&lower, ", active speaker") {
+        &without_self[..index]
+    } else if let Some(index) = explicit_speaker_marker_index(&lower, ", speaking") {
+        &without_self[..index]
+    } else {
+        return None;
+    };
+
+    let name = name.trim();
+    let name = name
+        .strip_prefix("Video render ")
+        .or_else(|| name.strip_prefix("video render "))
+        .map_or(name, |rest| {
+            rest.split(',').next().unwrap_or_default().trim()
+        });
+    plausible_participant_name(name).then(|| (label, name.to_string(), is_self))
+}
+
+#[cfg(any(test, all(target_os = "macos", feature = "anarlog-ax")))]
+fn explicit_speaker_marker_index(label: &str, marker: &str) -> Option<usize> {
+    let index = label.find(marker)?;
+    let suffix = &label[index + marker.len()..];
+    (suffix.is_empty() || suffix == " (you)").then_some(index)
+}
+
+#[cfg(any(test, all(target_os = "macos", feature = "anarlog-ax")))]
+fn plausible_participant_name(name: &str) -> bool {
+    let name = name.trim();
+    if name.is_empty()
+        || name.chars().count() > 80
+        || name
+            .chars()
+            .any(|character| matches!(character, '\n' | '\r' | '?' | '!'))
+    {
+        return false;
+    }
+    const GENERIC_SUBJECTS: &[&str] = &[
+        "anybody",
+        "anyone",
+        "everybody",
+        "everyone",
+        "nobody",
+        "participant",
+        "participants",
+        "person",
+        "somebody",
+        "someone",
+        "speaker",
+        "speakers",
+        "what",
+        "who",
+    ];
+    let words = name
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|character: char| !character.is_alphanumeric())
+                .to_ascii_lowercase()
+        })
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    !words.is_empty()
+        && words.len() <= 6
+        && !words
+            .iter()
+            .any(|word| GENERIC_SUBJECTS.contains(&word.as_str()))
 }
 
 /// Bounded adapter around a real Anarlog provider.
@@ -115,7 +490,10 @@ fn source_for_platform(platform: &str) -> EvidenceSource {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_anarlog_inspection, AnarlogInspection, AnarlogParticipantStream};
+    use super::{
+        normalize_anarlog_inspection, parse_zoom_active_speaker_label, AnarlogInspection,
+        AnarlogParticipantStream,
+    };
     use crate::evidence::EvidenceSource;
 
     #[test]
@@ -140,5 +518,26 @@ mod tests {
         assert_eq!(evidence[0].source, EvidenceSource::ZoomAx);
         assert_eq!(evidence[0].is_active, None);
         assert_eq!(evidence[0].display_name.as_deref(), Some("Akbar"));
+    }
+
+    #[test]
+    fn parses_only_explicit_zoom_speaker_labels() {
+        let parsed = parse_zoom_active_speaker_label("Video render Akbar Khan, active speaker")
+            .expect("explicit active speaker");
+        assert_eq!(parsed.1, "Akbar Khan");
+        assert!(!parsed.2);
+        assert!(
+            parse_zoom_active_speaker_label("Video render Akbar Khan, Computer audio unmuted")
+                .is_none()
+        );
+        assert!(parse_zoom_active_speaker_label("Participants, active speaker").is_none());
+    }
+
+    #[test]
+    fn keeps_an_explicit_self_marker_for_the_resolver() {
+        let parsed = parse_zoom_active_speaker_label("Grace Hopper is speaking (You)")
+            .expect("explicit self speaker");
+        assert_eq!(parsed.1, "Grace Hopper");
+        assert!(parsed.2);
     }
 }
