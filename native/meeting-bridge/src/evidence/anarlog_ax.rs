@@ -177,6 +177,7 @@ enum ZoomAxDiagnostic {
         top_level_dialogs: usize,
         ignored_surfaces: usize,
         discovery: SurfaceDiscoveryStats,
+        window_validation: Vec<ZoomWindowValidation>,
     },
     ValidatedMeeting {
         primary_windows: usize,
@@ -184,6 +185,7 @@ enum ZoomAxDiagnostic {
         ignored_surfaces: usize,
         active_speaker_labels: usize,
         discovery: SurfaceDiscoveryStats,
+        window_validation: Vec<ZoomWindowValidation>,
     },
 }
 
@@ -212,6 +214,26 @@ struct SurfaceDiscoveryStats {
     fallback_visited_nodes: usize,
     fallback_skipped_branches: usize,
     focused_surface_candidates: usize,
+}
+
+/// Privacy-safe validator telemetry. These counts describe only the shape of
+/// a bounded, already-accepted AX window snapshot; no AX strings, names, or
+/// element identities are retained in diagnostics.
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ZoomWindowValidation {
+    eligible_nodes: usize,
+    video_evidence_nodes: usize,
+    audio_state_nodes: usize,
+    colocated_evidence_nodes: usize,
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+impl ZoomWindowValidation {
+    fn is_valid(&self) -> bool {
+        self.colocated_evidence_nodes > 0
+            || (self.video_evidence_nodes > 0 && self.audio_state_nodes > 0)
+    }
 }
 
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
@@ -302,10 +324,14 @@ fn inspect_zoom_windows(
     ignored_surfaces: usize,
     discovery: SurfaceDiscoveryStats,
 ) -> ZoomProcessInspection {
-    let candidates = window_nodes
+    let window_validation = window_nodes
+        .iter()
+        .map(|nodes| zoom_meeting_window_validation(nodes))
+        .collect::<Vec<_>>();
+    let candidates = window_validation
         .iter()
         .enumerate()
-        .filter_map(|(index, nodes)| zoom_meeting_window_is_validated(nodes).then_some(index))
+        .filter_map(|(index, validation)| validation.is_valid().then_some(index))
         .collect::<Vec<_>>();
     // More than one plausible Zoom meeting window is ambiguous. The bridge
     // has no permission to choose based on title/layout heuristics.
@@ -318,6 +344,7 @@ fn inspect_zoom_windows(
                 top_level_dialogs: auxiliary_dialog_nodes.len(),
                 ignored_surfaces,
                 discovery,
+                window_validation,
             },
         };
     }
@@ -340,6 +367,7 @@ fn inspect_zoom_windows(
             ignored_surfaces,
             active_speaker_labels: speakers.len(),
             discovery,
+            window_validation,
         },
         active_speakers: Some(speakers),
     }
@@ -635,15 +663,31 @@ fn node_labels(node: &ZoomAxNode) -> impl Iterator<Item = &str> {
 }
 
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
-fn zoom_meeting_window_is_validated(nodes: &[ZoomAxNode]) -> bool {
-    nodes.iter().any(|node| {
-        let role_matches = matches!(node.role.as_deref(), Some("AXGroup") | Some("AXCell"));
-        let has_audio_state = node_labels(node).any(|label| {
-            let label = label.to_ascii_lowercase();
-            label.contains("computer audio") || label.contains("no audio connected")
-        });
-        role_matches && has_audio_state && node_labels(node).any(is_zoom_video_evidence_label)
-    })
+fn zoom_meeting_window_validation(nodes: &[ZoomAxNode]) -> ZoomWindowValidation {
+    let mut validation = ZoomWindowValidation {
+        eligible_nodes: 0,
+        video_evidence_nodes: 0,
+        audio_state_nodes: 0,
+        colocated_evidence_nodes: 0,
+    };
+    for node in nodes {
+        if !matches!(node.role.as_deref(), Some("AXGroup") | Some("AXCell")) {
+            continue;
+        }
+        validation.eligible_nodes += 1;
+        let has_audio_state = node_labels(node).any(is_zoom_audio_state_label);
+        let has_video_evidence = node_labels(node).any(is_zoom_video_evidence_label);
+        validation.audio_state_nodes += usize::from(has_audio_state);
+        validation.video_evidence_nodes += usize::from(has_video_evidence);
+        validation.colocated_evidence_nodes += usize::from(has_audio_state && has_video_evidence);
+    }
+    validation
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn is_zoom_audio_state_label(label: &str) -> bool {
+    let lower = label.to_ascii_lowercase();
+    lower.contains("computer audio") || lower.contains("no audio connected")
 }
 
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
@@ -921,8 +965,8 @@ mod tests {
 
     #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
     use super::{
-        inspect_zoom_windows, is_zoom_top_level_auxiliary_dialog, SurfaceDiscoveryStats,
-        ZoomAxDiagnostic, ZoomAxNode,
+        inspect_zoom_windows, is_zoom_top_level_auxiliary_dialog, zoom_meeting_window_validation,
+        SurfaceDiscoveryStats, ZoomAxDiagnostic, ZoomAxNode,
     };
 
     #[test]
@@ -997,6 +1041,26 @@ mod tests {
             fallback_skipped_branches: 0,
             focused_surface_candidates: 0,
         }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+    #[test]
+    fn split_audio_and_video_evidence_validates_only_inside_one_window() {
+        let validation = zoom_meeting_window_validation(&[
+            zoom_node(1, "AXGroup", "Video tile"),
+            zoom_node(2, "AXCell", "Computer audio unmuted"),
+        ]);
+        assert_eq!(validation.eligible_nodes, 2);
+        assert_eq!(validation.video_evidence_nodes, 1);
+        assert_eq!(validation.audio_state_nodes, 1);
+        assert_eq!(validation.colocated_evidence_nodes, 0);
+        assert!(validation.is_valid());
+
+        let video_only = zoom_meeting_window_validation(&[zoom_node(3, "AXGroup", "Video tile")]);
+        assert!(!video_only.is_valid());
+        let audio_only =
+            zoom_meeting_window_validation(&[zoom_node(4, "AXCell", "Computer audio unmuted")]);
+        assert!(!audio_only.is_valid());
     }
 
     #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
