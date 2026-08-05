@@ -216,6 +216,7 @@ enum ZoomAxDiagnostic {
         primary_windows: usize,
         validated_meetings: usize,
         top_level_dialogs: usize,
+        auxiliary_talking_labels: usize,
         ignored_surfaces: usize,
         discovery: SurfaceDiscoveryStats,
         window_validation: Vec<ZoomWindowValidation>,
@@ -437,6 +438,14 @@ fn inspect_zoom_windows(
     ignored_surfaces: usize,
     discovery: SurfaceDiscoveryStats,
 ) -> ZoomProcessInspection {
+    let auxiliary_talking_labels = auxiliary_dialog_nodes
+        .iter()
+        .flatten()
+        .filter(|node| {
+            !is_text_input_role(node.role.as_deref())
+                && node_labels(node).any(is_zoom_explicit_talking_label)
+        })
+        .count();
     let window_validation = window_nodes
         .iter()
         .map(|nodes| zoom_meeting_window_validation(nodes))
@@ -455,6 +464,7 @@ fn inspect_zoom_windows(
                 primary_windows: window_nodes.len(),
                 validated_meetings: candidates.len(),
                 top_level_dialogs: auxiliary_dialog_nodes.len(),
+                auxiliary_talking_labels,
                 ignored_surfaces,
                 discovery,
                 window_validation,
@@ -688,12 +698,13 @@ fn collect_nodes(element: &ax::UiElement, depth: usize, nodes: &mut Vec<ZoomAxNo
     nodes.push(snapshot_node(element));
 
     let Ok(children) = element.children() else {
-        return !ax_role_may_have_children(
-            nodes
-                .last()
-                .and_then(|node| node.role.as_deref())
-                .unwrap_or_default(),
-        );
+        // Zoom routinely exposes transient groups whose AXChildren request
+        // cannot complete while the rest of the meeting tree is readable.
+        // Fathom reconciles nodes seen through polling/notifications instead
+        // of discarding that whole snapshot. Skip only this unavailable
+        // branch; downstream meeting and speaker validators still fail closed
+        // unless accessible siblings contain explicit evidence.
+        return true;
     };
     children
         .iter()

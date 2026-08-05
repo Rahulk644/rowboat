@@ -92,6 +92,7 @@ test('self-hosted provider stays loopback-only and completes two source sessions
   assert.deepEqual(snapshot.segments.map(({ text, timingConfidence, timingSource }) => ({ text, timingConfidence, timingSource })), [
     { text: 'local words', timingConfidence: 'low', timingSource: 'feed-window' },
   ]);
+  assert.equal(snapshot.segments[0]?.speaker.kind, 'unknown');
   await provider.restart('meeting A');
   const final = await provider.finalize('meeting A');
   assert.equal(final.mic.final, true);
@@ -278,9 +279,16 @@ test('main emits one canonical system upsert when the matching mic segment is ec
   const provider = new SelfHostedMeetingTranscription();
   await provider.begin('echo pair', 'en');
   const pcm = Buffer.alloc(32_000).toString('base64');
-  await provider.feed('echo pair', 'mic', pcm, {
+  const mic = await provider.feed('echo pair', 'mic', pcm, {
     startSample: 0, sampleCount: 16_000, sampleRate: 16_000, sequence: 0,
   });
+  assert.equal(mic.segments[0]?.speaker.kind, 'unknown');
+  const qualified = provider.applySpeakerEvidence('echo pair', [], { outputRouteIsolated: true });
+  assert.deepEqual(qualified.segments.map((segment) => ({
+    kind: segment.speaker.kind,
+    displayName: segment.speaker.displayName,
+    source: segment.attributionSource,
+  })), [{ kind: 'self', displayName: 'You', source: 'qualified-mic' }]);
   const system = await provider.feed('echo pair', 'system', pcm, {
     startSample: 0, sampleCount: 16_000, sampleRate: 16_000, sequence: 0,
   });

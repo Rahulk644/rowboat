@@ -65,6 +65,12 @@ bounded polling, strict evidence parser, and temporary resolver evidence. A
 process-keyed AX observer plus participant reconciliation cache remains a
 follow-up; it must retain only normalized meeting evidence, never a raw tree.
 
+Zoom can invalidate one container's `AXChildren` request while accessible
+siblings remain stable. Matching Fathom's reconcile-not-reject behavior,
+Rowboat skips only that transient child branch; depth/node budget failures
+still reject the surface, and the surviving snapshot must independently pass
+the exact meeting-surface and active-speaker validators before it emits a name.
+
 ## Zoom surface and label evidence
 
 Fathom recognizes `AXStandardWindow`, system/application dialogs, Zoom video
@@ -86,6 +92,13 @@ Rowboat intentionally remains narrower than Fathom:
 - multiple plausible meeting windows produce no name;
 - diagnostics contain counts/status only, never labels, names, titles, bounds,
   PIDs, audio, or transcript text.
+
+A live minimized-window sample exposed one `AXSystemDialog` and no primary
+meeting window or explicit active-speaker label. That state correctly produces
+no name. Fathom's observer/cache design can preserve a previously observed
+speaker through short UI transitions, but it cannot safely invent the first
+speaker name when Zoom exposes neither a validated meeting surface nor a fresh
+active-speaker assertion.
 
 ## Qualification
 

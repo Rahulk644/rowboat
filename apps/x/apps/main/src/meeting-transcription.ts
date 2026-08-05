@@ -372,7 +372,10 @@ function isEligibleMicEchoCandidate(segment: MeetingTranscriptSegment): boolean 
   return segment.channel === 'mic'
     && segment.finality !== 'interim'
     && segment.overlap === false
-    && segment.speaker.kind === 'unknown';
+    && (
+      segment.speaker.kind === 'unknown'
+      || (segment.speaker.kind === 'self' && segment.attributionSource === 'qualified-mic')
+    );
 }
 
 function isEligibleSystemEchoCandidate(segment: MeetingTranscriptSegment): boolean {
@@ -695,10 +698,12 @@ export class SelfHostedMeetingTranscription {
       ));
       const voiceProfile = options.voiceProfilesBySegment?.[segment.segmentId];
       const stableClusterIds = options.stableClusterIdsBySegment?.[segment.segmentId];
+      const qualifiedMic = segment.channel === 'mic'
+        && (options.playbackReferenceHealthy === true || options.outputRouteIsolated === true);
       // Do not touch unrelated historical records when a bridge batch covers
       // another interval. A remembered explicit correction remains in the
       // resolver input for the intervals that are re-evaluated.
-      if (!segmentEvidence.length && !voiceProfile && !stableClusterIds) continue;
+      if (!segmentEvidence.length && !voiceProfile && !stableClusterIds && !qualifiedMic) continue;
       const correction = active.corrections.get(segment.segmentId);
       const upsert = resolveMeetingSpeakerUpsert(segment, {
         correction: correction ? { displayName: correction.displayName } : undefined,
@@ -992,10 +997,9 @@ export class SelfHostedMeetingTranscription {
     const merged = mergeMeetingTranscriptSegments(active.segments.values(), updates);
     active.segments = new Map(merged.map((segment) => [segment.segmentId, segment]));
     const accepted = updates.filter((update) => active.segments.get(update.segmentId)?.revision === update.revision);
-    // AX/evidence often arrives before the corresponding ASR text because
-    // the stream has model look-ahead. Re-evaluate exactly the records this
-    // snapshot created or revised against the bounded retained history.
-    const attributed = this.resolveStoredSpeakerEvidence(active, accepted.map((segment) => segment.segmentId));
+    // Suppress a proven render echo before any microphone segment can be
+    // promoted to self. This preserves the original fail-closed guarantee:
+    // channel alone is never identity evidence.
     const echoSuppression = findCrossChannelEchoSuppressions(active.segments.values());
     if (echoSuppression.suppressedMicSegmentIds.length > 0) {
       for (const segmentIdValue of echoSuppression.suppressedMicSegmentIds) {
@@ -1005,6 +1009,10 @@ export class SelfHostedMeetingTranscription {
       const echoMerged = mergeMeetingTranscriptSegments(active.segments.values(), echoSuppression.systemUpserts);
       active.segments = new Map(echoMerged.map((segment) => [segment.segmentId, segment]));
     }
+    // AX/evidence often arrives before the corresponding ASR text because
+    // the stream has model look-ahead. Re-evaluate exactly the records this
+    // snapshot created or revised against the bounded retained history.
+    const attributed = this.resolveStoredSpeakerEvidence(active, accepted.map((segment) => segment.segmentId));
     this.pruneSpeakerEvidence(active);
     const pending = [...active.pendingAttributionUpserts.values()];
     const survived = (segment: MeetingTranscriptSegment): boolean => (
