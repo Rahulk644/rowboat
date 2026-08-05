@@ -119,23 +119,45 @@ fn inspect_zoom_process(ax_app: &ax::UiElement) -> Option<Vec<AnarlogParticipant
         return None;
     }
 
-    let mut candidates = Vec::new();
+    let mut window_nodes = Vec::new();
     for window in windows {
         let mut nodes = Vec::new();
         if !collect_nodes(&window, 0, &mut nodes) {
             return None;
         }
-        if zoom_meeting_window_is_validated(&nodes) {
-            candidates.push(nodes);
-        }
+        window_nodes.push(nodes);
     }
+    inspect_zoom_windows(window_nodes)
+}
 
+/// One validated meeting surface proves that this Zoom process is in a call.
+/// With that proof, small auxiliary Zoom surfaces (such as the floating
+/// speaking-state dialog) may contribute only an explicit `Talking: Name`
+/// assertion. Their other labels never become speaker evidence.
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn inspect_zoom_windows(
+    window_nodes: Vec<Vec<ZoomAxNode>>,
+) -> Option<Vec<AnarlogParticipantStream>> {
+    let candidates = window_nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, nodes)| zoom_meeting_window_is_validated(nodes).then_some(index))
+        .collect::<Vec<_>>();
     // More than one plausible Zoom meeting window is ambiguous. The bridge
     // has no permission to choose based on title/layout heuristics.
     if candidates.len() != 1 {
         return None;
     }
-    Some(find_zoom_active_speakers(&candidates.pop()?))
+    let meeting_window_index = candidates[0];
+    let mut names = HashSet::new();
+    let mut speakers = find_zoom_active_speakers(&window_nodes[meeting_window_index], &mut names);
+    for (index, nodes) in window_nodes.iter().enumerate() {
+        if index == meeting_window_index {
+            continue;
+        }
+        speakers.extend(find_zoom_auxiliary_talking_speakers(nodes, &mut names));
+    }
+    Some(speakers)
 }
 
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
@@ -292,8 +314,10 @@ fn is_zoom_video_evidence_label(label: &str) -> bool {
 }
 
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
-fn find_zoom_active_speakers(nodes: &[ZoomAxNode]) -> Vec<AnarlogParticipantStream> {
-    let mut names = HashSet::new();
+fn find_zoom_active_speakers(
+    nodes: &[ZoomAxNode],
+    names: &mut HashSet<String>,
+) -> Vec<AnarlogParticipantStream> {
     let mut streams = Vec::new();
     for node in nodes {
         if !matches!(
@@ -327,6 +351,51 @@ fn find_zoom_active_speakers(nodes: &[ZoomAxNode]) -> Vec<AnarlogParticipantStre
     streams
 }
 
+/// Auxiliary Zoom surfaces are intentionally stricter than the validated
+/// meeting window: only an explicit `Talking: Name` state is accepted. This
+/// lets the floating macOS speaking dialog work without allowing a roster or
+/// generic window text to name a transcript interval.
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn find_zoom_auxiliary_talking_speakers(
+    nodes: &[ZoomAxNode],
+    names: &mut HashSet<String>,
+) -> Vec<AnarlogParticipantStream> {
+    let mut streams = Vec::new();
+    for node in nodes {
+        if is_text_input_role(node.role.as_deref()) {
+            continue;
+        }
+        let Some((_, name, is_self)) = node_labels(node).find_map(|label| {
+            label
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("talking:")
+                .then(|| parse_zoom_active_speaker_label(label))
+                .flatten()
+        }) else {
+            continue;
+        };
+        if !names.insert(name.to_ascii_lowercase()) {
+            continue;
+        }
+        streams.push(AnarlogParticipantStream {
+            participant_id: Some(format!("ax-element-{:x}", node.element_hash)),
+            participant_name: Some(name),
+            is_self: Some(is_self),
+            is_active_speaker: Some(true),
+            is_muted: None,
+            confidence: 0.95,
+            signals: vec!["speaker-state-label".to_string(), "auxiliary-talking-label".to_string()],
+        });
+    }
+    streams
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn is_text_input_role(role: Option<&str>) -> bool {
+    matches!(role, Some("AXTextArea") | Some("AXTextField") | Some("AXSecureTextField"))
+}
+
 /// Adapted from Anarlog's `participant_name_from_speaker_label` at the pinned
 /// revision. It accepts only explicit speaker-state labels and rejects generic
 /// subject words, so a participant roster cannot become a false speaker claim.
@@ -343,6 +412,8 @@ fn parse_zoom_active_speaker_label(label: &str) -> Option<(&str, String, bool)> 
     let lower = without_self.to_ascii_lowercase();
     let name = if lower.starts_with("active speaker: ") {
         &without_self["active speaker: ".len()..]
+    } else if lower.starts_with("talking:") {
+        &without_self["talking:".len()..]
     } else if lower.ends_with(" is speaking") {
         &without_self[..without_self.len() - " is speaking".len()]
     } else if let Some(index) = explicit_speaker_marker_index(&lower, ", active speaker") {
@@ -496,6 +567,9 @@ mod tests {
     };
     use crate::evidence::EvidenceSource;
 
+    #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+    use super::{inspect_zoom_windows, ZoomAxNode};
+
     #[test]
     fn roster_presence_does_not_turn_into_a_speaking_claim() {
         let evidence = normalize_anarlog_inspection(
@@ -531,6 +605,12 @@ mod tests {
                 .is_none()
         );
         assert!(parse_zoom_active_speaker_label("Participants, active speaker").is_none());
+        let talking = parse_zoom_active_speaker_label("Talking: Vikram Prasanna")
+            .expect("explicit talking state");
+        assert_eq!(talking.1, "Vikram Prasanna");
+        assert!(parse_zoom_active_speaker_label("Talking:").is_none());
+        assert!(parse_zoom_active_speaker_label("Talking:   ").is_none());
+        assert!(parse_zoom_active_speaker_label("Talking: Speaker").is_none());
     }
 
     #[test]
@@ -539,5 +619,38 @@ mod tests {
             .expect("explicit self speaker");
         assert_eq!(parsed.1, "Grace Hopper");
         assert!(parsed.2);
+    }
+
+    #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+    fn zoom_node(element_hash: usize, role: &str, title: &str) -> ZoomAxNode {
+        ZoomAxNode {
+            element_hash,
+            role: Some(role.to_string()),
+            title: Some(title.to_string()),
+            description: None,
+            placeholder: None,
+            value: None,
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+    #[test]
+    fn auxiliary_floating_window_contributes_only_an_explicit_talking_label() {
+        // The main meeting surface validates the Zoom meeting but has no
+        // active-speaker state. macOS exposes that state in a separate floating
+        // AX window, represented here by its static-text label.
+        let meeting_window = vec![zoom_node(
+            1,
+            "AXGroup",
+            "Video render Vikram Prasanna, Computer audio unmuted",
+        )];
+        let floating_window = vec![zoom_node(2, "AXStaticText", "Talking: Vikram Prasanna")];
+        let speakers = inspect_zoom_windows(vec![meeting_window, floating_window])
+            .expect("exactly one validated meeting window");
+
+        assert_eq!(speakers.len(), 1);
+        assert_eq!(speakers[0].participant_name.as_deref(), Some("Vikram Prasanna"));
+        assert_eq!(speakers[0].is_active_speaker, Some(true));
+        assert!(speakers[0].signals.iter().any(|signal| signal == "auxiliary-talking-label"));
     }
 }
