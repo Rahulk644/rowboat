@@ -232,6 +232,67 @@ test('suppresses one very close STT revision only with strong time alignment', (
   assert.equal(suppression.systemUpserts[0]?.supersedes.includes('mic-1'), true);
 });
 
+test('suppresses a contiguous run of short aligned echo fragments', () => {
+  const pairs = [
+    ['you always attract', 'you always attract that'],
+    ['that kind of person', 'kind of person'],
+    ['because that is', 'because that is'],
+  ].flatMap(([micText, systemText], index) => {
+    const start = index * 16_000;
+    const end = start + 16_000;
+    return [
+      echoSegment('mic', `mic-${index}`, micText!, start, end),
+      echoSegment('system', `system-${index}`, systemText!, start, end),
+    ];
+  });
+
+  const suppression = findCrossChannelEchoSuppressions(pairs);
+
+  assert.deepEqual(suppression.suppressedMicSegmentIds, ['mic-0', 'mic-1', 'mic-2']);
+  assert.deepEqual(
+    suppression.systemUpserts.map((segment) => segment.supersedes),
+    [['mic-0'], ['mic-1'], ['mic-2']],
+  );
+});
+
+test('preserves an isolated short match and breaks an echo run around different simultaneous speech', () => {
+  const isolatedMic = echoSegment('mic', 'mic-isolated', 'yes');
+  const isolatedSystem = echoSegment('system', 'system-isolated', 'yes');
+  assert.deepEqual(findCrossChannelEchoSuppressions([isolatedMic, isolatedSystem]), {
+    suppressedMicSegmentIds: [], systemUpserts: [],
+  });
+
+  const segments = [
+    echoSegment('mic', 'mic-before', 'please review that', 0, 16_000),
+    echoSegment('system', 'system-before', 'please review that', 0, 16_000),
+    echoSegment('mic', 'mic-local', 'my local interruption is different', 16_000, 32_000),
+    echoSegment('system', 'system-remote', 'the remote speaker keeps talking', 16_000, 32_000),
+    echoSegment('mic', 'mic-after', 'yes continue', 32_000, 48_000),
+    echoSegment('system', 'system-after', 'yes continue', 32_000, 48_000),
+  ];
+  assert.deepEqual(findCrossChannelEchoSuppressions(segments), {
+    suppressedMicSegmentIds: [], systemUpserts: [],
+  });
+});
+
+test('suppresses a unique feed-boundary split without erasing different overlap', () => {
+  const splitMic = echoSegment('mic', 'mic-split', 'looking woman same', 0, 32_000);
+  const systemA = echoSegment('system', 'system-a', 'look', 0, 16_000);
+  const systemB = echoSegment('system', 'system-b', 'ing woman same', 16_000, 32_000);
+  const suppression = findCrossChannelEchoSuppressions([splitMic, systemA, systemB]);
+
+  assert.deepEqual(suppression.suppressedMicSegmentIds, ['mic-split']);
+  assert.deepEqual(suppression.systemUpserts.map((segment) => ({
+    segmentId: segment.segmentId,
+    supersedes: segment.supersedes,
+  })), [{ segmentId: 'system-b', supersedes: ['mic-split'] }]);
+
+  const localSpeech = echoSegment('mic', 'mic-local-overlap', 'my own simultaneous answer', 0, 32_000);
+  assert.deepEqual(findCrossChannelEchoSuppressions([localSpeech, systemA, systemB]), {
+    suppressedMicSegmentIds: [], systemUpserts: [],
+  });
+});
+
 test('preserves different simultaneous speakers and any ambiguous echo graph', () => {
   const system = echoSegment('system', 'system-1', 'please review the deployment plan before lunch');
   const differentMic = echoSegment('mic', 'mic-different', 'we should postpone the planning meeting until tomorrow');

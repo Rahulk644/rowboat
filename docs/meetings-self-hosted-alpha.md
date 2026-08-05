@@ -46,7 +46,11 @@ Private VPS:         one resident Nemotron model, mic + system ASR sessions,
 Segments are idempotent by `(segmentId, revision)`; a gap starts an epoch.
 The current worker returns text prefixes, so emitted interval timing is
 intentionally `low` confidence with `timingSource: "feed-window"`, not a
-claim of token timestamps.
+claim of token timestamps. The renderer groups safe contiguous chunks into a
+single visible speaker turn while retaining every raw record. Mic copies of
+system speech are removed only when shared, conservative time/text evidence is
+unique; different concurrent speech is retained. This is reconciliation, not
+a claim of acoustic echo cancellation.
 
 Speaker trust order is explicit correction; qualified healthy mic for `You`;
 dominant active Accessibility evidence; confirmed voice profile clearing both

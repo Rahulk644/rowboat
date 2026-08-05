@@ -1,13 +1,16 @@
 import { describe, expect, it } from 'vitest'
 import {
   applyTranscriptSegmentRevisions,
+  createSpeakerCorrectionRequests,
   createTranscriptV2Block,
   isCanonicalTranscriptSnapshot,
   normalizeTranscriptSegment,
   parseTranscriptV2Block,
+  projectTranscriptDisplayEntries,
   removeTranscriptSegment,
   replaceOwnedTranscriptV2Block,
   serializeTranscriptV2Block,
+  transcriptProjection,
   upsertTranscriptSegments,
 } from './meeting-transcript-v2'
 
@@ -85,6 +88,15 @@ describe('meeting transcript v2', () => {
 
     expect(applyTranscriptSegmentRevisions(block, [corrected]).segments).toEqual([corrected])
     expect(applyTranscriptSegmentRevisions(block, [corrected]).transcript).toContain('Parminder')
+  })
+
+  it('keeps every canonical source in a grouped speaker correction and enrolls a voice once', () => {
+    const next = { ...first, segmentId: 'system-2', startSample: 201, endSample: 300 }
+
+    expect(createSpeakerCorrectionRequests([first, next], 'Parminder', true)).toEqual([
+      { meetingId: 'meeting-1', segmentId: first.segmentId, displayName: 'Parminder', rememberVoice: true },
+      { meetingId: 'meeting-1', segmentId: next.segmentId, displayName: 'Parminder', rememberVoice: false },
+    ])
   })
 
   it('replaces an Unknown speaker with a main-process name-only revision in the active note', () => {
@@ -187,5 +199,156 @@ describe('meeting transcript v2', () => {
     expect(createTranscriptV2Block(finalized).transcript).toContain('this time')
     expect(createTranscriptV2Block(finalized).transcript).not.toContain('taken you are shown')
     expect(upsertTranscriptSegments(finalized, [final0, final1, final2])).toEqual(finalized)
+  })
+
+  it('coalesces only overlapping incremental ASR fragments in a display-only projection', () => {
+    const you = {
+      ...first,
+      segmentId: 'system:e0:stable:0', revision: 1, epoch: 0,
+      startSample: 0, endSample: 16_000, text: 'you', finality: 'stable' as const,
+    }
+    const youAlways = {
+      ...you,
+      segmentId: 'system:e0:provisional:0', revision: 2,
+      endSample: 32_000, text: 'you always need to test', finality: 'interim' as const,
+    }
+    const overlappingSuffix = {
+      ...you,
+      segmentId: 'system:e0:provisional:30000', revision: 3,
+      startSample: 30_000, endSample: 48_000, text: 'test the overlap path', finality: 'interim' as const,
+    }
+    const raw = [you, youAlways, overlappingSuffix]
+    const beforeProjection = JSON.parse(JSON.stringify(raw))
+
+    const projected = projectTranscriptDisplayEntries(raw)
+
+    expect(projected).toHaveLength(1)
+    expect(projected[0]).toMatchObject({
+      text: 'you always need to test the overlap path',
+      finality: 'interim',
+      sourceSegments: raw,
+    })
+    expect(raw).toEqual(beforeProjection)
+    expect(createTranscriptV2Block(raw).segments).toEqual(raw)
+    expect(parseTranscriptV2Block(JSON.stringify(createTranscriptV2Block(raw)))?.segments).toEqual(raw)
+  })
+
+  it('groups physical contiguous chunks into one displayed turn without altering their raw records', () => {
+    const amount = {
+      ...first,
+      segmentId: 'system:e0:stable:0', epoch: 0,
+      startSample: 0, endSample: 35_840, text: 'The amount',
+    }
+    const people = {
+      ...amount,
+      segmentId: 'system:e0:stable:35840',
+      startSample: 35_840, endSample: 53_760, text: 'of people you',
+    }
+    const need = {
+      ...amount,
+      segmentId: 'system:e0:stable:53760',
+      startSample: 53_760, endSample: 70_400, text: 'need to invite',
+    }
+
+    const projected = projectTranscriptDisplayEntries([amount, people, need])
+
+    expect(projected).toHaveLength(1)
+    expect(projected[0]?.text).toBe('The amount of people you need to invite')
+    expect(projected[0]?.sourceSegments.map(segment => segment.segmentId)).toEqual([
+      amount.segmentId, people.segmentId, need.segmentId,
+    ])
+    expect(transcriptProjection([amount, people, need])).toBe(
+      '**Akbar:** The amount of people you need to invite',
+    )
+  })
+
+  it('hides only proven persisted mic echoes while retaining simultaneous local speech', () => {
+    const unknownSpeaker = { kind: 'unknown' as const, displayName: 'Unknown speaker' }
+    const echoMic0 = {
+      ...first,
+      segmentId: 'mic-echo-0', epoch: 0, startSample: 0, endSample: 16_000,
+      channel: 'mic' as const, text: 'you always attract', finality: 'stable' as const,
+      speaker: unknownSpeaker,
+    }
+    const system0 = {
+      ...echoMic0,
+      segmentId: 'system-0', channel: 'system' as const, text: 'you always attract that',
+    }
+    const echoMic1 = {
+      ...echoMic0,
+      segmentId: 'mic-echo-1', startSample: 16_000, endSample: 32_000,
+      text: 'that kind of person',
+    }
+    const system1 = {
+      ...echoMic1,
+      segmentId: 'system-1', channel: 'system' as const, text: 'kind of person',
+    }
+    const localMic = {
+      ...echoMic1,
+      segmentId: 'mic-local', text: 'my local interruption is materially different',
+    }
+    const echoMic2 = {
+      ...echoMic0,
+      segmentId: 'mic-echo-2', startSample: 32_000, endSample: 48_000,
+      text: 'because that is',
+    }
+    const system2 = {
+      ...echoMic2,
+      segmentId: 'system-2', channel: 'system' as const, text: 'because that is',
+    }
+    const raw = [echoMic0, system0, echoMic1, localMic, system1, echoMic2, system2]
+    const beforeProjection = JSON.parse(JSON.stringify(raw))
+
+    const projected = projectTranscriptDisplayEntries(raw)
+
+    expect(projected).toHaveLength(2)
+    expect(projected[0]).toMatchObject({
+      channel: 'system',
+      text: 'you always attract that kind of person because that is',
+      sourceSegments: [system0, system1, system2],
+    })
+    expect(projected[1]).toMatchObject({
+      channel: 'mic',
+      text: 'my local interruption is materially different',
+      sourceSegments: [localMic],
+    })
+    expect(raw).toEqual(beforeProjection)
+    expect(createTranscriptV2Block(raw).segments).toEqual(raw)
+  })
+
+  it('does not coalesce across speaker, overlap, epoch, or explicit-correction boundaries', () => {
+    const base = {
+      ...first,
+      segmentId: 'system:e0:stable:0', epoch: 0,
+      startSample: 0, endSample: 16_000, text: 'you always',
+    }
+    const incremental = {
+      ...base,
+      segmentId: 'system:e0:stable:0:next', startSample: 100, endSample: 20_000,
+      text: 'you always review',
+    }
+    const differentSpeaker = {
+      ...incremental,
+      segmentId: 'different-speaker',
+      speaker: { kind: 'named' as const, id: 'nadia', displayName: 'Nadia' },
+    }
+    const overlappingSpeech = { ...incremental, segmentId: 'overlap', overlap: true }
+    const restartedEpoch = { ...incremental, segmentId: 'new-epoch', epoch: 1 }
+    const laterTurn = {
+      ...incremental,
+      segmentId: 'later-turn', startSample: base.endSample + 1_601, endSample: base.endSample + 12_000,
+      text: 'review the next topic',
+    }
+    const corrected = {
+      ...incremental,
+      segmentId: 'corrected',
+      attributionSource: 'explicit-user-correction',
+    }
+
+    expect(projectTranscriptDisplayEntries([base, differentSpeaker])).toHaveLength(2)
+    expect(projectTranscriptDisplayEntries([base, overlappingSpeech])).toHaveLength(2)
+    expect(projectTranscriptDisplayEntries([base, restartedEpoch])).toHaveLength(2)
+    expect(projectTranscriptDisplayEntries([base, laterTurn])).toHaveLength(2)
+    expect(projectTranscriptDisplayEntries([base, corrected])).toHaveLength(2)
   })
 })

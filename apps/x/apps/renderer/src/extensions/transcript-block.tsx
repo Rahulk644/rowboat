@@ -5,11 +5,14 @@ import { blocks } from '@x/shared'
 import { useMemo, useState } from 'react'
 import {
   applyTranscriptSegmentRevisions,
+  createSpeakerCorrectionRequests,
   normalizeTranscriptSegments,
   parseTranscriptV2Block,
+  projectTranscriptDisplayEntries,
   publishTranscriptSegmentRevisions,
   type SpeakerCorrectionRequest,
   type TranscriptFinality,
+  type TranscriptSegment,
   type TranscriptSpeaker,
 } from '@/lib/meeting-transcript-v2'
 
@@ -20,6 +23,8 @@ interface TranscriptEntry {
   text: string
   overlap: boolean
   finality: TranscriptFinality
+  /** The raw canonical segments behind a renderer-only grouped turn. */
+  sourceSegments?: TranscriptSegment[]
 }
 
 function parseLegacyTranscript(raw: string): TranscriptEntry[] {
@@ -46,13 +51,15 @@ function parseLegacyTranscript(raw: string): TranscriptEntry[] {
 function parseTranscript(raw: string): TranscriptEntry[] {
   const v2 = parseTranscriptV2Block(raw)
   if (v2) {
-    return v2.segments.map(segment => ({
-      segmentId: segment.segmentId,
-      meetingId: segment.meetingId,
-      speaker: segment.speaker,
-      text: segment.text,
-      overlap: segment.overlap,
-      finality: segment.finality,
+    return projectTranscriptDisplayEntries(v2.segments).map(entry => ({
+      // A grouped turn retains every raw segment for exact correction IPC.
+      segmentId: entry.sourceSegments[0]?.segmentId,
+      meetingId: entry.sourceSegments[0]?.meetingId,
+      speaker: entry.speaker,
+      text: entry.text,
+      overlap: entry.overlap,
+      finality: entry.finality,
+      sourceSegments: entry.sourceSegments,
     }))
   }
 
@@ -120,42 +127,44 @@ function TranscriptBlockView({ node, getPos, editor, updateAttributes }: {
   }, [getPos, editor])
 
   const [expanded, setExpanded] = useState(isFirstBlock)
-  const [editingSegmentId, setEditingSegmentId] = useState<string | null>(null)
+  const [editingSegmentIds, setEditingSegmentIds] = useState<string[] | null>(null)
   const [displayName, setDisplayName] = useState('')
   const [rememberVoice, setRememberVoice] = useState(false)
   const [correctionError, setCorrectionError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
 
-  const startCorrection = (entry: TranscriptEntry) => {
-    if (!entry.segmentId) return
-    setEditingSegmentId(entry.segmentId)
-    setDisplayName(entry.speaker.displayName === 'Unknown speaker' ? '' : entry.speaker.displayName)
+  const startCorrection = (segments: readonly TranscriptSegment[]) => {
+    const first = segments[0]
+    if (!first) return
+    setEditingSegmentIds(segments.map(segment => segment.segmentId))
+    setDisplayName(first.speaker.displayName === 'Unknown speaker' ? '' : first.speaker.displayName)
     setRememberVoice(false)
     setCorrectionError(null)
   }
 
-  const saveCorrection = async (entry: TranscriptEntry) => {
+  const saveCorrection = async (segments: readonly TranscriptSegment[]) => {
     const nextName = displayName.trim()
-    if (!entry.segmentId || !nextName) return
+    if (segments.length === 0 || !nextName) return
     setSaving(true)
     setCorrectionError(null)
     try {
-      const result = await submitSpeakerCorrection({
-        meetingId: entry.meetingId,
-        segmentId: entry.segmentId,
-        displayName: nextName,
-        rememberVoice,
-      })
-      const revised = correctionSegments(result)
+      // A grouped display turn has one verified speaker boundary. Correct
+      // each canonical record together; durable voice enrollment is opt-in
+      // and sent only once so one click cannot create duplicate enrollments.
+      const responses = await Promise.all(
+        createSpeakerCorrectionRequests(segments, nextName, rememberVoice).map(submitSpeakerCorrection),
+      )
+      const revised = responses.flatMap(correctionSegments)
       const current = parseTranscriptV2Block(raw)
-      if (!current || revised.length === 0) {
-        throw new Error('The correction response did not include a revised transcript segment')
+      const revisedIds = new Set(revised.map(segment => segment.segmentId))
+      if (!current || !segments.every(segment => revisedIds.has(segment.segmentId))) {
+        throw new Error('The correction response did not include every revised transcript segment')
       }
       updateAttributes({
         data: JSON.stringify(applyTranscriptSegmentRevisions(current, revised)),
       })
       publishTranscriptSegmentRevisions(revised)
-      setEditingSegmentId(null)
+      setEditingSegmentIds(null)
     } catch {
       setCorrectionError('Could not save this correction yet.')
     } finally {
@@ -190,21 +199,32 @@ function TranscriptBlockView({ node, getPos, editor, updateAttributes }: {
         {expanded && (
           <div className="transcript-block-content">
             {entries.length > 0 ? entries.map((entry, index) => {
-              const isEditing = editingSegmentId === entry.segmentId
+              const correctionSegments = entry.sourceSegments ?? []
+              const isEditing = correctionSegments.length > 0
+                && correctionSegments.length === editingSegmentIds?.length
+                && correctionSegments.every(segment => editingSegmentIds?.includes(segment.segmentId))
               return (
-                <div key={entry.segmentId ?? `${entry.speaker.displayName}-${index}`} className={`transcript-entry transcript-entry-${entry.finality}`}>
+                <div
+                  key={entry.segmentId ?? entry.sourceSegments?.map(segment => segment.segmentId).join(':') ?? `${entry.speaker.displayName}-${index}`}
+                  className={`transcript-entry transcript-entry-${entry.finality}`}
+                >
                   <div className="transcript-entry-meta">
                     <span className="transcript-speaker" style={{ color: speakerColor(entry.speaker.displayName) }}>
                       {entry.speaker.displayName}
                     </span>
                     {entry.overlap && <span className="transcript-overlap-badge">Overlapping speech</span>}
                     {entry.finality === 'interim' && <span className="transcript-interim-badge">Live</span>}
-                    {entry.segmentId && (
+                    {correctionSegments.length > 0 && (
                       <button
                         type="button"
                         className="transcript-speaker-correct"
-                        aria-label={`Correct speaker ${entry.speaker.displayName}`}
-                        onClick={() => startCorrection(entry)}
+                        aria-label={correctionSegments.length === 1
+                          ? `Correct speaker ${entry.speaker.displayName}`
+                          : `Correct speaker ${entry.speaker.displayName} for all ${correctionSegments.length} source segments in this grouped turn`}
+                        title={correctionSegments.length === 1
+                          ? 'Correct speaker'
+                          : `Corrects all ${correctionSegments.length} source segments in this grouped turn`}
+                        onClick={() => startCorrection(correctionSegments)}
                       >
                         <Pencil size={12} />
                       </button>
@@ -214,7 +234,7 @@ function TranscriptBlockView({ node, getPos, editor, updateAttributes }: {
                   {isEditing && (
                     <form
                       className="transcript-speaker-correction"
-                      onSubmit={(event) => { event.preventDefault(); void saveCorrection(entry) }}
+                      onSubmit={(event) => { event.preventDefault(); void saveCorrection(correctionSegments) }}
                     >
                       <label>
                         Speaker name
@@ -239,7 +259,7 @@ function TranscriptBlockView({ node, getPos, editor, updateAttributes }: {
                         <button type="submit" disabled={!displayName.trim() || saving}>
                           <Check size={13} /> Save for this meeting
                         </button>
-                        <button type="button" onClick={() => setEditingSegmentId(null)} disabled={saving}>
+                        <button type="button" onClick={() => setEditingSegmentIds(null)} disabled={saving}>
                           <X size={13} /> Cancel
                         </button>
                       </div>

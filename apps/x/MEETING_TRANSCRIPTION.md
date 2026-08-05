@@ -22,9 +22,15 @@ host. The token is read only by the main process and never returned over IPC.
 ## Audio and recovery contract
 
 - Input is 16 kHz mono signed-16 PCM, batched at 560 ms per source.
-- `mic` and `system` are independent source channels. They are not participant identities: microphone is
-  labelled `You`, while mixed playback is conservatively labelled `Remote participant` until a separate
-  evidence/diarization layer can justify a name.
+- `mic` and `system` are independent source channels, not participant identities. A microphone interval is
+  labelled `You` only after direct self evidence or qualified acoustic isolation; otherwise it remains
+  `Unknown speaker`. Mixed playback also remains unknown until active-speaker evidence or diarization can
+  justify a name.
+- A conservative shared echo pass removes only uniquely time-aligned, text-matching microphone copies of
+  system speech. Short matches require a longer aligned run, feed-boundary splits require one unique covered
+  interval, and materially different simultaneous speech is preserved.
+- The live note renders contiguous canonical chunks as one speaker turn. Raw segment IDs, revisions, timing,
+  overlap, and correction evidence stay intact beneath that display projection.
 - Requests are serialized because the qualified CPU worker shares one loaded model and one compute lane.
 - A transient connection failure restarts both streaming sessions and replays the uncommitted channel pair.
 - Pending audio is bounded to 24 pairs (13.44 seconds). Rowboat reports a degraded live transcript and drops
@@ -52,5 +58,6 @@ non-silent PCM, while `emittedSegmentUpserts` can remain zero during silence or 
 ## Remaining production work
 
 Environment configuration is the developer/qualification seam. A settings surface backed by Electron
-`safeStorage`, transcript-liveness monitoring, explicit provider status in the in-meeting surface, participant
-evidence, and overlap-safe acoustic echo cancellation must land before enabling this provider by default.
+`safeStorage`, transcript-liveness monitoring, explicit provider status in the in-meeting surface, broader
+participant evidence, and measured overlap-safe acoustic echo cancellation must land before enabling this
+provider by default. The text/timing echo pass is a conservative reconciliation layer, not acoustic AEC.

@@ -9,6 +9,8 @@
  * "You" or that playback is one remote participant.
  */
 
+import { meetingEcho } from '@x/shared'
+
 export const TRANSCRIPT_V2_VERSION = 2 as const
 export const TRANSCRIPT_V2_FENCE = 'transcript-v2'
 
@@ -26,6 +28,8 @@ export interface TranscriptSegment {
   meetingId?: string
   segmentId: string
   revision: number
+  /** Monotonic per-channel capture generation. Omitted by older bridges. */
+  epoch?: number
   startSample: number
   endSample: number
   timingConfidence: 'high' | 'medium' | 'low'
@@ -50,12 +54,44 @@ export interface TranscriptV2Block {
   segments: TranscriptSegment[]
 }
 
+/**
+ * A renderer-only turn. `sourceSegments` always points to the canonical
+ * records that produced the displayed text; it is never serialized back into
+ * the transcript-v2 block.
+ */
+export interface TranscriptDisplayEntry {
+  sourceSegments: TranscriptSegment[]
+  text: string
+  channel: TranscriptChannel
+  speaker: TranscriptSpeaker
+  overlap: boolean
+  finality: TranscriptFinality
+}
+
 export interface SpeakerCorrectionRequest {
   meetingId?: string
   segmentId: string
   displayName: string
   /** Voice profiles are biometric-adjacent. Never opt in by default. */
   rememberVoice: boolean
+}
+
+/**
+ * A grouped display turn still consists of distinct canonical records. Keep
+ * the correction RPC exact for every record, and enroll a voice at most once
+ * when the person has explicitly opted in.
+ */
+export function createSpeakerCorrectionRequests(
+  segments: readonly Pick<TranscriptSegment, 'meetingId' | 'segmentId'>[],
+  displayName: string,
+  rememberVoice: boolean,
+): SpeakerCorrectionRequest[] {
+  return segments.map((segment, index) => ({
+    meetingId: segment.meetingId,
+    segmentId: segment.segmentId,
+    displayName,
+    rememberVoice: index === 0 && rememberVoice,
+  }))
 }
 
 type UnknownRecord = Record<string, unknown>
@@ -134,6 +170,9 @@ export function normalizeTranscriptSegment(value: unknown): TranscriptSegment | 
     meetingId: asString(value.meetingId),
     segmentId,
     revision: Math.floor(asFiniteNonNegative(value.revision)),
+    ...(typeof value.epoch === 'number' && Number.isFinite(value.epoch) && value.epoch >= 0
+      ? { epoch: Math.floor(value.epoch) }
+      : {}),
     startSample,
     endSample,
     timingConfidence: isTimingConfidence(value.timingConfidence) ? value.timingConfidence : 'low',
@@ -175,9 +214,130 @@ export function isCanonicalTranscriptSnapshot(value: unknown): boolean {
 }
 
 function compareSegments(a: TranscriptSegment, b: TranscriptSegment): number {
-  return a.startSample - b.startSample
+  return (a.epoch ?? 0) - (b.epoch ?? 0)
+    || a.startSample - b.startSample
     || a.endSample - b.endSample
     || a.segmentId.localeCompare(b.segmentId)
+}
+
+const MAX_DISPLAY_CONTINUITY_GAP_SAMPLES = 1_600
+
+type TranscriptToken = {
+  normalized: string
+  start: number
+}
+
+function transcriptTokens(text: string): TranscriptToken[] {
+  const tokens: TranscriptToken[] = []
+  const matcher = /[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*/gu
+  for (let match = matcher.exec(text); match; match = matcher.exec(text)) {
+    tokens.push({ normalized: match[0].toLocaleLowerCase(), start: match.index })
+  }
+  return tokens
+}
+
+/**
+ * Returns a display-only de-duplicated join when `next` clearly extends or
+ * overlaps `current`. This deliberately does not use fuzzy matching: a
+ * mistaken word must remain visible rather than being silently discarded.
+ */
+function joinOverlappingTranscriptText(current: string, next: string, allowSingleTokenOverlap: boolean): string | null {
+  const left = transcriptTokens(current)
+  const right = transcriptTokens(next)
+  if (left.length === 0 || right.length === 0) return null
+
+  const same = (leftIndex: number, rightIndex: number, length: number): boolean => (
+    Array.from({ length }).every((_, offset) => left[leftIndex + offset]?.normalized === right[rightIndex + offset]?.normalized)
+  )
+
+  // A later ASR snapshot that begins with the full current text replaces it;
+  // retaining `next` preserves its most recent punctuation and casing.
+  if (right.length >= left.length && same(0, 0, left.length)) return next.trim()
+  // A shorter replay adds no new words, so keep the current display spelling.
+  if (left.length >= right.length && same(0, 0, right.length)) return current.trim()
+
+  const minimumOverlap = allowSingleTokenOverlap ? 1 : 2
+  const maximumOverlap = Math.min(left.length, right.length)
+  for (let overlap = maximumOverlap; overlap >= minimumOverlap; overlap--) {
+    if (!same(left.length - overlap, 0, overlap)) continue
+    const suffixStart = right[overlap]?.start
+    if (suffixStart === undefined) return current.trim()
+    return `${current.trimEnd()} ${next.slice(suffixStart).trimStart()}`.trim()
+  }
+  return null
+}
+
+function sameSpeaker(left: TranscriptSpeaker, right: TranscriptSpeaker): boolean {
+  return left.kind === right.kind && left.id === right.id && left.displayName === right.displayName
+}
+
+function isExplicitSpeakerCorrection(segment: TranscriptSegment): boolean {
+  return segment.attributionSource === 'explicit-user-correction'
+}
+
+function displayFinality(sourceSegments: readonly TranscriptSegment[]): TranscriptFinality {
+  if (sourceSegments.some(segment => segment.finality === 'interim')) return 'interim'
+  if (sourceSegments.some(segment => segment.finality === 'stable')) return 'stable'
+  return 'final'
+}
+
+function canJoinDisplayEntry(current: TranscriptDisplayEntry, next: TranscriptSegment): boolean {
+  const last = current.sourceSegments[current.sourceSegments.length - 1]
+  if (!last) return false
+  if (last.meetingId !== next.meetingId || (last.epoch ?? 0) !== (next.epoch ?? 0)) return false
+  if (last.channel !== next.channel || last.overlap !== next.overlap || !sameSpeaker(last.speaker, next.speaker)) return false
+  if (current.sourceSegments.some(isExplicitSpeakerCorrection) || isExplicitSpeakerCorrection(next)) return false
+
+  const latestEnd = Math.max(...current.sourceSegments.map(segment => segment.endSample))
+  return next.startSample <= latestEnd + MAX_DISPLAY_CONTINUITY_GAP_SAMPLES
+}
+
+/**
+ * Coalesce only clear, time-adjacent ASR expansions for the live renderer.
+ * The canonical `segments` array remains unchanged, including its segment
+ * IDs, revisions, correction evidence, speaker boundaries, and overlap data.
+ */
+export function projectTranscriptDisplayEntries(segments: readonly TranscriptSegment[]): TranscriptDisplayEntry[] {
+  const projected: TranscriptDisplayEntry[] = []
+  // Old persisted notes can predate the main-process suppression upsert. Hide
+  // only the proven microphone copies in this projection; canonical records
+  // remain available for serialization, revisions, and corrections.
+  const suppressedMicSegmentIds = new Set(
+    meetingEcho.findCrossChannelEchoSuppressions(segments).suppressedMicSegmentIds,
+  )
+  const displaySegments = segments.filter(segment => !suppressedMicSegmentIds.has(segment.segmentId))
+
+  for (const segment of [...displaySegments].sort(compareSegments)) {
+    // A genuine simultaneous turn from the other channel must stay visible,
+    // but it must not split one readable system turn into several fragments.
+    const current = [...projected].reverse().find(entry => entry.channel === segment.channel)
+    if (!current || !canJoinDisplayEntry(current, segment)) {
+      projected.push({
+        sourceSegments: [segment],
+        text: segment.text,
+        channel: segment.channel,
+        speaker: segment.speaker,
+        overlap: segment.overlap,
+        finality: segment.finality,
+      })
+      continue
+    }
+
+    const latestEnd = Math.max(...current.sourceSegments.map(source => source.endSample))
+    // Contiguous chunks are one turn and are joined verbatim. We remove
+    // repeated words only if their audio intervals overlap as well as their
+    // token text; adjacent chunks that merely happen to repeat a word keep it.
+    const joined = segment.startSample < latestEnd
+      ? joinOverlappingTranscriptText(current.text, segment.text, true)
+      : null
+
+    const sourceSegments = [...current.sourceSegments, segment]
+    current.sourceSegments = sourceSegments
+    current.text = joined ?? `${current.text.trimEnd()} ${segment.text.trimStart()}`.trim()
+    current.finality = displayFinality(sourceSegments)
+  }
+
+  return projected
 }
 
 /**
@@ -217,12 +377,11 @@ export function removeTranscriptSegment(existing: TranscriptSegment[], segmentId
 }
 
 export function transcriptProjection(segments: TranscriptSegment[]): string {
-  return [...segments]
-    .sort(compareSegments)
-    .filter(segment => segment.text.trim())
-    .map(segment => {
-      const overlap = segment.overlap ? ' [overlap]' : ''
-      return `**${segment.speaker.displayName}:**${overlap} ${segment.text}`
+  return projectTranscriptDisplayEntries(segments)
+    .filter(entry => entry.text.trim())
+    .map(entry => {
+      const overlap = entry.overlap ? ' [overlap]' : ''
+      return `**${entry.speaker.displayName}:**${overlap} ${entry.text}`
     })
     .join('\n\n')
 }
