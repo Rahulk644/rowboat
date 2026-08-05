@@ -16,6 +16,13 @@ allowBuilds:
 
 blockExoticSubdeps: false
 
+# Electron Forge packages the desktop app from disk and rejects pnpm's fully
+# isolated layout unless an explicit hoist policy exists. Keep the exception
+# limited to Forge's own packages instead of switching the whole workspace to
+# `node-linker=hoisted`.
+publicHoistPattern:
+  - '@electron-forge/*'
+
 overrides:
   vscode-jsonrpc: 8.2.0
 

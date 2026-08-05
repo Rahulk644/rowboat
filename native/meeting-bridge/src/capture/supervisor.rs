@@ -4,8 +4,9 @@ use std::{
 };
 
 use crate::{
+    aec::{AecCoordinator, AecOutputRoute},
     capture::{AudioSource, FrameQueue, RawAudioChunk, SourceError},
-    types::{AudioFrame, CaptureHealth, CaptureState, Channel, FrameFlags},
+    types::{AecHealth, AudioFrame, CaptureHealth, CaptureState, Channel, FrameFlags},
 };
 
 const FRAME_MS: u32 = 20;
@@ -387,6 +388,7 @@ impl FrameFramer {
                 sequence: self.next_sequence,
                 epoch: self.epoch,
                 flags,
+                aec: None,
                 pcm_s16le,
             });
             self.next_sequence = self.next_sequence.saturating_add(1);
@@ -403,11 +405,17 @@ pub struct DualCapture {
     pub system: CaptureSupervisor,
     mic_queue: FrameQueue,
     system_queue: FrameQueue,
+    /// Optional in-memory AEC coordinator.  This is opt-in: renderer capture
+    /// remains the active path until a native transport owns both channels.
+    aec: Option<AecCoordinator>,
 }
 
 #[derive(Debug, Default)]
 pub struct DualCaptureOutput {
     pub health: Vec<CaptureHealth>,
+    /// AEC lifecycle is separate from source health.  AEC degradation never
+    /// turns a healthy audio source into a capture failure.
+    pub aec_health: Vec<AecHealth>,
     pub backpressure: Vec<(Channel, u64, usize)>,
 }
 
@@ -427,7 +435,43 @@ impl DualCapture {
             system,
             mic_queue: FrameQueue::new(queue_capacity_frames),
             system_queue: FrameQueue::new(queue_capacity_frames),
+            aec: None,
         })
+    }
+
+    /// Enables an already-audited AEC processor for this native capture pair.
+    /// The coordinator itself never selects a model or device.  Existing
+    /// callers that do not opt in retain byte-for-byte raw capture behavior.
+    pub fn set_aec(&mut self, aec: AecCoordinator) {
+        self.aec = Some(aec);
+    }
+
+    pub fn aec_health(&self) -> Option<&AecHealth> {
+        self.aec.as_ref().map(AecCoordinator::health)
+    }
+
+    /// Applies an output-device route change to the active AEC coordinator
+    /// without touching either source supervisor. Any tiny reblocking or
+    /// reference holdback is first released raw, then the next capture frames
+    /// keep their existing meeting sample clock and epoch. This is the native
+    /// equivalent of Electron main handling a renderer `devicechange` while
+    /// retaining the same helper process and meeting session.
+    pub fn set_aec_output_route(&mut self, output_route: AecOutputRoute) -> DualCaptureOutput {
+        let mut output = DualCaptureOutput::default();
+        let released = self.aec.as_mut().map(|aec| {
+            let frames = aec.set_output_route(output_route);
+            let health = aec.take_health_update();
+            (frames, health)
+        });
+        if let Some((frames, health)) = released {
+            for frame in frames {
+                self.enqueue_frame(Channel::Mic, frame, &mut output);
+            }
+            if let Some(health) = health {
+                output.aec_health.push(health);
+            }
+        }
+        output
     }
 
     pub fn start(&mut self, now: Instant) -> DualCaptureOutput {
@@ -459,6 +503,27 @@ impl DualCapture {
         }
     }
 
+    /// Releases the bounded AEC mic holdback raw.  Hosts must call this before
+    /// finalizing a native capture session so a missing final render callback
+    /// can never truncate local speech.
+    pub fn flush_aec(&mut self) -> DualCaptureOutput {
+        let mut output = DualCaptureOutput::default();
+        let released = self.aec.as_mut().map(|aec| {
+            let frames = aec.flush();
+            let health = aec.take_health_update();
+            (frames, health)
+        });
+        if let Some((frames, health)) = released {
+            for frame in frames {
+                self.enqueue_frame(Channel::Mic, frame, &mut output);
+            }
+            if let Some(health) = health {
+                output.aec_health.push(health);
+            }
+        }
+        output
+    }
+
     fn consume_output(
         &mut self,
         output: SupervisorOutput,
@@ -466,19 +531,65 @@ impl DualCapture {
         mut aggregate: DualCaptureOutput,
     ) -> DualCaptureOutput {
         aggregate.health.extend(output.health);
+        for frame in output.frames {
+            let original_frame = frame.clone();
+            if self.aec.is_some() {
+                let (processed_mic, aec_health) = {
+                    let aec = self.aec.as_mut().expect("checked above");
+                    let processed_mic = match channel {
+                        Channel::Mic => aec.push_mic(frame),
+                        Channel::System => aec.push_render(frame),
+                    };
+                    (processed_mic, aec.take_health_update())
+                };
+                match processed_mic {
+                    Ok(processed_mic) => {
+                        for mic_frame in processed_mic {
+                            self.enqueue_frame(Channel::Mic, mic_frame, &mut aggregate);
+                        }
+                    }
+                    Err(_) => {
+                        // The supervisor has already normalized fixed frames,
+                        // so this is defensive only.  Preserve raw capture if
+                        // a future AEC adapter rejects an otherwise valid one.
+                        if channel == Channel::Mic {
+                            self.enqueue_frame(
+                                Channel::Mic,
+                                original_frame.clone(),
+                                &mut aggregate,
+                            );
+                        }
+                    }
+                }
+                if channel == Channel::System {
+                    self.enqueue_frame(Channel::System, original_frame, &mut aggregate);
+                }
+                if let Some(health) = aec_health {
+                    aggregate.aec_health.push(health);
+                }
+            } else {
+                self.enqueue_frame(channel, frame, &mut aggregate);
+            }
+        }
+        aggregate
+    }
+
+    fn enqueue_frame(
+        &mut self,
+        channel: Channel,
+        frame: AudioFrame,
+        aggregate: &mut DualCaptureOutput,
+    ) {
         let queue = match channel {
             Channel::Mic => &mut self.mic_queue,
             Channel::System => &mut self.system_queue,
         };
-        for frame in output.frames {
-            let report = queue.push(frame);
-            if report.dropped_oldest {
-                aggregate
-                    .backpressure
-                    .push((channel, report.dropped_total, report.capacity));
-            }
+        let report = queue.push(frame);
+        if report.dropped_oldest {
+            aggregate
+                .backpressure
+                .push((channel, report.dropped_total, report.capacity));
         }
-        aggregate
     }
 }
 
@@ -490,7 +601,14 @@ mod tests {
         time::Duration,
     };
 
-    use crate::{capture::RawAudioChunk, types::CaptureState};
+    use crate::{
+        aec::{
+            AecConfig, AecCoordinator, AecError, AecOutputRoute, AecProcessor,
+            AecReferenceAlignment,
+        },
+        capture::RawAudioChunk,
+        types::{AecEngine, AecFrameDisposition, CaptureState},
+    };
 
     use super::{
         AudioSource, CaptureSupervisor, Channel, DualCapture, RecoveryPolicy, SourceError,
@@ -544,6 +662,21 @@ mod tests {
                 .unwrap_or(Ok(None))
         }
         fn close(&mut self) {}
+    }
+
+    #[derive(Debug)]
+    struct IdentityAec;
+
+    impl AecProcessor for IdentityAec {
+        fn engine(&self) -> AecEngine {
+            AecEngine::LocalVqe
+        }
+
+        fn process(&mut self, _: &[i16], mic: &[i16]) -> Result<Vec<i16>, AecError> {
+            Ok(mic.to_vec())
+        }
+
+        fn reset(&mut self) {}
     }
 
     fn pcm(start_sample: u64, value: i16) -> RawAudioChunk {
@@ -735,5 +868,161 @@ mod tests {
         assert!(frame.flags.discontinuity);
         assert!(frame.flags.recovered);
         assert_eq!(frame.epoch, 1);
+    }
+
+    #[test]
+    fn optional_aec_coordinator_keeps_system_raw_and_queues_cleaned_mic() {
+        let mic_state = Arc::new(Mutex::new(MockState::default()));
+        let system_state = Arc::new(Mutex::new(MockState::default()));
+        mic_state
+            .lock()
+            .expect("state")
+            .chunks
+            .push_back(Ok(Some(pcm(0, 42))));
+        system_state
+            .lock()
+            .expect("state")
+            .chunks
+            .push_back(Ok(Some(pcm(0, 7))));
+
+        let mic = CaptureSupervisor::new(
+            "meeting",
+            Box::new(MockSource::new(Channel::Mic, mic_state)),
+            16_000,
+            policy(),
+        )
+        .expect("mic");
+        let system = CaptureSupervisor::new(
+            "meeting",
+            Box::new(MockSource::new(Channel::System, system_state)),
+            16_000,
+            policy(),
+        )
+        .expect("system");
+        let mut capture = DualCapture::new(mic, system, 4).expect("dual");
+        capture.set_aec(
+            AecCoordinator::with_processor(
+                "meeting",
+                AecConfig {
+                    alignment: AecReferenceAlignment::trusted(0),
+                    ..AecConfig::default()
+                },
+                AecOutputRoute::Speaker,
+                Box::new(IdentityAec),
+            )
+            .expect("coordinator"),
+        );
+        let now = std::time::Instant::now();
+        let _ = capture.start(now);
+        let tick = capture.tick(now);
+
+        let mic = capture.pop_mic_frame().expect("cleaned mic");
+        assert_eq!(mic.pcm_s16le, vec![42; 320]);
+        assert_eq!(
+            mic.aec.as_ref().expect("AEC metadata").disposition,
+            AecFrameDisposition::Cleaned
+        );
+        let system = capture.pop_system_frame().expect("raw system frame");
+        assert_eq!(system.pcm_s16le, vec![7; 320]);
+        assert!(system.aec.is_none());
+        assert!(tick
+            .aec_health
+            .iter()
+            .any(|health| health.processed_frames == 1));
+    }
+
+    #[test]
+    fn output_route_switch_keeps_sources_and_sample_clock_while_failing_open() {
+        let mic_state = Arc::new(Mutex::new(MockState::default()));
+        let system_state = Arc::new(Mutex::new(MockState::default()));
+        for (start, value) in [(0, 42), (320, 43), (640, 44)] {
+            mic_state
+                .lock()
+                .expect("state")
+                .chunks
+                .push_back(Ok(Some(pcm(start, value))));
+        }
+        for (start, value) in [(0, 7), (320, 8), (640, 9)] {
+            system_state
+                .lock()
+                .expect("state")
+                .chunks
+                .push_back(Ok(Some(pcm(start, value))));
+        }
+
+        let mic = CaptureSupervisor::new(
+            "meeting",
+            Box::new(MockSource::new(Channel::Mic, mic_state.clone())),
+            16_000,
+            policy(),
+        )
+        .expect("mic");
+        let system = CaptureSupervisor::new(
+            "meeting",
+            Box::new(MockSource::new(Channel::System, system_state.clone())),
+            16_000,
+            policy(),
+        )
+        .expect("system");
+        let mut capture = DualCapture::new(mic, system, 8).expect("dual");
+        capture.set_aec(
+            AecCoordinator::with_processor(
+                "meeting",
+                AecConfig {
+                    alignment: AecReferenceAlignment::trusted(0),
+                    ..AecConfig::default()
+                },
+                AecOutputRoute::Speaker,
+                Box::new(IdentityAec),
+            )
+            .expect("coordinator"),
+        );
+        let now = std::time::Instant::now();
+        let _ = capture.start(now);
+
+        let _ = capture.tick(now);
+        let first = capture.pop_mic_frame().expect("first mic");
+        assert_eq!(first.start_sample, 0);
+        assert_eq!(
+            first.aec.as_ref().expect("metadata").disposition,
+            AecFrameDisposition::Cleaned
+        );
+        let _ = capture.pop_system_frame().expect("first system");
+
+        let switched_to_isolated = capture.set_aec_output_route(AecOutputRoute::Isolated);
+        assert!(switched_to_isolated.health.is_empty());
+        assert!(switched_to_isolated
+            .aec_health
+            .iter()
+            .any(|health| health.state == crate::types::AecState::Bypassed));
+        assert_eq!(mic_state.lock().expect("state").opens, 1);
+        assert_eq!(system_state.lock().expect("state").opens, 1);
+
+        let _ = capture.tick(now);
+        let isolated = capture.pop_mic_frame().expect("isolated mic");
+        assert_eq!((isolated.start_sample, isolated.epoch), (320, 0));
+        assert_eq!(
+            isolated.aec.as_ref().expect("metadata").disposition,
+            AecFrameDisposition::BypassedIsolatedOutput
+        );
+        let _ = capture.pop_system_frame().expect("isolated system");
+
+        let switched_to_speaker = capture.set_aec_output_route(AecOutputRoute::Speaker);
+        assert!(switched_to_speaker
+            .aec_health
+            .iter()
+            .any(|health| health.state == crate::types::AecState::WaitingForReference));
+        assert_eq!(mic_state.lock().expect("state").opens, 1);
+        assert_eq!(system_state.lock().expect("state").opens, 1);
+
+        let _ = capture.tick(now);
+        let resumed = capture.pop_mic_frame().expect("speaker mic");
+        assert_eq!((resumed.start_sample, resumed.epoch), (640, 0));
+        assert_eq!(
+            resumed.aec.as_ref().expect("metadata").disposition,
+            AecFrameDisposition::Cleaned
+        );
+        assert_eq!(mic_state.lock().expect("state").opens, 1);
+        assert_eq!(system_state.lock().expect("state").opens, 1);
     }
 }

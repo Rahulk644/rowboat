@@ -34,4 +34,22 @@ describe('SelfHostedMeetingAudioClock', () => {
     const afterFailure = clock.capture('system', 8_960);
     expect(clock.metadataFor(afterFailure)).toMatchObject({ startSample: 8_960, sequence: 0, flags: ['discontinuity'] });
   });
+
+  it('marks only the recovered source with a discontinuity and recovered epoch flag', () => {
+    const clock = new SelfHostedMeetingAudioClock();
+    clock.capture('mic', 8_960);
+    clock.capture('system', 8_960);
+    clock.acknowledge('mic');
+    clock.acknowledge('system');
+    clock.markSourceRecovered('system');
+
+    const nextMic = clock.capture('mic', 8_960);
+    const nextSystem = clock.capture('system', 8_960);
+    expect(clock.metadataFor(nextMic)).toMatchObject({ startSample: 8_960, sequence: 1, flags: [] });
+    expect(clock.metadataFor(nextSystem)).toMatchObject({
+      startSample: 8_960,
+      sequence: 1,
+      flags: ['discontinuity', 'recovered'],
+    });
+  });
 });

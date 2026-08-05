@@ -1,6 +1,7 @@
 import { app, BrowserWindow, desktopCapturer, dialog, protocol, net, shell, session, safeStorage, type Session } from "electron";
 import path from "node:path";
 import os from "node:os";
+import fs from "node:fs";
 import {
   setupIpcHandlers,
   startRunsWatcher, startSessionsWatcher, startTurnEventsWatcher, markSessionsIndexReady,
@@ -14,7 +15,8 @@ import {
   startWorkspaceWatcher,
   stopRunsWatcher,
   stopServicesWatcher,
-  stopWorkspaceWatcher
+  stopWorkspaceWatcher,
+  shutdownMeetingTranscription,
 } from "./ipc.js";
 import { disposeAllTerminals } from "./terminal.js";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -76,6 +78,9 @@ import { init as initMeetingDetection } from "@x/core/dist/meetings/detector.js"
 import { createAppTray, hasTray, isRecordingActive, markPendingToggleMeetingNotes } from "./tray.js";
 import { initMeetingPopup, showMeetingPopup } from "./meeting-popup.js";
 import { initQuickAsk } from "./quick-ask.js";
+import { initializeMeetingTranscriptionCredentials } from './meeting-transcription-config.js';
+import { initializePackagedMeetingCapabilities } from './meeting-bridge.js';
+import { resolveSystemAudioCaptureMode, shouldUseAudioOnlyLoopback } from './meeting-system-audio.js';
 
 // Captured as early as possible so it reflects actual process start. Used to
 // gate grace-eligible notifications (e.g. the burst of background-task
@@ -84,6 +89,32 @@ const APP_LAUNCHED_AT = Date.now();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+
+// Contributor meeting builds must never contend with or impersonate the
+// installed release app. The sealed marker survives Finder launches where
+// shell environment variables do not. Set the isolated Chromium profile
+// before requestSingleInstanceLock(), because Electron scopes that lock to
+// the user-data identity.
+const MEETING_CONTRIBUTOR_BUILD = process.env.ROWBOAT_MEETING_CONTRIBUTOR_BUILD === '1'
+  || (app.isPackaged && fs.existsSync(path.join(process.resourcesPath, 'meeting-contributor-build.json')));
+const MEETING_ONLY_MODE = process.env.ROWBOAT_MEETING_ONLY === '1';
+const meetingProfileDir = process.env.ROWBOAT_MEETING_PROFILE_DIR?.trim();
+if (MEETING_CONTRIBUTOR_BUILD || MEETING_ONLY_MODE) {
+  const profileRoot = meetingProfileDir
+    || (MEETING_CONTRIBUTOR_BUILD ? path.join(app.getPath('appData'), 'Rowboat Meetings Dev') : undefined);
+  if (profileRoot) {
+    if (!path.isAbsolute(profileRoot)) {
+      throw new Error('ROWBOAT_MEETING_PROFILE_DIR must be an absolute path');
+    }
+    const userDataPath = path.join(profileRoot, 'electron-user-data');
+    const sessionDataPath = path.join(profileRoot, 'electron-session-data');
+    fs.mkdirSync(userDataPath, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(sessionDataPath, { recursive: true, mode: 0o700 });
+    app.setPath('userData', userDataPath);
+    app.setPath('sessionData', sessionDataPath);
+  }
+  if (MEETING_CONTRIBUTOR_BUILD) app.setName('Rowboat Meetings Dev');
+}
 
 // fs.watch failures (EMFILE fd exhaustion, ENOSPC watch limits) surface as
 // uncaught exceptions from Node's watcher internals, bypassing chokidar's
@@ -116,13 +147,13 @@ if (app.isPackaged && !app.requestSingleInstanceLock()) {
 
 // Register as the OS handler for rowboat:// URLs.
 // In dev, point at the right argv so the OS can re-invoke us correctly.
-if (process.defaultApp) {
+if (!MEETING_CONTRIBUTOR_BUILD && process.defaultApp) {
   if (process.argv.length >= 2) {
     app.setAsDefaultProtocolClient(DEEP_LINK_SCHEME, process.execPath, [
       path.resolve(process.argv[1]),
     ]);
   }
-} else {
+} else if (!MEETING_CONTRIBUTOR_BUILD) {
   app.setAsDefaultProtocolClient(DEEP_LINK_SCHEME);
 }
 
@@ -180,24 +211,20 @@ function initializeExecutionEnvironment(): void {
   }
 }
 initializeExecutionEnvironment();
+// Finder launches do not inherit the shell wrapper used during qualification.
+// Load the private loopback STT credential in Electron main before any meeting
+// IPC can create a transcription session. The helper's strict environment
+// allow-list still prevents this token reaching native code or a renderer.
+initializeMeetingTranscriptionCredentials();
+initializePackagedMeetingCapabilities({
+  repositoryRoot: process.cwd(),
+  resourcesPath: process.resourcesPath,
+  isPackaged: app.isPackaged,
+});
 
 // Physical meeting qualification must not wake unrelated account connectors,
 // agents, analytics, or background knowledge jobs. This mode keeps only the
 // renderer, IPC, meeting detector/capture, tray, and the local session index.
-const MEETING_ONLY_MODE = process.env.ROWBOAT_MEETING_ONLY === '1';
-
-// Keep physical meeting qualification isolated from the operator's normal
-// Chromium cookies, cache, and permission state as well as their Rowboat
-// workspace. The launcher owns this temporary directory and its cleanup.
-const meetingProfileDir = process.env.ROWBOAT_MEETING_PROFILE_DIR?.trim();
-if (MEETING_ONLY_MODE && meetingProfileDir) {
-  if (!path.isAbsolute(meetingProfileDir)) {
-    throw new Error('ROWBOAT_MEETING_PROFILE_DIR must be an absolute path');
-  }
-  app.setPath('userData', path.join(meetingProfileDir, 'electron-user-data'));
-  app.setPath('sessionData', path.join(meetingProfileDir, 'electron-session-data'));
-}
-
 // Path resolution differs between development and production:
 const preloadPath = app.isPackaged
   ? path.join(__dirname, "../preload/dist/preload.js")
@@ -309,6 +336,23 @@ async function ensureLinuxMonitorVolume(): Promise<void> {
 // (a user-facing source picker) in BrowserViewManager.
 function configureAppDisplayMediaHandler(targetSession: Session): void {
   targetSession.setDisplayMediaRequestHandler(async (request, callback) => {
+    // Electron 39's CoreAudio Tap path on macOS 14.2+ can capture system
+    // audio without a screen source. Keep Electron 39's supported string
+    // selector (not Electron 42's loopbackAllDevices object), and give the
+    // handler frame as its mandatory throwaway video source. The renderer
+    // asks for video:false, so no video track reaches the capture pipeline.
+    const systemAudioMode = resolveSystemAudioCaptureMode({
+      platform: process.platform,
+      systemVersion: process.platform === 'darwin' ? process.getSystemVersion() : undefined,
+    });
+    if (shouldUseAudioOnlyLoopback(systemAudioMode, {
+      audioRequested: request.audioRequested,
+      videoRequested: request.videoRequested,
+      hasFrame: request.frame !== null,
+    })) {
+      callback({ video: request.frame!, audio: 'loopback' });
+      return;
+    }
     // On Linux, enumerating screens via desktopCapturer goes through the
     // Wayland screencast portal, which can block on a system dialog or hang
     // outright. Requests that want audio (meeting transcription — the only
@@ -832,7 +876,25 @@ app.on("window-all-closed", () => {
   }
 });
 
-app.on("before-quit", () => {
+let meetingShutdownComplete = false;
+let meetingShutdownInFlight: Promise<void> | null = null;
+
+app.on("before-quit", (event) => {
+  // Force-quit and updater paths can bypass the renderer's normal meeting
+  // finalize action. Wait only for the bounded local helper shutdown, then
+  // re-enter this hook for the regular app cleanup below.
+  if (!meetingShutdownComplete) {
+    event.preventDefault();
+    meetingShutdownInFlight ??= shutdownMeetingTranscription()
+      .catch((error) => {
+        console.error('[Meeting] Failed to stop meeting helper during shutdown:', error);
+      })
+      .finally(() => {
+        meetingShutdownComplete = true;
+        app.quit();
+      });
+    return;
+  }
   // Clean up watcher on app quit
   stopWorkspaceWatcher();
   stopRunsWatcher();

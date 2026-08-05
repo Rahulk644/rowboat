@@ -1,5 +1,5 @@
 export type SelfHostedAudioChannel = 'mic' | 'system';
-export type SelfHostedAudioFlag = 'discontinuity';
+export type SelfHostedAudioFlag = 'discontinuity' | 'recovered';
 
 export type SelfHostedAudioMetadata = {
   sourceId?: string;
@@ -22,6 +22,7 @@ type ChannelState = {
   nextSequence: number;
   discontinuityAtNextCapture: boolean;
   discontinuityBeforeNextSend: boolean;
+  recoveredBeforeNextSend: boolean;
 };
 
 const SAMPLE_RATE = 16_000;
@@ -63,12 +64,15 @@ export class SelfHostedMeetingAudioClock {
   metadataFor(packet: CapturedSelfHostedAudio): SelfHostedAudioMetadata {
     const state = this.states[packet.channel];
     const discontinuity = packet.discontinuityAtCapture || state.discontinuityBeforeNextSend;
+    const flags: SelfHostedAudioFlag[] = [];
+    if (discontinuity) flags.push('discontinuity');
+    if (state.recoveredBeforeNextSend) flags.push('recovered');
     return {
       startSample: packet.startSample,
       sampleCount: packet.sampleCount,
       sampleRate: SAMPLE_RATE,
       sequence: state.nextSequence,
-      flags: discontinuity ? ['discontinuity'] : [],
+      flags,
     };
   }
 
@@ -77,11 +81,23 @@ export class SelfHostedMeetingAudioClock {
     const state = this.states[channel];
     state.nextSequence += 1;
     state.discontinuityBeforeNextSend = false;
+    state.recoveredBeforeNextSend = false;
   }
 
   /** The failed packet was not accepted; flag the next queued packet's gap. */
   markTransportDrop(channel: SelfHostedAudioChannel): void {
     this.states[channel].discontinuityBeforeNextSend = true;
+  }
+
+  /**
+   * A source was reopened after an ended track/device dropout. The next
+   * accepted packet starts a new ASR epoch and records recovery separately
+   * from an ordinary renderer transport retry.
+   */
+  markSourceRecovered(channel: SelfHostedAudioChannel): void {
+    const state = this.states[channel];
+    state.discontinuityBeforeNextSend = true;
+    state.recoveredBeforeNextSend = true;
   }
 
   private newChannelState(): ChannelState {
@@ -90,6 +106,7 @@ export class SelfHostedMeetingAudioClock {
       nextSequence: 0,
       discontinuityAtNextCapture: false,
       discontinuityBeforeNextSend: false,
+      recoveredBeforeNextSend: false,
     };
   }
 }

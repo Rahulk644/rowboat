@@ -18,16 +18,16 @@ self-hosted meeting path without over-claiming what is currently shipped.
 The branch has the v2 transcript domain and a Rust bridge lifecycle/evidence
 sidecar. **Current alpha PCM capture remains the existing renderer
 getUserMedia/ScreenCaptureKit path** and is the active rollback path. The
-bridge may be built, packaged, and enabled for lifecycle plus optional macOS
-Anarlog evidence; native FlexAudio PCM transport remains opt-in foundation
-work. This is not a production release.
+bridge may be built, packaged, and enabled for lifecycle, optional macOS
+Anarlog evidence, and contributor-only private AEC; native FlexAudio PCM
+capture remains opt-in foundation work. This is not a production release.
 
 ## Architecture and boundaries
 
 ```text
 Renderer (current):  meeting UI plus existing mic/system PCM capture fallback
-Electron main:       owns STT credential, supervises bridge, merges revisions
-Rust bridge:         lifecycle plus optional bounded macOS AX evidence
+Electron main:       owns STT credential, serializes paired AEC/ASR, merges revisions
+Rust bridge:         lifecycle, bounded macOS AX evidence, optional private AEC
 Private VPS:         one resident Nemotron model, mic + system ASR sessions,
                      globally serialized inference
 ```
@@ -35,7 +35,9 @@ Private VPS:         one resident Nemotron model, mic + system ASR sessions,
 - The renderer never receives the STT token or scans Accessibility. It does
   currently own the legacy capture path until native capture is qualified.
 - The bridge has no ASR model, diarizer, LLM, Calendar, contacts, or public
-  renderer-facing PCM API. When native audio capture is selected, its audio
+  renderer-facing PCM API. In an AEC contributor build, only Electron main can
+  exchange bounded paired PCM with it over private stdio; the helper never
+  transports, logs, or persists that PCM. When native audio capture is selected, its audio
   readiness contract requires a first valid callback, not an open handle. The
   current evidence-only sidecar's lifecycle handshake is not audio readiness.
 - KVM 1 keeps one model loaded and two named sessions; serialized compute is
@@ -49,8 +51,10 @@ intentionally `low` confidence with `timingSource: "feed-window"`, not a
 claim of token timestamps. The renderer groups safe contiguous chunks into a
 single visible speaker turn while retaining every raw record. Mic copies of
 system speech are removed only when shared, conservative time/text evidence is
-unique; different concurrent speech is retained. This is reconciliation, not
-a claim of acoustic echo cancellation.
+unique; different concurrent speech is retained. A contributor AEC package
+now has a real LocalVQE path with AEC3 fallback and bounded raw fail-open, but
+quality still requires the physical double-talk corpus below. Text
+reconciliation remains the rollback safety net, not acoustic-quality proof.
 
 Zoom 6.x compact windows expose participant tiles through the native
 `Video render` role and a separate participant/audio-state description. Direct
@@ -162,6 +166,8 @@ acceptance; those remain explicit qualification work.
 | Self-hosted Nemotron | Both loopback env vars select it | tunnel + KVM health | remove either env var |
 | Transcript v2 | main-process domain | revision-aware UI + tests | legacy snapshot fields retained |
 | FlexAudio | Cargo feature only | timestamp/device/recovery physical A/B | existing capture adapter |
+| LocalVQE AEC | Cargo feature + verified explicit local library/model + Rust paired-frame transport | aligned speaker-mode corpus, near-end/double-talk, reference loss, CPU/RSS and SBOM gates | raw mic pass-through |
+| WebRTC AEC3 | Cargo feature + bundled reviewed native build + Rust paired-frame transport | same corpus/toolchain/SBOM gates; wins a documented failure class | raw mic pass-through or LocalVQE |
 | Anarlog AX | optional evidence-only macOS feature | package + TCC/Zoom physical test | disable feature; no AX names |
 | Voice profiles/diarization | not alpha | consent/privacy/scheduling/accuracy | anonymous or unknown |
 

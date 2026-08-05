@@ -40,4 +40,25 @@ describe('CoalescedAsyncWriter', () => {
     await vi.advanceTimersByTimeAsync(100)
     expect(write).toHaveBeenCalledTimes(2)
   })
+
+  it('cancels a trailing write and settles the active write before final output', async () => {
+    vi.useFakeTimers()
+    let releaseFirst!: () => void
+    const first = new Promise<void>((resolve) => { releaseFirst = resolve })
+    const write = vi.fn().mockImplementation(() => first)
+    const writer = new CoalescedAsyncWriter(write, 100)
+
+    writer.schedule()
+    await vi.advanceTimersByTimeAsync(100)
+    writer.schedule()
+    let settled = false
+    const settling = writer.cancelAndSettle().then(() => { settled = true })
+    await Promise.resolve()
+    expect(settled).toBe(false)
+
+    releaseFirst()
+    await settling
+    await vi.advanceTimersByTimeAsync(100)
+    expect(write).toHaveBeenCalledTimes(1)
+  })
 })

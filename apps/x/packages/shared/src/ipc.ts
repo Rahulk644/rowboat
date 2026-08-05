@@ -1230,6 +1230,40 @@ const ipcSchemas = {
     }),
     res: SelfHostedMeetingSnapshotSchema,
   },
+  // Private renderer -> Electron-main paired capture operation. It never
+  // returns PCM: Electron main may route the paired frame through the native
+  // AEC helper, then returns only zero or more ordinary transcript snapshots
+  // for microphone audio that is now safe to forward to self-hosted ASR.
+  // System audio keeps the existing named `feed` operation and is therefore
+  // independently retryable if its worker session drops.
+  'meeting:transcription:feedAecPair': {
+    req: z.object({
+      meetingId: z.string().min(1).max(120),
+      mic: z.object({
+        pcmBase64: z.string().min(1).max(100_000),
+        audio: z.object({
+          sourceId: z.string().min(1).max(160).optional(),
+          startSample: z.number().int().nonnegative().optional(),
+          sampleCount: z.number().int().positive().optional(),
+          sampleRate: z.number().int().positive().max(192_000).optional(),
+          sequence: z.number().int().nonnegative().optional(),
+          flags: z.array(z.enum(['discontinuity', 'recovered', 'silence'])).max(3).optional(),
+        }).optional(),
+      }),
+      system: z.object({
+        pcmBase64: z.string().min(1).max(100_000),
+        audio: z.object({
+          sourceId: z.string().min(1).max(160).optional(),
+          startSample: z.number().int().nonnegative().optional(),
+          sampleCount: z.number().int().positive().optional(),
+          sampleRate: z.number().int().positive().max(192_000).optional(),
+          sequence: z.number().int().nonnegative().optional(),
+          flags: z.array(z.enum(['discontinuity', 'recovered', 'silence'])).max(3).optional(),
+        }).optional(),
+      }),
+    }),
+    res: z.array(SelfHostedMeetingSnapshotSchema),
+  },
   'meeting:transcription:finalize': {
     req: z.object({ meetingId: z.string().min(1).max(120) }),
     res: z.object({
@@ -2609,6 +2643,14 @@ const ipcSchemas = {
     req: z.null(),
     res: z.object({
       granted: z.boolean(),
+    }),
+  },
+  // Main chooses the platform-safe display-media shape. Renderer must not
+  // infer macOS versions from a browser user agent.
+  'meeting:getSystemAudioCaptureMode': {
+    req: z.null(),
+    res: z.object({
+      mode: z.enum(['audio-only-loopback', 'screen-loopback']),
     }),
   },
   'meeting:openScreenRecordingSettings': {

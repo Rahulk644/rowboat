@@ -7,15 +7,15 @@ renderer-facing PCM path.
 
 ## Safety boundary
 
-Electron main starts and supervises this binary over a private stdio pipe.
-The plan allows a length-delimited binary protocol or NDJSON. This foundation
-selects newline-delimited JSON for small control and metadata events.
-It never serializes audio frames, base64 PCM, API credentials, Accessibility
-trees, or user note text. PCM is handed by the bridge directly to the private
-authenticated VPS transport selected by Electron main **only after the next
-transport slice supplies a private binary `AudioFrame` sink**. The current
-standalone binary is a control-protocol smoke-test host and deliberately does
-not send or persist audio.
+Electron main starts and supervises this binary over a private NDJSON stdio
+pipe. Control, health, and normalized speaker-evidence records contain no PCM.
+The one explicit exception is the opt-in AEC request: Electron main sends one
+bounded, paired 20 ms mic/render frame and receives ordered replacement mic
+frames on that same private pipe. PCM is never exposed through renderer IPC,
+logged, persisted, placed in diagnostics, or sent to the VPS by the helper.
+Electron main alone delivers the cleaned-or-raw mic result and the independent
+system channel to ASR. API credentials, Accessibility trees, transcripts, and
+user note text never enter the sidecar.
 
 `Ready` has a strict meaning: the source has opened **and** a non-empty valid
 PCM callback has produced a normalized 20 ms frame. A buffer full of zeroes is
@@ -67,6 +67,44 @@ cargo run
 # emits {"type":"ready","protocol_version":1}
 printf '%s\n' '{"type":"ping","request_id":"smoke"}' | cargo run
 ```
+
+## Optional acoustic echo cancellation qualification
+
+The bridge now owns the safe AEC timing boundary: it aligns bounded render and
+microphone histories, processes only timestamp-qualified speaker-output pairs,
+preserves near-end/double-talk mic frames, and passes raw mic through on
+headsets, missing/untrusted references, source gaps, processor failure, or the
+incomplete reblocking tail. `AecHealth` and per-frame metadata are safe for
+Electron main; neither contains PCM, text, paths, or a quality score.
+
+Two implementation candidates remain opt-in, independent comparisons:
+
+```sh
+# Generic bridge/reblocker policy and the dynamically loaded LocalVQE adapter.
+cargo test --features aec-localvqe
+
+# Bundled BSD-3-Clause WebRTC AudioProcessing v2.1 AEC3 comparator.
+# Requires the reviewed native toolchain (meson, ninja, pkg-config/pkgconf).
+cargo test --features aec-webrtc-aec3
+```
+
+`aec-localvqe` pins the Apache-2.0 LocalVQE source and v1.4-AEC 200K model but
+does not ship either. Electron main supplies explicit local library/model paths
+only for a qualification session; the adapter canonicalizes both and verifies
+the model SHA-256 before dynamically loading the narrow C ABI. LocalVQE uses
+256-sample hops, AEC3 uses 160-sample hops, and the bridge uses 320-sample
+capture frames. `StreamingReblocker` preserves sample order and adds bounded
+startup latency instead of pretending these are same-frame APIs.
+
+The current Rowboat alpha captures PCM through the renderer fallback, pairs
+the two channels in Electron main, and—only in the contributor AEC package—
+constructs an `AecCoordinator` and routes bounded pairs through this sidecar.
+Missing resources, untrusted timing, helper errors, or disabled gates release
+the original mic samples raw. Do not claim AEC quality merely because this
+operational path builds or passes silent-frame tests.
+See [`vendor/localvqe/MANIFEST.md`](vendor/localvqe/MANIFEST.md) and
+[`vendor/webrtc-aec3/MANIFEST.md`](vendor/webrtc-aec3/MANIFEST.md) for pins,
+licenses, SBOM evidence, and physical promotion gates.
 
 ## FlexAudio A/B adapter
 

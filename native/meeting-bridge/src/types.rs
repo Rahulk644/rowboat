@@ -9,6 +9,111 @@ pub enum Channel {
     System,
 }
 
+/// The independently selectable acoustic echo cancellation implementation.
+///
+/// These names describe a qualified implementation selected by the native
+/// host.  They do not imply that an arbitrary Cargo feature, model file, or
+/// platform library is available at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AecEngine {
+    LocalVqe,
+    WebRtcAec3,
+}
+
+/// How a microphone frame reached the ASR/VAD transport.  The bridge never
+/// drops a microphone frame merely because a render reference is present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AecFrameDisposition {
+    /// A configured implementation produced a cleaned microphone frame.
+    Cleaned,
+    /// A headset or other isolated route made AEC unnecessary.
+    BypassedIsolatedOutput,
+    /// AEC is intentionally not selected for this session.
+    BypassedDisabled,
+    /// The reference was missing, stale, or not timestamp-qualified.  The raw
+    /// microphone frame was passed through to preserve near-end speech.
+    BypassedReferenceUnavailable,
+    /// The implementation rejected a frame.  The raw microphone frame was
+    /// passed through and the session entered a degraded health state.
+    BypassedProcessorFailure,
+    /// A source discontinuity invalidated alignment.  The raw microphone
+    /// frame was passed through and alignment must be re-established.
+    BypassedDiscontinuity,
+}
+
+/// Reference timing provenance.  This is metadata only; it never includes a
+/// device identifier, source title, PCM, or user content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AecReferenceTiming {
+    NotUsed,
+    Trusted,
+    Untrusted,
+    Missing,
+}
+
+/// Per-microphone-frame AEC provenance.  It is included in frame metadata so
+/// Electron main can make speaker-attribution decisions without inspecting
+/// PCM or inferring quality from a UI state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AecFrameMetadata {
+    pub engine: Option<AecEngine>,
+    pub disposition: AecFrameDisposition,
+    pub reference_timing: AecReferenceTiming,
+    /// The accepted render-reference position minus the microphone position.
+    /// This is a bounded integer sample delta, never an audio payload.
+    pub reference_offset_samples: Option<i64>,
+}
+
+/// Session-level AEC lifecycle.  `Ready` means a configured implementation
+/// has processed at least one timestamp-qualified mic/render pair; it is not a
+/// claim that a physical echo-quality gate has passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AecState {
+    Off,
+    Bypassed,
+    WaitingForReference,
+    Ready,
+    Degraded,
+}
+
+/// Bounded, privacy-safe AEC health.  This deliberately contains counts and
+/// state only; no PCM, transcript text, device name, model path, or metric
+/// derived from a user's speech is emitted here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AecHealth {
+    pub meeting_id: String,
+    pub engine: Option<AecEngine>,
+    pub state: AecState,
+    pub processed_frames: u64,
+    pub raw_bypass_frames: u64,
+    pub reference_missing_frames: u64,
+    pub processor_failure_frames: u64,
+    pub reference_evictions: u64,
+    pub pending_mic_frames: usize,
+    pub reason: Option<String>,
+}
+
+impl AecHealth {
+    pub(crate) fn new(meeting_id: impl Into<String>, engine: Option<AecEngine>) -> Self {
+        Self {
+            meeting_id: meeting_id.into(),
+            engine,
+            state: AecState::Off,
+            processed_frames: 0,
+            raw_bypass_frames: 0,
+            reference_missing_frames: 0,
+            processor_failure_frames: 0,
+            reference_evictions: 0,
+            pending_mic_frames: 0,
+            reason: None,
+        }
+    }
+}
+
 /// Flags which make audio gaps visible to downstream ASR and transcript
 /// revision logic. They are never inferred from transcript text.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -43,6 +148,9 @@ pub struct AudioFrame {
     pub sequence: u64,
     pub epoch: u64,
     pub flags: FrameFlags,
+    /// AEC provenance for microphone frames.  System frames and raw capture
+    /// frames leave this as `None` until an AEC coordinator processes them.
+    pub aec: Option<AecFrameMetadata>,
     pub pcm_s16le: Vec<i16>,
 }
 
@@ -58,6 +166,7 @@ pub struct AudioFrameMetadata {
     pub sequence: u64,
     pub epoch: u64,
     pub flags: FrameFlags,
+    pub aec: Option<AecFrameMetadata>,
 }
 
 impl From<&AudioFrame> for AudioFrameMetadata {
@@ -72,6 +181,7 @@ impl From<&AudioFrame> for AudioFrameMetadata {
             sequence: frame.sequence,
             epoch: frame.epoch,
             flags: frame.flags,
+            aec: frame.aec.clone(),
         }
     }
 }

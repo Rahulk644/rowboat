@@ -84,6 +84,7 @@ mod tests {
             sequence,
             epoch: 0,
             flags: FrameFlags::default(),
+            aec: None,
             pcm_s16le: vec![0; 320],
         }
     }

@@ -17,11 +17,27 @@ flexaudio = ["dep:flexaudio"]
 # bounded native Zoom inspection path behind an explicit macOS feature; it
 # never enables a browser extension, Calendar identity, or AX mutation.
 anarlog-ax = ["dep:cidre", "dep:macos-accessibility-client"]
+# These feature flags expose only the audited integration boundary and pin
+# metadata.  They intentionally do not fetch, link, or package a model/library
+# until its native source, model checksum, reblocking adapter, SBOM, and
+# platform build are all reviewed.  Raw microphone pass-through remains the
+# behavior when no qualified processor is injected by the native host.
+aec-localvqe = ["dep:libloading", "dep:sha2"]
+aec-webrtc-aec3 = ["dep:webrtc-audio-processing"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+base64 = "=0.22.1"
+libloading = { version = "=0.8.9", optional = true }
+sha2 = { version = "=0.10.9", optional = true }
+# BSD-3-Clause — https://github.com/tonarino/webrtc-audio-processing
+# audited v2.1.0 source: c14d7af1760baff83e8210fee336a0cae0faaa7d;
+# PulseAudio WebRTC submodule: d0569cfa.  Build its reviewed bundled source
+# only when the comparator feature is explicitly selected; this avoids relying
+# on an arbitrary system library with unknown build flags or ABI.
+webrtc-audio-processing = { version = "=2.1.0", default-features = false, features = ["bundled"], optional = true }
 
 # MIT — https://github.com/Studio-Sadola/flexaudio
 # audited revision: 7e41bbd0b03c4f52260926fa0148ca0e0179fda1

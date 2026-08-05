@@ -101,6 +101,49 @@ test('simultaneous trusted speakers are preserved as overlap rather than forced 
   assert.equal(resolution.attributionSource, 'trusted-ax-overlap');
 });
 
+test('identical display names stay distinct and ambiguous without an explicit Zoom self marker', () => {
+  const resolution = resolveMeetingSpeaker(segment(), {
+    evidence: [
+      {
+        source: 'zoom_ax', participantId: 'ax-element-local', displayName: 'Rahul Khatri',
+        isActive: true, startSample: 0, endSample: 12_000, confidence: 1,
+      },
+      {
+        source: 'zoom_ax', participantId: 'ax-element-remote', displayName: 'Rahul Khatri',
+        isActive: true, startSample: 0, endSample: 12_000, confidence: 1,
+      },
+    ],
+  });
+
+  assert.equal(resolution.overlap, true);
+  assert.deepEqual(resolution.speaker, {
+    kind: 'unknown',
+    displayName: 'Rahul Khatri + Rahul Khatri',
+  });
+  assert.equal(resolution.attributionSource, 'trusted-ax-overlap');
+});
+
+test('an explicit Zoom self marker separates same-name local mic and remote system turns', () => {
+  const evidence = [
+    {
+      source: 'zoom_ax', participantId: 'ax-element-local', displayName: 'Rahul Khatri',
+      isSelf: true, isActive: true, startSample: 0, endSample: 12_000, confidence: 1,
+    },
+    {
+      source: 'zoom_ax', participantId: 'ax-element-remote', displayName: 'Rahul Khatri',
+      isSelf: false, isActive: true, startSample: 0, endSample: 12_000, confidence: 1,
+    },
+  ];
+
+  const mic = resolveMeetingSpeaker(segment({ channel: 'mic' }), { evidence });
+  assert.deepEqual(mic.speaker, { kind: 'self', id: 'self', displayName: 'You' });
+
+  const system = resolveMeetingSpeaker(segment({ channel: 'system' }), { evidence });
+  assert.deepEqual(system.speaker, {
+    kind: 'named', id: 'ax-element-remote', displayName: 'Rahul Khatri',
+  });
+});
+
 test('unqualified mic and passive roster evidence fail closed to a stable anonymous cluster', () => {
   const resolution = resolveMeetingSpeaker(segment({ channel: 'mic' }), {
     micHealth: { meetingId: 'meeting-1', channel: 'mic', epoch: 0, state: 'ready', sequence: 1, lastFrameSample: 16_000, restartCount: 0 },

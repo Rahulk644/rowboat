@@ -92,7 +92,9 @@ import { notifyIfEnabled } from '@x/core/dist/application/notification/notifier.
 import { consumePendingToggleMeetingNotes, setTrayRecordingState } from './tray.js';
 import { closeMeetingPopup, getMeetingPopupPayload, handleMeetingPopupAction } from './meeting-popup.js';
 import { selfHostedMeetingTranscription } from './meeting-transcription.js';
+import { AecAsrDeliveryQueue, MeetingAecRouter } from './meeting-aec-router.js';
 import { createMeetingBridgeRuntime, resolveRowboatRepositoryRoot } from './meeting-bridge-runtime.js';
+import { resolveSystemAudioCaptureMode } from './meeting-system-audio.js';
 
 // Ambient meeting detection must ignore Rowboat's own mic use: meeting
 // capture and assistant voice/video calls both hold the mic. Either being
@@ -105,6 +107,11 @@ const MEETING_ONLY_UNAVAILABLE = 'Unavailable in meeting-only mode.';
 // capture. It can start only when the renderer reports its graph is prepared,
 // anchoring both sample clocks at the same instant.
 const bridgeEligibleMeetings = new Set<string>();
+// The only Electron-main location that may temporarily hold unmatched AEC
+// microphone frames. The router is bounded, never logs/persists PCM, and
+// fails open to ordinary self-hosted ASR on any helper uncertainty.
+const meetingAecRouters = new Map<string, MeetingAecRouter>();
+const meetingAecAsrQueues = new Map<string, AecAsrDeliveryQueue<Awaited<ReturnType<typeof selfHostedMeetingTranscription.feed>>>>();
 function updateSelfCaptureState() {
   setSelfCaptureActive(meetingRecordingActive || voiceCallActive);
 }
@@ -122,6 +129,53 @@ const meetingBridgeRuntime = createMeetingBridgeRuntime({
     selfHostedMeetingTranscription.applySpeakerEvidence(meetingId, evidence);
   },
 });
+
+/**
+ * The renderer normally finalizes a meeting. Force-quit and updater paths can
+ * bypass that UI, so Electron main owns this final sidecar cleanup boundary.
+ */
+export async function shutdownMeetingTranscription(): Promise<void> {
+  bridgeEligibleMeetings.clear();
+  meetingAecRouters.clear();
+  meetingAecAsrQueues.clear();
+  await meetingBridgeRuntime.dispose();
+}
+
+function meetingAecRouter(meetingId: string): MeetingAecRouter {
+  let router = meetingAecRouters.get(meetingId);
+  if (!router) {
+    router = new MeetingAecRouter();
+    meetingAecRouters.set(meetingId, router);
+  }
+  return router;
+}
+
+function meetingAecAsrQueue(meetingId: string): AecAsrDeliveryQueue<Awaited<ReturnType<typeof selfHostedMeetingTranscription.feed>>> {
+  let queue = meetingAecAsrQueues.get(meetingId);
+  if (!queue) {
+    queue = new AecAsrDeliveryQueue();
+    meetingAecAsrQueues.set(meetingId, queue);
+  }
+  return queue;
+}
+
+function aecCaptureKey(meetingId: string, audio: { startSample?: number; sequence?: number; sourceId?: string } | undefined): string {
+  // This is a bounded, non-content identity. It distinguishes a renderer retry
+  // from the next captured batch without retaining or hashing microphone PCM.
+  return `${meetingId}:${audio?.sourceId ?? 'mic'}:${audio?.startSample ?? -1}:${audio?.sequence ?? -1}`;
+}
+
+/** Drain a native reblocker's held microphone tail before the ASR boundary moves. */
+async function flushMeetingAecMicrophone(meetingId: string): Promise<void> {
+  const router = meetingAecRouters.get(meetingId);
+  if (!router) return;
+  const queue = meetingAecAsrQueue(meetingId);
+  await queue.accept(
+    `${meetingId}:flush`,
+    () => router.flush(meetingBridgeRuntime, meetingId),
+    (batch) => selfHostedMeetingTranscription.feed(meetingId, 'mic', batch.pcmBase64, batch.metadata),
+  );
+}
 import * as composioHandler from './composio-handler.js';
 import * as appsIndexer from '@x/core/dist/apps/indexer.js';
 import * as appsServer from '@x/core/dist/apps/server.js';
@@ -987,6 +1041,11 @@ export function setupIpcHandlers() {
       setTrayRecordingState(args.recording);
       meetingRecordingActive = args.recording;
       updateSelfCaptureState();
+      // Chromium may throttle timers/callback scheduling when the main window
+      // is minimized. Keep the renderer capture graph fully scheduled only
+      // for the duration of an active meeting, then restore the lightweight
+      // default immediately when recording stops.
+      BrowserWindow.fromWebContents(_event.sender)?.webContents.setBackgroundThrottling(!args.recording);
       // Recording started through another path — a lingering "Take Notes?"
       // popup is stale now.
       if (args.recording) closeMeetingPopup();
@@ -997,6 +1056,8 @@ export function setupIpcHandlers() {
     },
     'meeting:transcription:begin': async (_event, args) => {
       await selfHostedMeetingTranscription.begin(args.meetingId, args.language);
+      meetingAecRouters.set(args.meetingId, new MeetingAecRouter());
+      meetingAecAsrQueues.set(args.meetingId, new AecAsrDeliveryQueue());
       bridgeEligibleMeetings.add(args.meetingId);
       void meetingBridgeRuntime.warm(args.meetingId);
       return { success: true as const };
@@ -1007,7 +1068,29 @@ export function setupIpcHandlers() {
           args.meetingId,
           args.outputRouteIsolated,
         );
-        await meetingBridgeRuntime.captureReady(args.meetingId);
+        const bridgeReady = await meetingBridgeRuntime.captureReady(
+          args.meetingId,
+          args.outputRouteIsolated,
+        );
+        // A renderer devicechange may call captureReady again. Keep the
+        // warm/native helper and evidence session intact; only update its AEC
+        // route and deliver a bounded raw-safe tail through the existing ASR
+        // queue. A missing/failed helper makes the router release retained
+        // microphone audio raw rather than delaying or discarding it.
+        await meetingAecAsrQueue(args.meetingId).accept(
+          `${args.meetingId}:aec-route:${args.outputRouteIsolated ? 'isolated' : 'speaker'}`,
+          () => meetingAecRouter(args.meetingId).updateOutputRoute(
+            bridgeReady ? meetingBridgeRuntime : null,
+            args.meetingId,
+            args.outputRouteIsolated,
+          ),
+          (batch) => selfHostedMeetingTranscription.feed(
+            args.meetingId,
+            'mic',
+            batch.pcmBase64,
+            batch.metadata,
+          ),
+        );
       }
       return { success: true as const };
     },
@@ -1017,15 +1100,36 @@ export function setupIpcHandlers() {
     'meeting:transcription:feed': async (_event, args) => {
       return selfHostedMeetingTranscription.feed(args.meetingId, args.channel, args.pcmBase64, args.audio);
     },
+    'meeting:transcription:feedAecPair': async (_event, args) => {
+      return meetingAecAsrQueue(args.meetingId).accept(
+        aecCaptureKey(args.meetingId, args.mic.audio),
+        async () => {
+          const routed = await meetingAecRouter(args.meetingId).processPair(
+            bridgeEligibleMeetings.has(args.meetingId) ? meetingBridgeRuntime : null,
+            args.meetingId,
+            args.mic.pcmBase64,
+            args.system.pcmBase64,
+            args.mic.audio,
+            args.system.audio,
+          );
+          return routed.mic;
+        },
+        (batch) => selfHostedMeetingTranscription.feed(args.meetingId, 'mic', batch.pcmBase64, batch.metadata),
+      );
+    },
     'meeting:transcription:finalize': async (_event, args) => {
       try {
+        await flushMeetingAecMicrophone(args.meetingId);
         return await selfHostedMeetingTranscription.finalize(args.meetingId);
       } finally {
         bridgeEligibleMeetings.delete(args.meetingId);
+        meetingAecRouters.delete(args.meetingId);
+        meetingAecAsrQueues.delete(args.meetingId);
         await meetingBridgeRuntime.stop(args.meetingId);
       }
     },
     'meeting:transcription:restart': async (_event, args) => {
+      await flushMeetingAecMicrophone(args.meetingId);
       await selfHostedMeetingTranscription.restart(args.meetingId);
       if (bridgeEligibleMeetings.has(args.meetingId)) {
         void meetingBridgeRuntime.restart(args.meetingId);
@@ -1033,14 +1137,22 @@ export function setupIpcHandlers() {
       return { success: true as const };
     },
     'meeting:transcription:restartChannel': async (_event, args) => {
+      // Do not flush the AEC delivery queue here. A failed mic ASR delivery is
+      // intentionally retained under the renderer's capture key; draining it
+      // before resetting the worker would commit the batch once and make the
+      // subsequent same-key retry non-contiguous. The serialized retry drains
+      // that retained batch exactly once into the fresh worker session.
       await selfHostedMeetingTranscription.restartChannel(args.meetingId, args.channel);
       return { success: true as const };
     },
     'meeting:transcription:reset': async (_event, args) => {
       try {
+        await flushMeetingAecMicrophone(args.meetingId);
         await selfHostedMeetingTranscription.reset(args.meetingId);
       } finally {
         bridgeEligibleMeetings.delete(args.meetingId);
+        meetingAecRouters.delete(args.meetingId);
+        meetingAecAsrQueues.delete(args.meetingId);
         await meetingBridgeRuntime.stop(args.meetingId);
       }
       return { success: true as const };
@@ -2505,13 +2617,21 @@ export function setupIpcHandlers() {
       if (status === 'granted') return { granted: true };
       // Not granted — call desktopCapturer.getSources() to register the app
       // in the macOS Screen Recording list. On first call this shows the
-      // native permission prompt (signed apps are remembered across restarts).
+      // native permission prompt. macOS retains the choice only when a later
+      // bundle satisfies the same designated signing requirement; a matching
+      // display name or CFBundleIdentifier alone is not sufficient.
       try { await desktopCapturer.getSources({ types: ['screen'] }); } catch { /* ignore */ }
       // Re-check after the native prompt was dismissed
       const statusAfter = systemPreferences.getMediaAccessStatus('screen');
       console.log('[meeting] Screen recording permission status after prompt:', statusAfter);
       return { granted: statusAfter === 'granted' };
     },
+    'meeting:getSystemAudioCaptureMode': async () => ({
+      mode: resolveSystemAudioCaptureMode({
+        platform: process.platform,
+        systemVersion: process.platform === 'darwin' ? process.getSystemVersion() : undefined,
+      }),
+    }),
     'meeting:openScreenRecordingSettings': async () => {
       await shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture');
       return { success: true };

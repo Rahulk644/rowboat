@@ -22,6 +22,9 @@ import {
     type CapturedSelfHostedAudio,
 } from '@/lib/self-hosted-meeting-audio-clock';
 import { CoalescedAsyncWriter } from '@/lib/coalesced-async-writer';
+import { MeetingCaptureWatchdog, type MeetingCaptureChannel } from '@/lib/meeting-capture-watchdog';
+import { isKnownIsolatedOutputLabel } from '@/lib/meeting-output-route';
+import { MeetingLifecycleGate } from '@/lib/meeting-lifecycle-gate';
 
 export type MeetingTranscriptionState = 'idle' | 'connecting' | 'recording' | 'stopping';
 
@@ -45,6 +48,7 @@ const DEEPGRAM_LISTEN_URL = `wss://api.deepgram.com/v1/listen?${DEEPGRAM_PARAMS.
 const SELF_HOSTED_BATCH_SAMPLES = 8_960;
 const SELF_HOSTED_MAX_PENDING_BATCHES = 24;
 const SELF_HOSTED_RECONNECT_DELAYS_MS = [250, 500, 1_000, 2_000, 4_000];
+const CAPTURE_WATCHDOG_INTERVAL_MS = 1_000;
 
 // RMS threshold for "someone is talking" on either channel. Drives silence
 // detection while staying above faint room-noise levels on the microphone.
@@ -63,19 +67,6 @@ const POST_CALENDAR_END_SILENCE_MS = 2 * 60 * 1000;
 // How often the silence checker runs.
 const SILENCE_CHECK_INTERVAL_MS = 5 * 1000;
 
-// On macOS (ScreenCaptureKit) the system-audio track never fires "ended"/"mute"
-// when the meeting ends, and its readyState stays "live" — only track.muted flips
-// to true. But muted is ambiguous: it also goes true whenever no system audio is
-// playing (a quiet but live meeting), so muted alone can't safely trigger a stop.
-// See the poll in start() for how the muted signal is gated on the scheduled
-// calendar end so a quiet stretch never cuts a live meeting short.
-const TRACK_POLL_INTERVAL_MS = 3 * 1000;
-const MUTE_POLLS_TO_STOP = 3;
-
-// The ScreenCaptureKit quirk above is macOS-only; on Windows the track's "ended"
-// event fires normally (handled by the listener in start()), so the poll below is
-// gated to macOS.
-const isMac = typeof navigator !== 'undefined' && navigator.platform.toLowerCase().includes('mac');
 // On Linux getDisplayMedia loopback works too (Chromium captures the default
 // sink's monitor through the PulseAudio layer), but the request needs special
 // handling in main.ts — see setDisplayMediaRequestHandler there. Note that
@@ -83,6 +74,7 @@ const isMac = typeof navigator !== 'undefined' && navigator.platform.toLowerCase
 // is NOT an option: Chromium filters monitor sources out of device
 // enumeration on Linux (audio_manager_pulse.cc), so they never appear.
 const isLinux = typeof navigator !== 'undefined' && navigator.platform.toLowerCase().includes('linux');
+const isMac = typeof navigator !== 'undefined' && navigator.platform.toLowerCase().includes('mac');
 
 // ---------------------------------------------------------------------------
 // Headphone detection
@@ -93,12 +85,38 @@ async function detectHeadphones(): Promise<boolean> {
         const outputs = devices.filter(d => d.kind === 'audiooutput');
         const defaultOutput = outputs.find(d => d.deviceId === 'default');
         const label = (defaultOutput?.label ?? '').toLowerCase();
-        // Heuristic: built-in speakers won't match these patterns
-        const headphonePatterns = ['headphone', 'airpod', 'earpod', 'earphone', 'earbud', 'bluetooth', 'bt_', 'jabra', 'bose', 'sony wh', 'sony wf'];
-        return headphonePatterns.some(p => label.includes(p));
+        return isKnownIsolatedOutputLabel(label);
     } catch {
         return false;
     }
+}
+
+function openMicrophoneCapture(): Promise<MediaStream> {
+    return navigator.mediaDevices.getUserMedia({
+        audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+        },
+    });
+}
+
+async function openSystemAudioCapture(): Promise<MediaStream> {
+    const captureMode = await window.ipc
+        .invoke('meeting:getSystemAudioCaptureMode', null)
+        // A mismatched main/renderer pair must retain the old, known-safe
+        // screen+loopback request rather than assume an audio-only path.
+        .catch(() => ({ mode: 'screen-loopback' as const }));
+    const stream = await navigator.mediaDevices.getDisplayMedia({
+        audio: true,
+        video: captureMode.mode === 'audio-only-loopback' ? false : true,
+    });
+    stream.getVideoTracks().forEach(track => track.stop());
+    if (stream.getAudioTracks().length === 0) {
+        stream.getTracks().forEach(track => track.stop());
+        throw new Error('No audio track from getDisplayMedia');
+    }
+    return stream;
 }
 
 // ---------------------------------------------------------------------------
@@ -183,6 +201,7 @@ function formatTranscript(date: string, calendarEvent?: CalendarEventMeta): stri
 export function useMeetingTranscription(onAutoStop?: () => void) {
     const { refresh: refreshRowboatAccount } = useRowboatAccount();
     const [state, setState] = useState<MeetingTranscriptionState>('idle');
+    const stateRef = useRef<MeetingTranscriptionState>('idle');
     const wsRef = useRef<WebSocket | null>(null);
     const selfHostedMeetingIdRef = useRef<string | null>(null);
     const transcriptMeetingIdRef = useRef<string | null>(null);
@@ -198,13 +217,22 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
     const selfHostedAudioClockRef = useRef(new SelfHostedMeetingAudioClock());
     const micStreamRef = useRef<MediaStream | null>(null);
     const systemStreamRef = useRef<MediaStream | null>(null);
+    const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+    const systemSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+    const mergerRef = useRef<ChannelMergerNode | null>(null);
     const processorRef = useRef<ScriptProcessorNode | null>(null);
     const audioCtxRef = useRef<AudioContext | null>(null);
+    const captureWatchdogRef = useRef<MeetingCaptureWatchdog | null>(null);
+    const captureWatchdogTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+    const captureRecoveryRef = useRef<((channel: MeetingCaptureChannel, reason: string) => Promise<void>) | null>(null);
+    const captureRecoveryInFlightRef = useRef(new Set<MeetingCaptureChannel>());
+    const captureDeviceChangeListenerRef = useRef<(() => void) | null>(null);
     const transcriptSegmentsRef = useRef<TranscriptSegment[]>([]);
     const legacySegmentSequenceRef = useRef<Record<SelfHostedChannel, number>>({ mic: 0, system: 0 });
     const legacyInterimRevisionRef = useRef<Record<SelfHostedChannel, number>>({ mic: 0, system: 0 });
     const notePathRef = useRef<string>('');
     const transcriptWriterRef = useRef<CoalescedAsyncWriter | null>(null);
+    const lifecycleGateRef = useRef(new MeetingLifecycleGate());
     const transcriptBlockMissingNotifiedRef = useRef(false);
     // Silence detection: timestamp of the last speech-level audio on either
     // channel, plus the interval that checks it. calendarEndMsRef holds the
@@ -213,10 +241,6 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
     const silenceCheckRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const calendarEndMsRef = useRef<number | null>(null);
     const nudgeToastIdRef = useRef<string | number | null>(null);
-    // On macOS (ScreenCaptureKit) the system-audio track doesn't reliably fire
-    // "ended"/"mute" when the meeting ends, so we poll its readyState/muted
-    // state instead.
-    const trackPollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const onAutoStopRef = useRef(onAutoStop);
     onAutoStopRef.current = onAutoStop;
 
@@ -407,9 +431,48 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
                 throw lastError;
             };
 
+            // The paired operation is still normal renderer capture IPC: it
+            // takes the same two bounded PCM batches this function already
+            // owns, but returns transcript snapshots only—never cleaned PCM.
+            // Electron main can therefore align the private native AEC lane
+            // without granting any new renderer-facing audio capability. The
+            // system channel remains below as an independently retryable ASR
+            // feed, so a quiet/broken system worker cannot replay or block mic.
+            const feedAecMic = async (): Promise<void> => {
+                let lastError: unknown;
+                for (let attempt = 0; attempt <= SELF_HOSTED_RECONNECT_DELAYS_MS.length; attempt++) {
+                    try {
+                        const snapshots = await window.ipc.invoke('meeting:transcription:feedAecPair', {
+                            meetingId,
+                            mic: {
+                                pcmBase64: micBase64,
+                                audio: selfHostedAudioClockRef.current.metadataFor(micPacket),
+                            },
+                            system: {
+                                pcmBase64: systemBase64,
+                                audio: selfHostedAudioClockRef.current.metadataFor(systemPacket),
+                            },
+                        });
+                        selfHostedAudioClockRef.current.acknowledge('mic');
+                        for (const snapshot of snapshots) applySelfHostedSnapshot('mic', snapshot);
+                        return;
+                    } catch (error) {
+                        lastError = error;
+                        const delay = SELF_HOSTED_RECONNECT_DELAYS_MS[attempt];
+                        if (delay === undefined || selfHostedMeetingIdRef.current !== meetingId) break;
+                        console.warn(`[meeting] mic transcription interrupted; reconnecting in ${delay}ms`);
+                        await wait(delay);
+                        await window.ipc.invoke('meeting:transcription:restartChannel', { meetingId, channel: 'mic' });
+                        selfHostedCommittedRef.current.mic = '';
+                    }
+                }
+                selfHostedAudioClockRef.current.markTransportDrop('mic');
+                throw lastError;
+            };
+
             let micAcknowledged = false;
             try {
-                await feedChannel('mic', micPacket, micBase64);
+                await feedAecMic();
                 micAcknowledged = true;
                 await feedChannel('system', systemPacket, systemBase64);
                 selfHostedFailureShownRef.current = false;
@@ -444,9 +507,32 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
     }, [queueSelfHostedBatch]);
 
     const stopInputCapture = useCallback(() => {
+        captureRecoveryRef.current = null;
+        captureRecoveryInFlightRef.current.clear();
+        if (captureWatchdogTimerRef.current) {
+            clearInterval(captureWatchdogTimerRef.current);
+            captureWatchdogTimerRef.current = null;
+        }
+        captureWatchdogRef.current = null;
+        if (captureDeviceChangeListenerRef.current) {
+            navigator.mediaDevices.removeEventListener('devicechange', captureDeviceChangeListenerRef.current);
+            captureDeviceChangeListenerRef.current = null;
+        }
         if (processorRef.current) {
             processorRef.current.disconnect();
             processorRef.current = null;
+        }
+        if (micSourceRef.current) {
+            micSourceRef.current.disconnect();
+            micSourceRef.current = null;
+        }
+        if (systemSourceRef.current) {
+            systemSourceRef.current.disconnect();
+            systemSourceRef.current = null;
+        }
+        if (mergerRef.current) {
+            mergerRef.current.disconnect();
+            mergerRef.current = null;
         }
         if (audioCtxRef.current) {
             audioCtxRef.current.close();
@@ -462,9 +548,10 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
         }
     }, []);
 
-    const cleanup = useCallback(() => {
-        transcriptWriterRef.current?.cancel();
+    const cleanup = useCallback(async () => {
+        const transcriptWriter = transcriptWriterRef.current;
         transcriptWriterRef.current = null;
+        await transcriptWriter?.cancelAndSettle();
         if (silenceCheckRef.current) {
             clearInterval(silenceCheckRef.current);
             silenceCheckRef.current = null;
@@ -472,10 +559,6 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
         if (nudgeToastIdRef.current !== null) {
             toast.dismiss(nudgeToastIdRef.current);
             nudgeToastIdRef.current = null;
-        }
-        if (trackPollingRef.current) {
-            clearInterval(trackPollingRef.current);
-            trackPollingRef.current = null;
         }
         stopInputCapture();
         if (wsRef.current) {
@@ -486,15 +569,25 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
         const selfHostedMeetingId = selfHostedMeetingIdRef.current;
         if (selfHostedMeetingId) {
             selfHostedMeetingIdRef.current = null;
-            void window.ipc.invoke('meeting:transcription:reset', {
+            await window.ipc.invoke('meeting:transcription:reset', {
                 meetingId: selfHostedMeetingId,
             }).catch((error) => console.error('[meeting] Failed to reset self-hosted transcription:', error));
         }
     }, [stopInputCapture]);
 
+    useEffect(() => () => {
+        lifecycleGateRef.current.invalidate();
+        void cleanup();
+    }, [cleanup]);
+
     const start = useCallback(async (calendarEvent?: CalendarEventMeta): Promise<string | null> => {
-        if (state !== 'idle') return null;
+        if (stateRef.current !== 'idle') return null;
+        const lifecycleToken = lifecycleGateRef.current.begin('starting');
+        if (lifecycleToken === null) return null;
+        stateRef.current = 'connecting';
         setState('connecting');
+
+        try {
 
         // Run independent setup steps in parallel for faster startup
         const [headphoneResult, transcriptionResult, micResult, systemResult] = await Promise.allSettled([
@@ -549,28 +642,26 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
                 return { kind: 'deepgram' as const, ws };
             })(),
             // 3. Get mic stream
-            navigator.mediaDevices.getUserMedia({
-                audio: {
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true,
-                },
-            }),
+            openMicrophoneCapture(),
             // 4. Get system audio via getDisplayMedia (loopback). Works on all
             // platforms; on Linux main.ts answers this request with the
             // requesting frame as the throwaway video source (avoids the
             // flaky Wayland screen-capture portal) + Pulse loopback audio.
-            (async () => {
-                const stream = await navigator.mediaDevices.getDisplayMedia({ audio: true, video: true });
-                stream.getVideoTracks().forEach(t => t.stop());
-                if (stream.getAudioTracks().length === 0) {
-                    stream.getTracks().forEach(t => t.stop());
-                    throw new Error('No audio track from getDisplayMedia');
-                }
+            openSystemAudioCapture().then((stream) => {
                 console.log('[meeting] System audio captured');
                 return stream;
-            })(),
+            }),
         ]);
+
+        if (!lifecycleGateRef.current.isCurrent(lifecycleToken)) {
+            if (transcriptionResult.status === 'fulfilled') {
+                if (transcriptionResult.value.kind === 'deepgram') transcriptionResult.value.ws.close();
+                else await window.ipc.invoke('meeting:transcription:reset', { meetingId: transcriptionResult.value.meetingId }).catch(() => {});
+            }
+            if (micResult.status === 'fulfilled') micResult.value.getTracks().forEach(track => track.stop());
+            if (systemResult.status === 'fulfilled') systemResult.value.getTracks().forEach(track => track.stop());
+            return null;
+        }
 
         // Check for failures — clean up any successful resources if something failed
         const failed = transcriptionResult.status === 'rejected'
@@ -587,6 +678,11 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
                         description: 'Meeting audio capture needs PipeWire or PulseAudio. Make sure one of them is running, then try again.',
                         duration: 10000,
                     });
+                } else if (isMac) {
+                    toast.error('Could not capture meeting audio', {
+                        description: 'Allow Rowboat to record system audio in System Settings, then try again.',
+                        duration: 10000,
+                    });
                 }
             }
             // Clean up any resources that did succeed
@@ -601,7 +697,8 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
             }
             if (micResult.status === 'fulfilled') { micResult.value.getTracks().forEach(t => t.stop()); }
             if (systemResult.status === 'fulfilled') { systemResult.value.getTracks().forEach(t => t.stop()); }
-            cleanup();
+            await cleanup();
+            stateRef.current = 'idle';
             setState('idle');
             return null;
         }
@@ -705,60 +802,6 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
         const systemStream = systemResult.value;
         systemStreamRef.current = systemStream;
 
-        // If the shared source goes away (user closes the call window / clicks
-        // "Stop sharing"), the track fires "ended" — treat that as the meeting
-        // ending and stop. Our own cleanup() calls track.stop(), which does NOT
-        // fire "ended", so this won't double-trigger on a manual stop.
-        // On Linux the loopback stream mirrors the default output device, not
-        // the meeting app, so it stays live after the meeting closes and
-        // "ended" never fires — auto-stop on Linux comes from the silence
-        // detector armed below.
-        systemStream.getAudioTracks().forEach(track => {
-            track.addEventListener('ended', () => {
-                console.log('[meeting] system-audio track ended (shared source closed) — auto-stopping');
-                onAutoStopRef.current?.();
-            });
-        });
-
-        // On macOS the system-audio track's "ended"/"mute" events don't fire when
-        // the meeting ends, so poll its state instead. (On Windows the "ended"
-        // listener above already covers this, so the poll is macOS-only.)
-        //
-        //  - readyState === 'ended' is unambiguous (the source is gone) → stop now.
-        //    It never actually fires on macOS (readyState stays 'live'); it's just
-        //    a safety net should polling ever observe the track ending.
-        //  - muted is ambiguous on macOS: it flips true both when the meeting ends
-        //    AND when nothing is playing system audio (a quiet but live meeting).
-        //    So we only treat sustained mute as "meeting over" once we're past the
-        //    linked event's scheduled end — a dead audio track after the meeting
-        //    was due to finish is a strong signal. With no calendar event, or
-        //    before the scheduled end, we DON'T hard-stop on mute; the silence
-        //    checker's nudge + backstop handles it, so a quiet stretch can never
-        //    silently cut a live meeting short.
-        const pollTrack = systemStream.getAudioTracks()[0];
-        if (isMac && pollTrack) {
-            let mutedPolls = 0;
-            if (trackPollingRef.current) clearInterval(trackPollingRef.current);
-            trackPollingRef.current = setInterval(() => {
-                if (pollTrack.readyState === 'ended') {
-                    console.log('[meeting] system-audio track ended (poll) — auto-stopping');
-                    onAutoStopRef.current?.();
-                    return;
-                }
-                if (pollTrack.muted) {
-                    mutedPolls++;
-                    const endMs = calendarEndMsRef.current;
-                    const pastCalendarEnd = endMs != null && Date.now() > endMs;
-                    if (pastCalendarEnd && mutedPolls >= MUTE_POLLS_TO_STOP) {
-                        console.log('[meeting] system-audio track muted past scheduled end (poll) — auto-stopping');
-                        onAutoStopRef.current?.();
-                    }
-                } else {
-                    mutedPolls = 0;
-                }
-            }, TRACK_POLL_INTERVAL_MS);
-        }
-
         // ----- Audio pipeline -----
         const audioCtx = new AudioContext({ sampleRate: 16000 });
         audioCtxRef.current = audioCtx;
@@ -767,13 +810,160 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
         const systemSource = audioCtx.createMediaStreamSource(systemStream);
         const merger = audioCtx.createChannelMerger(2);
 
+        micSourceRef.current = micSource;
+        systemSourceRef.current = systemSource;
+        mergerRef.current = merger;
+
         micSource.connect(merger, 0, 0);     // mic → channel 0
         systemSource.connect(merger, 0, 1);  // system audio → channel 1
 
         const processor = audioCtx.createScriptProcessor(4096, 2, 2);
         processorRef.current = processor;
 
+        const captureWatchdog = new MeetingCaptureWatchdog();
+        captureWatchdogRef.current = captureWatchdog;
+
+        const attachEndedRecovery = (channel: MeetingCaptureChannel, stream: MediaStream) => {
+            for (const track of stream.getAudioTracks()) {
+                track.addEventListener('ended', () => {
+                    void captureRecoveryRef.current?.(channel, 'track-ended');
+                }, { once: true });
+            }
+        };
+
+        const updateAecOutputRoute = async () => {
+            const meetingId = selfHostedMeetingIdRef.current;
+            if (!meetingId) return;
+            try {
+                // Route revalidation is intentionally independent from source
+                // recovery. A harmless speaker/headphone change must never
+                // reopen an otherwise healthy microphone or system stream.
+                await window.ipc.invoke('meeting:transcription:captureReady', {
+                    meetingId,
+                    outputRouteIsolated: await detectHeadphones(),
+                });
+            } catch (error) {
+                // AEC is attribution/capture enhancement only. Raw, paired
+                // capture remains live when a best-effort route update fails.
+                console.warn('[meeting] Failed to update AEC output route:', error);
+            }
+        };
+
+        captureRecoveryRef.current = async (channel, reason) => {
+            if (captureRecoveryInFlightRef.current.has(channel)) return;
+            // A stale ended event may arrive after stop() closed the graph.
+            if (audioCtxRef.current !== audioCtx || mergerRef.current !== merger || processorRef.current !== processor) return;
+            captureRecoveryInFlightRef.current.add(channel);
+
+            try {
+                // Preserve every complete capture batch before replacing a
+                // source. The main-process delivery queue owns any failed
+                // suffix, so a renderer retry cannot replay accepted mic ASR.
+                flushSelfHostedPcm();
+                const nextStream = channel === 'mic'
+                    ? await openMicrophoneCapture()
+                    : await openSystemAudioCapture();
+
+                if (audioCtxRef.current !== audioCtx || mergerRef.current !== merger || processorRef.current !== processor) {
+                    nextStream.getTracks().forEach(track => track.stop());
+                    return;
+                }
+
+                const nextSource = audioCtx.createMediaStreamSource(nextStream);
+                const oldSource = channel === 'mic' ? micSourceRef.current : systemSourceRef.current;
+                const oldStream = channel === 'mic' ? micStreamRef.current : systemStreamRef.current;
+
+                // Connect the replacement before releasing the failed source,
+                // keeping the shared graph alive. An ended source carries no
+                // useful samples, and a live one is only replaced after an
+                // explicit graph-stall recovery.
+                nextSource.connect(merger, 0, channel === 'mic' ? 0 : 1);
+                oldSource?.disconnect();
+                oldStream?.getTracks().forEach(track => track.stop());
+
+                if (channel === 'mic') {
+                    micSourceRef.current = nextSource;
+                    micStreamRef.current = nextStream;
+                } else {
+                    systemSourceRef.current = nextSource;
+                    systemStreamRef.current = nextStream;
+                }
+                attachEndedRecovery(channel, nextStream);
+                if (selfHostedMeetingIdRef.current) {
+                    selfHostedAudioClockRef.current.markSourceRecovered(channel);
+                }
+                console.info(`[meeting] Recovered ${channel} capture after ${reason}`);
+                void updateAecOutputRoute();
+            } catch (error) {
+                // Do not end a meeting because a source chooser/device was
+                // unavailable. The unaffected channel remains live; the next
+                // successful capture packet explicitly records the gap.
+                if (selfHostedMeetingIdRef.current) {
+                    selfHostedAudioClockRef.current.markTransportDrop(channel);
+                }
+                console.warn(`[meeting] Could not recover ${channel} capture after ${reason}:`, error);
+                toast.warning(`Reconnect ${channel === 'mic' ? 'microphone' : 'system audio'}`, {
+                    description: 'The meeting is still running. Reconnect this source to continue its transcript channel.',
+                    duration: 10_000,
+                    action: {
+                        label: 'Reconnect',
+                        onClick: () => { void captureRecoveryRef.current?.(channel, 'user-request'); },
+                    },
+                });
+            } finally {
+                captureRecoveryInFlightRef.current.delete(channel);
+            }
+        };
+
+        attachEndedRecovery('mic', micStream);
+        attachEndedRecovery('system', systemStream);
+
+        const deviceChangeHandler = () => {
+            const currentTracks = {
+                mic: micStreamRef.current?.getAudioTracks()[0],
+                system: systemStreamRef.current?.getAudioTracks()[0],
+            };
+            const affected = captureWatchdog.onDeviceChange({
+                mic: currentTracks.mic && { readyState: currentTracks.mic.readyState, muted: currentTracks.mic.muted },
+                system: currentTracks.system && { readyState: currentTracks.system.readyState, muted: currentTracks.system.muted },
+            });
+            for (const channel of affected) {
+                void captureRecoveryRef.current?.(channel, 'device-change-ended-track');
+            }
+            // No healthy stream is touched here. This only lets the native AEC
+            // choose the correct reference policy after output hardware moved.
+            void updateAecOutputRoute();
+        };
+        navigator.mediaDevices.addEventListener('devicechange', deviceChangeHandler);
+        captureDeviceChangeListenerRef.current = deviceChangeHandler;
+
+        captureWatchdogTimerRef.current = setInterval(() => {
+            const currentContext = audioCtxRef.current;
+            if (!currentContext || currentContext !== audioCtx) return;
+            if (currentContext.state === 'suspended') {
+                // Resume first; suspended contexts are not proof of a capture
+                // dropout and must never trigger source replacement by itself.
+                void currentContext.resume().catch((error) => console.warn('[meeting] Failed to resume audio context:', error));
+                return;
+            }
+            const stalledChannels = captureWatchdog.stalledChannels(currentContext.state);
+            if (stalledChannels.length === 0) return;
+            if (!captureWatchdog.rearmAfterStall()) {
+                toast.error('Audio capture needs attention', {
+                    description: 'Rowboat could not restart the capture graph. The meeting is still open; reconnect the affected source or stop safely.',
+                    duration: 10_000,
+                });
+                return;
+            }
+            for (const channel of stalledChannels) {
+                void captureRecoveryRef.current?.(channel, 'audio-callback-stalled');
+            }
+        }, CAPTURE_WATCHDOG_INTERVAL_MS);
+
         processor.onaudioprocess = (e) => {
+            // This is a graph liveness signal, not a signal-energy test: a
+            // quiet remote participant must keep the system capture healthy.
+            captureWatchdog.recordAudioCallback();
             const micRaw = e.inputBuffer.getChannelData(0);
             const sysRaw = e.inputBuffer.getChannelData(1);
 
@@ -908,14 +1098,32 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
             }
         }, SILENCE_CHECK_INTERVAL_MS);
 
+        stateRef.current = 'recording';
         setState('recording');
         return notePath;
-    }, [state, cleanup, scheduleDebouncedWrite, refreshRowboatAccount, queueSelfHostedBatch, upsertSegments]);
+        } catch (error) {
+            console.error('[meeting] Failed to start meeting capture:', error);
+            await cleanup();
+            stateRef.current = 'idle';
+            setState('idle');
+            toast.error('Could not start meeting notes', {
+                description: 'Any opened audio streams and transcription session were closed. Try again.',
+                duration: 10_000,
+            });
+            return null;
+        } finally {
+            lifecycleGateRef.current.finish(lifecycleToken);
+        }
+    }, [cleanup, scheduleDebouncedWrite, refreshRowboatAccount, queueSelfHostedBatch, upsertSegments, flushSelfHostedPcm]);
 
     const stop = useCallback(async () => {
-        if (state !== 'recording') return;
+        if (stateRef.current !== 'recording') return;
+        const lifecycleToken = lifecycleGateRef.current.begin('stopping');
+        if (lifecycleToken === null) return;
+        stateRef.current = 'stopping';
         setState('stopping');
 
+        try {
         stopInputCapture();
         const selfHostedMeetingId = selfHostedMeetingIdRef.current;
         try {
@@ -942,10 +1150,18 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
             // renderer identity so cleanup cannot race a duplicate reset.
             if (selfHostedMeetingId) selfHostedMeetingIdRef.current = null;
         }
-        cleanup();
+        await cleanup();
         await writeTranscriptToFile();
+        stateRef.current = 'idle';
         setState('idle');
-    }, [state, cleanup, stopInputCapture, writeTranscriptToFile, flushSelfHostedPcm, applySelfHostedSnapshot]);
+        } finally {
+            if (stateRef.current === 'stopping') {
+                stateRef.current = 'idle';
+                setState('idle');
+            }
+            lifecycleGateRef.current.finish(lifecycleToken);
+        }
+    }, [cleanup, stopInputCapture, writeTranscriptToFile, flushSelfHostedPcm, applySelfHostedSnapshot]);
 
     return { state, start, stop };
 }

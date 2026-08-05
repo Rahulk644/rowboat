@@ -30,6 +30,13 @@ export class CoalescedAsyncWriter {
     this.timer = null
   }
 
+  /** Cancel future writes and wait for the already-started write to finish. */
+  async cancelAndSettle(): Promise<void> {
+    this.cancel()
+    const active = this.active
+    if (active) await active
+  }
+
   private arm(): void {
     this.timer = setTimeout(() => {
       this.timer = null

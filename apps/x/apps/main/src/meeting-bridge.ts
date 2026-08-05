@@ -6,10 +6,16 @@ import { randomUUID } from 'node:crypto';
 /**
  * Electron-main supervisor for the native meeting bridge.
  *
- * This module is intentionally dormant unless `ROWBOAT_MEETING_BRIDGE_ENABLED`
- * is exactly `1`. The current meeting capture implementation remains the
- * rollback path. The bridge protocol is limited to small NDJSON control and
- * metadata messages; PCM is neither parsed nor sent to a renderer here.
+ * This module is dormant unless the unpackaged process explicitly sets
+ * `ROWBOAT_MEETING_BRIDGE_ENABLED=1` or a packaged build contains the sealed
+ * helper resource (an explicit `0` remains rollback). The current meeting
+ * capture implementation remains the rollback path. The bridge protocol is
+ * limited to small NDJSON control and metadata messages. The sole exception
+ * is the opt-in `aec_process` private
+ * stdio request below: Electron main may send one bounded, paired 20 ms PCM
+ * frame to the already-supervised native helper and receives its microphone
+ * replacement on that same private pipe. This is never an IPC API, never
+ * logged, never persisted, and never projected to the renderer.
  */
 
 const PROTOCOL_VERSION = 1;
@@ -17,6 +23,9 @@ const MAX_EVENT_BYTES = 64 * 1024;
 const HANDSHAKE_TIMEOUT_MS = 5_000;
 const PING_TIMEOUT_MS = 3_000;
 const DEFAULT_RESTART_WINDOW_MS = 60_000;
+const AEC_PROCESS_TIMEOUT_MS = 1_500;
+const AEC_PCM_BYTES = 320 * 2;
+const MAX_AEC_RESULT_FRAMES = 8;
 
 export type MeetingBridgePaths = {
   /** Absolute Rowboat repository root in development. */
@@ -59,10 +68,52 @@ export type BridgeSpeakerEvidence = {
   signals: string[];
 };
 
+/** One exact 20 ms PCM frame accepted only on Electron-main <-> helper stdio. */
+export type BridgeAecInputFrame = {
+  sourceId: string;
+  channel: 'mic' | 'system';
+  startSample: number;
+  sampleRate: number;
+  sequence: number;
+  epoch: number;
+  flags: { discontinuity: boolean; recovered: boolean; silence: boolean };
+  /** Canonical base64 of exactly 640 little-endian signed-16 PCM bytes. */
+  pcmBase64: string;
+};
+
+export type BridgeAecOutputFrame = BridgeAecInputFrame & {
+  /** Bounded provenance only; PCM never leaves Electron main afterwards. */
+  aec: {
+    engine: 'local_vqe' | 'web_rtc_aec3' | null;
+    disposition: 'cleaned' | 'bypassed_isolated_output' | 'bypassed_disabled' | 'bypassed_reference_unavailable' | 'bypassed_processor_failure' | 'bypassed_discontinuity';
+    referenceTiming: 'not_used' | 'trusted' | 'untrusted' | 'missing';
+    referenceOffsetSamples: number | null;
+  };
+};
+
+export type BridgeAecResult = {
+  meetingId: string;
+  frames: BridgeAecOutputFrame[];
+};
+
+export type BridgeAecHealth = {
+  meeting_id: string;
+  engine: 'local_vqe' | 'web_rtc_aec3' | null;
+  state: 'off' | 'bypassed' | 'waiting_for_reference' | 'ready' | 'degraded';
+  processed_frames: number;
+  raw_bypass_frames: number;
+  reference_missing_frames: number;
+  processor_failure_frames: number;
+  reference_evictions: number;
+  pending_mic_frames: number;
+  reason: string | null;
+};
+
 export type BridgeEvent =
   | { type: 'ready'; protocol_version: number }
   | { type: 'pong'; request_id: string }
   | { type: 'capture_health'; health: BridgeCaptureHealth }
+  | { type: 'aec_health'; health: BridgeAecHealth }
   | {
       type: 'audio_frame';
       metadata: {
@@ -113,6 +164,8 @@ export type MeetingBridgeSupervisorOptions = {
     maximumRestarts: number;
     windowMs?: number;
   };
+  /** Bounded grace period for a capture source reopening itself. */
+  captureRecoveryTimeoutMs?: number;
 };
 
 type PendingPing = {
@@ -125,6 +178,20 @@ type PendingHandshake = {
   resolve: () => void;
   reject: (error: Error) => void;
   timeout: TimerHandle;
+};
+
+type PendingAec = {
+  resolve: (result: BridgeAecResult) => void;
+  reject: (error: Error) => void;
+  timeout: TimerHandle;
+};
+
+/** Never projected through `onEvent`: it is consumed by the matching IPC request only. */
+type PrivateAecResultEvent = {
+  type: 'aec_result';
+  request_id: string;
+  meeting_id: string;
+  frames: BridgeAecOutputFrame[];
 };
 
 type ChildListeners = {
@@ -141,10 +208,70 @@ const DEFAULT_BACKOFF = {
   maximumRestarts: 3,
   windowMs: DEFAULT_RESTART_WINDOW_MS,
 } as const;
+const DEFAULT_CAPTURE_RECOVERY_TIMEOUT_MS = 5_000;
+const LOCALVQE_LIBRARY_RESOURCE = 'liblocalvqe.0.1.0.dylib';
+const LOCALVQE_MODEL_RESOURCE = 'localvqe-v1.4-aec-200K-f32.gguf';
 
 /** The bridge is an explicit opt-in while the existing capture path remains live. */
 export function isMeetingBridgeEnabled(environment: NodeJS.ProcessEnv = process.env): boolean {
   return environment.ROWBOAT_MEETING_BRIDGE_ENABLED === '1';
+}
+
+/**
+ * AEC has a second explicit gate. A running evidence helper alone must never
+ * cause microphone PCM to cross the private process boundary.
+ */
+export function isMeetingAecEnabled(environment: NodeJS.ProcessEnv = process.env): boolean {
+  return isMeetingBridgeEnabled(environment) && environment.ROWBOAT_MEETING_AEC_ENABLED === '1';
+}
+
+function regularPackagedResource(file: string, executable = false): boolean {
+  try {
+    const stat = fs.lstatSync(file);
+    return !stat.isSymbolicLink() && stat.isFile() && (!executable || (stat.mode & 0o111) !== 0);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Finder launches have no qualification-shell environment. A packaged
+ * Rowboat therefore enables the bridge only after finding its sealed fixed
+ * resource; normal packages force both capabilities off. Local development
+ * remains explicit-environment-only and this never grants Accessibility.
+ */
+export function initializePackagedMeetingCapabilities(
+  paths: MeetingBridgePaths,
+  environment: NodeJS.ProcessEnv = process.env,
+): { bridge: boolean; aec: boolean } {
+  if (!paths.isPackaged) {
+    return { bridge: isMeetingBridgeEnabled(environment), aec: isMeetingAecEnabled(environment) };
+  }
+
+  let bridgeDirectory: string | undefined;
+  try {
+    bridgeDirectory = path.dirname(resolveMeetingBridgeBinary(paths));
+  } catch {
+    environment.ROWBOAT_MEETING_BRIDGE_ENABLED = '0';
+    environment.ROWBOAT_MEETING_AEC_ENABLED = '0';
+    return { bridge: false, aec: false };
+  }
+
+  // An explicit 0 remains an operator opt-out. Any other inherited value is
+  // normalized to the resource-backed packaged default.
+  const bridge = environment.ROWBOAT_MEETING_BRIDGE_ENABLED !== '0';
+  environment.ROWBOAT_MEETING_BRIDGE_ENABLED = bridge ? '1' : '0';
+  if (!bridge) {
+    environment.ROWBOAT_MEETING_AEC_ENABLED = '0';
+    return { bridge: false, aec: false };
+  }
+
+  const aec = environment.ROWBOAT_MEETING_AEC_ENABLED !== '0'
+    && regularPackagedResource(path.join(bridgeDirectory, LOCALVQE_LIBRARY_RESOURCE), true)
+    && regularPackagedResource(path.join(bridgeDirectory, LOCALVQE_MODEL_RESOURCE));
+  environment.ROWBOAT_MEETING_AEC_ENABLED = aec ? '1' : '0';
+  if (aec) environment.ROWBOAT_MEETING_AEC_ENGINE = 'local_vqe';
+  return { bridge: true, aec };
 }
 
 /**
@@ -201,13 +328,16 @@ export class MeetingBridgeSupervisor {
   private readonly spawn: SpawnChild;
   private readonly backoff: Required<NonNullable<MeetingBridgeSupervisorOptions['restartBackoff']>>;
   private readonly pendingPings = new Map<string, PendingPing>();
+  private readonly pendingAec = new Map<string, PendingAec>();
   private child: ChildProcessWithoutNullStreams | null = null;
   private childListeners: ChildListeners | null = null;
   private stdoutBuffer = Buffer.alloc(0);
   private desiredMeetingId: string | null = null;
+  private desiredAecOutputRoute: 'speaker' | 'isolated' = 'speaker';
   private pendingHandshake: PendingHandshake | null = null;
   private handshakePromise: Promise<void> | null = null;
   private restartTimer: TimerHandle | null = null;
+  private readonly captureRecoveryTimers = new Map<BridgeCaptureHealth['channel'], TimerHandle>();
   private restartTimes: number[] = [];
   private status: MeetingBridgeStatus;
 
@@ -225,14 +355,15 @@ export class MeetingBridgeSupervisor {
     return { ...this.status };
   }
 
-  async start(meetingId: string): Promise<boolean> {
+  async start(meetingId: string, outputRouteIsolated = false): Promise<boolean> {
     if (!this.enabled()) {
       this.setStatus({ state: 'disabled', restartCount: 0 });
       return false;
     }
     this.desiredMeetingId = safeMeetingId(meetingId);
+    this.desiredAecOutputRoute = outputRouteIsolated ? 'isolated' : 'speaker';
     await this.ensureReady();
-    await this.writeCommand({ type: 'start', meeting_id: this.desiredMeetingId });
+    await this.writeStartCommand(this.desiredMeetingId);
     return true;
   }
 
@@ -260,7 +391,7 @@ export class MeetingBridgeSupervisor {
    * Send Start only to the already-handshaken helper. Unlike `start()`, this
    * refuses to spawn: renderer capture must not wait for a late native child.
    */
-  async startIfReady(meetingId: string): Promise<boolean> {
+  async startIfReady(meetingId: string, outputRouteIsolated = false): Promise<boolean> {
     if (!this.enabled()) {
       this.setStatus({ state: 'disabled', restartCount: 0 });
       return false;
@@ -268,8 +399,9 @@ export class MeetingBridgeSupervisor {
     if (!this.child || this.status.state !== 'ready') return false;
     const normalizedMeetingId = safeMeetingId(meetingId);
     try {
-      await this.writeCommand({ type: 'start', meeting_id: normalizedMeetingId });
       this.desiredMeetingId = normalizedMeetingId;
+      this.desiredAecOutputRoute = outputRouteIsolated ? 'isolated' : 'speaker';
+      await this.writeStartCommand(normalizedMeetingId);
       return true;
     } catch {
       // The child may have died between the readiness check and this write.
@@ -282,6 +414,9 @@ export class MeetingBridgeSupervisor {
     const meetingId = this.desiredMeetingId;
     this.desiredMeetingId = null;
     this.clearRestartTimer();
+    this.clearCaptureRecoveryTimers();
+    // A deliberate Stop creates a fresh retry budget for the next meeting.
+    this.restartTimes = [];
     const child = this.child;
     this.rejectPending('Meeting bridge stopped');
     this.detachChild();
@@ -315,6 +450,97 @@ export class MeetingBridgeSupervisor {
         clearTimeout(timeout);
         this.pendingPings.delete(requestId);
         reject(error instanceof Error ? error : new Error('Meeting bridge ping failed'));
+      });
+    });
+  }
+
+  /**
+   * Process exactly one paired 20 ms render/microphone frame in the helper.
+   * `null` means unavailable and is an explicit instruction to keep the raw
+   * microphone path. Errors are deliberately isolated to this optional lane;
+   * callers must retain raw input until an output frame acknowledges it.
+   */
+  async processAecFrame(
+    meetingId: string,
+    mic: BridgeAecInputFrame,
+    render: BridgeAecInputFrame,
+  ): Promise<BridgeAecResult | null> {
+    if (!this.enabled() || !this.child || this.status.state !== 'ready') return null;
+    const normalizedMeetingId = safeMeetingId(meetingId);
+    if (this.desiredMeetingId !== normalizedMeetingId) return null;
+    assertAecInputFrame(mic, 'mic');
+    assertAecInputFrame(render, 'system');
+    const requestId = randomUUID();
+    return new Promise<BridgeAecResult>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingAec.delete(requestId);
+        reject(new Error('Meeting bridge AEC request timed out'));
+      }, AEC_PROCESS_TIMEOUT_MS);
+      timeout.unref();
+      this.pendingAec.set(requestId, { resolve, reject, timeout });
+      this.writeCommand({
+        type: 'aec_process',
+        request_id: requestId,
+        meeting_id: normalizedMeetingId,
+        mic: aecInputToWire(mic),
+        render: aecInputToWire(render),
+      }).catch((error: unknown) => {
+        clearTimeout(timeout);
+        this.pendingAec.delete(requestId);
+        reject(error instanceof Error ? error : new Error('Meeting bridge AEC write failed'));
+      });
+    });
+  }
+
+  /** Release the helper's bounded reblocker tail before a meeting ends. */
+  async flushAec(meetingId: string): Promise<BridgeAecResult | null> {
+    if (!this.enabled() || !this.child || this.status.state !== 'ready') return null;
+    const normalizedMeetingId = safeMeetingId(meetingId);
+    if (this.desiredMeetingId !== normalizedMeetingId) return null;
+    const requestId = randomUUID();
+    return new Promise<BridgeAecResult>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingAec.delete(requestId);
+        reject(new Error('Meeting bridge AEC flush timed out'));
+      }, AEC_PROCESS_TIMEOUT_MS);
+      timeout.unref();
+      this.pendingAec.set(requestId, { resolve, reject, timeout });
+      this.writeCommand({ type: 'aec_flush', request_id: requestId, meeting_id: normalizedMeetingId }).catch((error: unknown) => {
+        clearTimeout(timeout);
+        this.pendingAec.delete(requestId);
+        reject(error instanceof Error ? error : new Error('Meeting bridge AEC flush write failed'));
+      });
+    });
+  }
+
+  /**
+   * Switch an already-active helper between speaker and isolated output
+   * without issuing Start or replacing the child. The native coordinator sends
+   * back its bounded raw-safe tail; Electron main's AEC router owns delivery
+   * of that result to ASR. `null` is deliberately a raw-capture fallback.
+   */
+  async updateAecOutputRoute(meetingId: string, outputRouteIsolated: boolean): Promise<BridgeAecResult | null> {
+    if (!isMeetingAecEnabled() || !this.child || this.status.state !== 'ready') return null;
+    const normalizedMeetingId = safeMeetingId(meetingId);
+    if (this.desiredMeetingId !== normalizedMeetingId) return null;
+    this.desiredAecOutputRoute = outputRouteIsolated ? 'isolated' : 'speaker';
+    const requestId = randomUUID();
+    return new Promise<BridgeAecResult>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingAec.delete(requestId);
+        reject(new Error('Meeting bridge AEC route update timed out'));
+      }, AEC_PROCESS_TIMEOUT_MS);
+      timeout.unref();
+      this.pendingAec.set(requestId, { resolve, reject, timeout });
+      this.writeCommand({
+        type: 'aec_route_update',
+        request_id: requestId,
+        meeting_id: normalizedMeetingId,
+        aec_output_route: this.desiredAecOutputRoute,
+      }).catch((error: unknown) => {
+        clearTimeout(timeout);
+        this.pendingAec.delete(requestId);
+        reject(error instanceof Error ? error : new Error('Meeting bridge AEC route update write failed'));
       });
     });
   }
@@ -397,7 +623,7 @@ export class MeetingBridgeSupervisor {
         this.onChildFailure(child, 'bridge event exceeded size limit');
         return;
       }
-      let event: BridgeEvent;
+      let event: BridgeEvent | PrivateAecResultEvent;
       try {
         event = parseBridgeEvent(line);
       } catch {
@@ -415,7 +641,7 @@ export class MeetingBridgeSupervisor {
     this.stdoutBuffer = Buffer.from(residual);
   }
 
-  private onEvent(event: BridgeEvent): void {
+  private onEvent(event: BridgeEvent | PrivateAecResultEvent): void {
     if (event.type === 'ready') {
       if (event.protocol_version !== PROTOCOL_VERSION || !this.pendingHandshake) {
         this.onChildFailure(this.child, 'bridge protocol version mismatch');
@@ -437,11 +663,48 @@ export class MeetingBridgeSupervisor {
       pending.resolve();
       return;
     }
+    if (event.type === 'aec_result') {
+      const pending = this.pendingAec.get(event.request_id);
+      if (!pending) return;
+      this.pendingAec.delete(event.request_id);
+      clearTimeout(pending.timeout);
+      pending.resolve({ meetingId: event.meeting_id, frames: event.frames });
+      return;
+    }
     if (this.status.state !== 'ready') {
       this.onChildFailure(this.child, 'bridge emitted metadata before handshake');
       return;
     }
+    if (event.type === 'capture_health') this.observeCaptureHealth(event.health);
     this.options.onEvent?.(event);
+  }
+
+  /**
+   * Source recovery is handled inside the native bridge, but Electron main
+   * owns the final deadline. A failed source recycles the isolated child
+   * immediately. A stalled/recovering source gets a short grace period; if it
+   * never becomes Ready the usual bounded child restart policy takes over.
+   */
+  private observeCaptureHealth(health: BridgeCaptureHealth): void {
+    if (health.meeting_id !== this.desiredMeetingId) return;
+    const channel = health.channel;
+    if (health.state === 'ready' || health.state === 'off') {
+      this.clearCaptureRecoveryTimer(channel);
+      return;
+    }
+    if (health.state === 'failed') {
+      this.clearCaptureRecoveryTimer(channel);
+      this.onChildFailure(this.child, `bridge ${channel} capture failed`);
+      return;
+    }
+    if (health.state !== 'stalled' && health.state !== 'recovering') return;
+    if (this.captureRecoveryTimers.has(channel)) return;
+    const timeout = setTimeout(() => {
+      this.captureRecoveryTimers.delete(channel);
+      this.onChildFailure(this.child, `bridge ${channel} capture recovery timed out`);
+    }, this.options.captureRecoveryTimeoutMs ?? DEFAULT_CAPTURE_RECOVERY_TIMEOUT_MS);
+    timeout.unref();
+    this.captureRecoveryTimers.set(channel, timeout);
   }
 
   private onChildFailure(child: ChildProcessWithoutNullStreams | null, reason: string): void {
@@ -474,7 +737,7 @@ export class MeetingBridgeSupervisor {
       const meetingId = this.desiredMeetingId;
       if (!meetingId || !this.enabled()) return;
       this.spawnAndHandshake()
-        .then(() => this.writeCommand({ type: 'start', meeting_id: meetingId }))
+        .then(() => this.writeStartCommand(meetingId))
         .catch(() => {
           // `spawnAndHandshake` already schedules a bounded retry.
       });
@@ -482,9 +745,15 @@ export class MeetingBridgeSupervisor {
     this.restartTimer.unref();
   }
 
-  private async writeCommand(command: Record<string, string>): Promise<void> {
+  private async writeCommand(command: Record<string, unknown>): Promise<void> {
     if (!this.child) throw new Error('Meeting bridge is not running');
     await writeNdjson(this.child, command);
+  }
+
+  private async writeStartCommand(meetingId: string): Promise<void> {
+    const command: Record<string, unknown> = { type: 'start', meeting_id: meetingId };
+    if (isMeetingAecEnabled()) command.aec_output_route = this.desiredAecOutputRoute;
+    await this.writeCommand(command);
   }
 
   private detachChild(): void {
@@ -498,6 +767,7 @@ export class MeetingBridgeSupervisor {
     this.childListeners = null;
     this.child = null;
     this.stdoutBuffer = Buffer.alloc(0);
+    this.clearCaptureRecoveryTimers();
   }
 
   private terminateChild(child: ChildProcessWithoutNullStreams): void {
@@ -521,12 +791,29 @@ export class MeetingBridgeSupervisor {
       pending.reject(new Error(reason));
     }
     this.pendingPings.clear();
+    for (const pending of this.pendingAec.values()) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error(reason));
+    }
+    this.pendingAec.clear();
   }
 
   private clearRestartTimer(): void {
     if (!this.restartTimer) return;
     clearTimeout(this.restartTimer);
     this.restartTimer = null;
+  }
+
+  private clearCaptureRecoveryTimer(channel: BridgeCaptureHealth['channel']): void {
+    const timer = this.captureRecoveryTimers.get(channel);
+    if (!timer) return;
+    clearTimeout(timer);
+    this.captureRecoveryTimers.delete(channel);
+  }
+
+  private clearCaptureRecoveryTimers(): void {
+    for (const timer of this.captureRecoveryTimers.values()) clearTimeout(timer);
+    this.captureRecoveryTimers.clear();
   }
 
   private setStatus(status: MeetingBridgeStatus): void {
@@ -542,10 +829,20 @@ function bridgeEnvironment(): NodeJS.ProcessEnv {
     const value = process.env[key];
     if (value !== undefined) environment[key] = value;
   }
+  // Do not use a broad ROWBOAT_* pass-through: STT/OAuth tokens and arbitrary
+  // dynamic-library/model paths must remain unavailable to the native helper.
+  // A packaged LocalVQE helper derives its fixed adjacent resources itself.
+  for (const key of [
+    'ROWBOAT_MEETING_AEC_ENABLED',
+    'ROWBOAT_MEETING_AEC_ENGINE',
+  ]) {
+    const value = process.env[key];
+    if (value !== undefined) environment[key] = value;
+  }
   return environment;
 }
 
-function writeNdjson(child: ChildProcessWithoutNullStreams, command: Record<string, string>): Promise<void> {
+function writeNdjson(child: ChildProcessWithoutNullStreams, command: Record<string, unknown>): Promise<void> {
   const line = `${JSON.stringify(command)}\n`;
   if (Buffer.byteLength(line) > MAX_EVENT_BYTES) return Promise.reject(new Error('Bridge command exceeds size limit'));
   return new Promise((resolve, reject) => {
@@ -556,7 +853,7 @@ function writeNdjson(child: ChildProcessWithoutNullStreams, command: Record<stri
   });
 }
 
-function parseBridgeEvent(line: Buffer): BridgeEvent {
+function parseBridgeEvent(line: Buffer): BridgeEvent | PrivateAecResultEvent {
   const text = new TextDecoder('utf-8', { fatal: true }).decode(line);
   const parsed: unknown = JSON.parse(text);
   if (!isRecord(parsed) || typeof parsed.type !== 'string') throw new Error('event must be an object');
@@ -567,9 +864,14 @@ function parseBridgeEvent(line: Buffer): BridgeEvent {
     case 'pong':
       assertKeys(parsed, ['type', 'request_id']);
       return { type: 'pong', request_id: string(parsed.request_id, 128) };
+    case 'aec_result':
+      return parsePrivateAecResult(parsed);
     case 'capture_health':
       assertKeys(parsed, ['type', 'health']);
       return { type: 'capture_health', health: parseHealth(parsed.health) };
+    case 'aec_health':
+      assertKeys(parsed, ['type', 'health']);
+      return { type: 'aec_health', health: parseAecHealth(parsed.health) };
     case 'audio_frame':
       assertKeys(parsed, ['type', 'metadata']);
       return { type: 'audio_frame', metadata: parseFrameMetadata(parsed.metadata) };
@@ -592,6 +894,104 @@ function parseBridgeEvent(line: Buffer): BridgeEvent {
   }
 }
 
+function parsePrivateAecResult(value: Record<string, unknown>): PrivateAecResultEvent {
+  assertKeys(value, ['type', 'request_id', 'meeting_id', 'frames']);
+  if (!Array.isArray(value.frames) || value.frames.length > MAX_AEC_RESULT_FRAMES) {
+    throw new Error('invalid AEC result frames');
+  }
+  return {
+    type: 'aec_result',
+    request_id: string(value.request_id, 128),
+    meeting_id: string(value.meeting_id, 128),
+    frames: value.frames.map(parseAecOutputFrame),
+  };
+}
+
+function parseAecOutputFrame(value: unknown): BridgeAecOutputFrame {
+  if (!isRecord(value)) throw new Error('invalid AEC output frame');
+  assertKeys(value, ['metadata', 'pcm_base64', 'aec']);
+  const metadata = parseFrameMetadata(value.metadata);
+  if (metadata.channel !== 'mic' || metadata.sample_count !== 320 || metadata.sample_rate !== 16_000) {
+    throw new Error('invalid AEC output metadata');
+  }
+  const pcmBase64 = canonicalAecBase64(value.pcm_base64);
+  if (!isRecord(value.aec)) throw new Error('invalid AEC output provenance');
+  assertKeys(value.aec, ['engine', 'disposition', 'reference_timing', 'reference_offset_samples']);
+  const engine = value.aec.engine;
+  if (engine !== null && engine !== 'local_vqe' && engine !== 'web_rtc_aec3') throw new Error('invalid AEC engine');
+  const disposition = string(value.aec.disposition, 64);
+  if (![
+    'cleaned', 'bypassed_isolated_output', 'bypassed_disabled',
+    'bypassed_reference_unavailable', 'bypassed_processor_failure', 'bypassed_discontinuity',
+  ].includes(disposition)) throw new Error('invalid AEC disposition');
+  const referenceTiming = string(value.aec.reference_timing, 32);
+  if (!['not_used', 'trusted', 'untrusted', 'missing'].includes(referenceTiming)) {
+    throw new Error('invalid AEC reference timing');
+  }
+  const referenceOffsetSamples = value.aec.reference_offset_samples;
+  if (referenceOffsetSamples !== null
+    && (typeof referenceOffsetSamples !== 'number' || !Number.isSafeInteger(referenceOffsetSamples))) {
+    throw new Error('invalid AEC reference offset');
+  }
+  return {
+    sourceId: metadata.source_id,
+    channel: metadata.channel,
+    startSample: metadata.start_sample,
+    sampleRate: metadata.sample_rate,
+    sequence: metadata.sequence,
+    epoch: metadata.epoch,
+    flags: metadata.flags,
+    pcmBase64,
+    aec: {
+      engine,
+      disposition: disposition as BridgeAecOutputFrame['aec']['disposition'],
+      referenceTiming: referenceTiming as BridgeAecOutputFrame['aec']['referenceTiming'],
+      referenceOffsetSamples,
+    },
+  };
+}
+
+function assertAecInputFrame(frame: BridgeAecInputFrame, expectedChannel: BridgeAecInputFrame['channel']): void {
+  if (frame.channel !== expectedChannel
+    || !Number.isSafeInteger(frame.startSample) || frame.startSample < 0
+    || !Number.isSafeInteger(frame.sequence) || frame.sequence < 0
+    || !Number.isSafeInteger(frame.epoch) || frame.epoch < 0
+    || frame.sampleRate !== 16_000
+    || !frame.sourceId || Buffer.byteLength(frame.sourceId) > 160
+    || !frame.flags || typeof frame.flags.discontinuity !== 'boolean'
+    || typeof frame.flags.recovered !== 'boolean' || typeof frame.flags.silence !== 'boolean') {
+    throw new Error('invalid AEC input frame');
+  }
+  canonicalAecBase64(frame.pcmBase64);
+}
+
+function aecInputToWire(frame: BridgeAecInputFrame): Record<string, unknown> {
+  return {
+    source_id: frame.sourceId,
+    channel: frame.channel,
+    start_sample: frame.startSample,
+    sample_count: 320,
+    sample_rate: frame.sampleRate,
+    sequence: frame.sequence,
+    epoch: frame.epoch,
+    flags: frame.flags,
+    pcm_base64: frame.pcmBase64,
+  };
+}
+
+/** Reject non-canonical input instead of Node's permissive base64 decoder. */
+function canonicalAecBase64(value: unknown): string {
+  const encoded = string(value, 4_096);
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
+    throw new Error('invalid AEC PCM encoding');
+  }
+  const decoded = Buffer.from(encoded, 'base64');
+  if (decoded.length !== AEC_PCM_BYTES || decoded.toString('base64') !== encoded) {
+    throw new Error('invalid AEC PCM length');
+  }
+  return encoded;
+}
+
 function parseHealth(value: unknown): BridgeCaptureHealth {
   if (!isRecord(value)) throw new Error('invalid health');
   assertKeys(value, ['meeting_id', 'channel', 'state', 'sequence', 'last_frame_sample', 'restart_count', 'reason']);
@@ -608,9 +1008,36 @@ function parseHealth(value: unknown): BridgeCaptureHealth {
   };
 }
 
+function parseAecHealth(value: unknown): BridgeAecHealth {
+  if (!isRecord(value)) throw new Error('invalid AEC health');
+  assertKeys(value, [
+    'meeting_id', 'engine', 'state', 'processed_frames', 'raw_bypass_frames',
+    'reference_missing_frames', 'processor_failure_frames', 'reference_evictions',
+    'pending_mic_frames', 'reason',
+  ]);
+  const engine = value.engine;
+  if (engine !== null && engine !== 'local_vqe' && engine !== 'web_rtc_aec3') throw new Error('invalid AEC health engine');
+  const state = string(value.state, 64);
+  if (!['off', 'bypassed', 'waiting_for_reference', 'ready', 'degraded'].includes(state)) {
+    throw new Error('invalid AEC health state');
+  }
+  return {
+    meeting_id: string(value.meeting_id, 128),
+    engine,
+    state: state as BridgeAecHealth['state'],
+    processed_frames: integer(value.processed_frames),
+    raw_bypass_frames: integer(value.raw_bypass_frames),
+    reference_missing_frames: integer(value.reference_missing_frames),
+    processor_failure_frames: integer(value.processor_failure_frames),
+    reference_evictions: integer(value.reference_evictions),
+    pending_mic_frames: integer(value.pending_mic_frames),
+    reason: value.reason === null ? null : string(value.reason, 240),
+  };
+}
+
 function parseFrameMetadata(value: unknown): Extract<BridgeEvent, { type: 'audio_frame' }>['metadata'] {
   if (!isRecord(value)) throw new Error('invalid frame metadata');
-  assertKeys(value, ['meeting_id', 'source_id', 'channel', 'start_sample', 'sample_count', 'sample_rate', 'sequence', 'epoch', 'flags']);
+  assertKeys(value, ['meeting_id', 'source_id', 'channel', 'start_sample', 'sample_count', 'sample_rate', 'sequence', 'epoch', 'flags'], ['aec']);
   if (!isRecord(value.flags)) throw new Error('invalid frame flags');
   assertKeys(value.flags, ['discontinuity', 'recovered', 'silence']);
   return {
@@ -666,9 +1093,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function assertKeys(value: Record<string, unknown>, expected: readonly string[]): void {
+function assertKeys(value: Record<string, unknown>, expected: readonly string[], optional: readonly string[] = []): void {
   const actual = Object.keys(value);
-  if (actual.length !== expected.length || actual.some((key) => !expected.includes(key))) {
+  if (actual.some((key) => !expected.includes(key) && !optional.includes(key))
+    || expected.some((key) => !actual.includes(key))) {
     throw new Error('unexpected event shape');
   }
 }

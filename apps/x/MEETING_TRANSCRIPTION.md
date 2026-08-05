@@ -35,6 +35,11 @@ host. The token is read only by the main process and never returned over IPC.
   participant/audio-state description. A direct active-speaker label wins; in a compact window that exposes
   no such label, only one sole-unmuted tile may name aligned system speech. Two or more unmuted tiles remain
   unknown rather than guessing.
+- A Zoom display name is not a participant ID. When two tiles share a name, Rowboat marks a line as `You` only
+  from a direct `(you)`/`(me)` speaker or tile marker, a self-marked participant row on the exact active AX
+  element, or one uniquely-correlated local mute-control/tile state. A signed-in account or participant-row
+  name can assist only when exactly one visible tile has that name. AX element hashes deduplicate repeated UI
+  assertions within the current snapshot; they are not cached across calls or treated as person identity.
 - Requests are serialized because the qualified CPU worker shares one loaded model and one compute lane.
 - A transient connection failure restarts both streaming sessions and replays the uncommitted channel pair.
 - Pending audio is bounded to 24 pairs (13.44 seconds). Rowboat reports a degraded live transcript and drops

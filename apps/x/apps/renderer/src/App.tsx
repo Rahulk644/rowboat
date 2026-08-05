@@ -6574,13 +6574,21 @@ function App() {
         meetingNotePathRef.current = null
       }
     } else if (meetingTranscription.state === 'idle') {
-      // On macOS, check screen recording permission before starting
+      // CoreAudio Tap on macOS 14.2+ is an audio-only capture path. It must
+      // not be gated on the unrelated Screen Recording status; the actual
+      // getDisplayMedia request asks macOS for the relevant permission. Older
+      // macOS paths retain the existing screen-loopback preflight.
       if (isMac) {
-        const result = await window.ipc.invoke('meeting:checkScreenPermission', null)
-        console.log('[meeting] Permission check result:', result)
-        if (!result.granted) {
-          setShowMeetingPermissions(true)
-          return
+        const captureMode = await window.ipc
+          .invoke('meeting:getSystemAudioCaptureMode', null)
+          .catch(() => ({ mode: 'screen-loopback' as const }))
+        if (captureMode.mode === 'screen-loopback') {
+          const result = await window.ipc.invoke('meeting:checkScreenPermission', null)
+          console.log('[meeting] Permission check result:', result)
+          if (!result.granted) {
+            setShowMeetingPermissions(true)
+            return
+          }
         }
       }
       await startMeetingNow()

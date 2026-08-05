@@ -7,14 +7,17 @@ import {
   resolveRowboatRepositoryRoot,
 } from './meeting-bridge-runtime.js';
 import type {
+  BridgeAecResult,
   BridgeEvent,
   MeetingBridgePaths,
+  MeetingBridgeStatus,
   MeetingBridgeSupervisorOptions,
 } from './meeting-bridge.js';
 
 class FakeSupervisor {
   warmCalls = 0;
   startIfReadyCalls: string[] = [];
+  updateAecOutputRouteCalls: Array<{ meetingId: string; isolated: boolean }> = [];
   stopCalls = 0;
   stopped = false;
   warmFailure: Error | null = null;
@@ -43,12 +46,29 @@ class FakeSupervisor {
     this.stopped = true;
   }
 
+  async processAecFrame(): Promise<BridgeAecResult | null> {
+    return null;
+  }
+
+  async flushAec(): Promise<BridgeAecResult | null> {
+    return null;
+  }
+
+  async updateAecOutputRoute(meetingId: string, isolated: boolean): Promise<BridgeAecResult | null> {
+    this.updateAecOutputRouteCalls.push({ meetingId, isolated });
+    return null;
+  }
+
   maximumRestarts(): number | undefined {
     return this.options.restartBackoff?.maximumRestarts;
   }
 
   emit(event: Exclude<BridgeEvent, { type: 'ready' } | { type: 'pong' }>): void {
     this.options.onEvent?.(event);
+  }
+
+  emitStatus(status: MeetingBridgeStatus): void {
+    this.options.onStatus?.(status);
   }
 }
 
@@ -93,7 +113,7 @@ test('bridge runtime warms before capture, starts only when ready, keeps a healt
 
   assert.equal(await runtime.warm('meeting-1'), true);
   assert.equal(supervisor?.warmCalls, 1);
-  assert.equal(supervisor?.maximumRestarts(), 0);
+  assert.equal(supervisor?.maximumRestarts(), 3);
   assert.equal(await runtime.captureReady('meeting-1'), true);
   assert.deepEqual(supervisor?.startIfReadyCalls, ['meeting-1']);
   assert.equal(await runtime.restart('meeting-1'), true);
@@ -170,6 +190,39 @@ test('speaker evidence emitted during native Start is not lost before start reso
   assert.equal(await runtime.captureReady('meeting-1'), true);
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(applied, ['Akbar']);
+});
+
+test('repeated captureReady preserves one helper session and route update never restarts evidence', async (t) => {
+  const originalBridge = process.env.ROWBOAT_MEETING_BRIDGE_ENABLED;
+  const originalAec = process.env.ROWBOAT_MEETING_AEC_ENABLED;
+  process.env.ROWBOAT_MEETING_BRIDGE_ENABLED = '1';
+  process.env.ROWBOAT_MEETING_AEC_ENABLED = '1';
+  t.after(() => {
+    if (originalBridge === undefined) delete process.env.ROWBOAT_MEETING_BRIDGE_ENABLED;
+    else process.env.ROWBOAT_MEETING_BRIDGE_ENABLED = originalBridge;
+    if (originalAec === undefined) delete process.env.ROWBOAT_MEETING_AEC_ENABLED;
+    else process.env.ROWBOAT_MEETING_AEC_ENABLED = originalAec;
+  });
+
+  let supervisor: FakeSupervisor | undefined;
+  const runtime = createMeetingBridgeRuntime({
+    paths,
+    enabled: () => true,
+    createSupervisor: (options) => {
+      supervisor = new FakeSupervisor(options);
+      return supervisor;
+    },
+    applySpeakerEvidence: () => {},
+  });
+
+  assert.equal(await runtime.warm('meeting-1'), true);
+  assert.equal(await runtime.captureReady('meeting-1', false), true);
+  assert.equal(await runtime.captureReady('meeting-1', true), true);
+  assert.deepEqual(supervisor?.startIfReadyCalls, ['meeting-1']);
+
+  assert.equal(await runtime.updateAecOutputRoute('meeting-1', true), null);
+  assert.deepEqual(supervisor?.updateAecOutputRouteCalls, [{ meetingId: 'meeting-1', isolated: true }]);
+  assert.deepEqual(supervisor?.startIfReadyCalls, ['meeting-1']);
 });
 
 test('native warmup failure is silent and captureReady never cold-starts a late helper', async () => {
@@ -261,6 +314,40 @@ test('reset cleanup stops a warmed helper even when capture never became ready',
   assert.equal(await runtime.warm('meeting-1'), true);
   await runtime.stop('meeting-1');
   assert.equal(supervisor?.stopCalls, 1);
+});
+
+test('helper recovery keeps the process bounded but quarantines the new evidence clock', async () => {
+  let supervisor: FakeSupervisor | undefined;
+  const applied: string[] = [];
+  const runtime = createMeetingBridgeRuntime({
+    paths,
+    enabled: () => true,
+    createSupervisor: (options) => {
+      supervisor = new FakeSupervisor(options);
+      return supervisor;
+    },
+    applySpeakerEvidence: (_meetingId, evidence) => {
+      applied.push(evidence[0]?.displayName ?? 'missing');
+    },
+  });
+
+  await runtime.warm('meeting-1');
+  await runtime.captureReady('meeting-1');
+  supervisor?.emitStatus({ state: 'recovering', restartCount: 1, reason: 'system capture stalled' });
+  supervisor?.emit({
+    type: 'speaker_evidence',
+    evidence: {
+      meetingId: 'meeting-1', startSample: 0, endSample: 3_200, platform: 'zoom', surface: 'native',
+      participantId: 'akbar', displayName: 'Akbar', isActive: true,
+      source: 'zoom_ax', confidence: 0.9, observedAtSample: 3_200, signals: ['active_speaker_label'],
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(applied, [], 'a restarted helper must not relabel an old sample clock');
+
+  await runtime.dispose();
+  assert.equal(supervisor?.stopCalls, 1);
+  assert.equal(await runtime.captureReady('meeting-1'), false);
 });
 
 test('disabled bridge never starts a native helper', async () => {

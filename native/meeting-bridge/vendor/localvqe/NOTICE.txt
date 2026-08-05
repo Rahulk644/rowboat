@@ -1,0 +1,5 @@
+LocalVQE
+Copyright 2024-2026 Richard Sherwood Palethorpe
+
+Licensed under the Apache License, Version 2.0. The complete license text is
+distributed beside this notice as APACHE-2.0.txt.

@@ -11,15 +11,121 @@ const pkg = require('./package.json');
 // Ubuntu and shouldn't attempt to ship an Arch package.
 const SKIP_PACMAN = process.env.ROWBOAT_SKIP_PACMAN === '1';
 const SKIP_CODE_SIGNING = process.env.ROWBOAT_SKIP_CODE_SIGNING === '1';
+// Contributors without a certificate use Forge's recursive signer with an
+// ad-hoc identity. Do not post-sign only the outer .app: that leaves nested
+// executables, including meeting-bridge, outside the sealed signature.
+const LOCAL_SIGNING_IDENTITY = process.env.ROWBOAT_LOCAL_SIGNING_IDENTITY?.trim() || undefined;
+const LOCAL_ADHOC_SIGNING = process.env.ROWBOAT_LOCAL_ADHOC_SIGNING === '1';
+const MEETING_CONTRIBUTOR_BUILD = process.env.ROWBOAT_MEETING_CONTRIBUTOR_BUILD === '1';
+if (LOCAL_SIGNING_IDENTITY && LOCAL_ADHOC_SIGNING) {
+    throw new Error('ROWBOAT_LOCAL_SIGNING_IDENTITY and ROWBOAT_LOCAL_ADHOC_SIGNING are mutually exclusive');
+}
 // The native meeting bridge is an alpha resource. Keep normal Rowboat
 // packages byte-for-byte on their current path unless this exact build flag is
 // deliberately provided by the release engineer.
 const MEETING_BRIDGE_ALPHA = process.env.ROWBOAT_MEETING_BRIDGE_ALPHA === '1';
+// Operational LocalVQE qualification is a stricter subset of the meeting
+// bridge alpha. The stage script refuses unreviewed paths/checksums and this
+// flag must never affect a normal package.
+const MEETING_AEC_ALPHA = process.env.ROWBOAT_MEETING_AEC_ALPHA === '1';
+if (MEETING_AEC_ALPHA && !MEETING_BRIDGE_ALPHA) {
+    throw new Error('ROWBOAT_MEETING_AEC_ALPHA requires ROWBOAT_MEETING_BRIDGE_ALPHA=1');
+}
+if (MEETING_AEC_ALPHA && !MEETING_CONTRIBUTOR_BUILD) {
+    throw new Error('ROWBOAT_MEETING_AEC_ALPHA is qualification-only and requires ROWBOAT_MEETING_CONTRIBUTOR_BUILD=1');
+}
+// Optional offline source for the exact Electron release ZIP. This is useful
+// on restricted build hosts that already have the matching runtime installed;
+// Electron Packager still owns extraction and bundle construction.
+const ELECTRON_ZIP_DIR = process.env.ROWBOAT_ELECTRON_ZIP_DIR?.trim() || undefined;
+if (ELECTRON_ZIP_DIR && !path.isAbsolute(ELECTRON_ZIP_DIR)) {
+    throw new Error('ROWBOAT_ELECTRON_ZIP_DIR must be an absolute path');
+}
 const MEETING_BRIDGE_STAGE_DIR = path.join(__dirname, '.package', 'resources', 'meeting-bridge');
 const MEETING_BRIDGE_STAGE_SCRIPT = path.resolve(
     __dirname,
     '../../../../native/meeting-bridge/scripts/stage.mjs',
 );
+const MEETING_CONTRIBUTOR_MARKER = path.resolve(__dirname, '../../../../script/meeting-contributor-build.json');
+
+const ENTITLEMENTS = path.join(__dirname, 'entitlements.plist');
+const LOCAL_ADHOC_APP_ENTITLEMENTS = [
+    'com.apple.security.cs.allow-jit',
+    'com.apple.security.cs.disable-library-validation',
+    'com.apple.security.device.audio-input',
+    'com.apple.security.device.screen-capture',
+];
+const LOCAL_ADHOC_HELPER_ENTITLEMENTS = [
+    'com.apple.security.cs.allow-jit',
+    'com.apple.security.cs.disable-library-validation',
+];
+const LOCAL_ADHOC_PLUGIN_ENTITLEMENTS = [
+    'com.apple.security.cs.allow-unsigned-executable-memory',
+    'com.apple.security.cs.disable-library-validation',
+];
+const signingOptionsForFile = (filePath) => {
+    // The Rust bridge and its model/library are not Electron processes. Keep
+    // JIT and device entitlements out of that trust boundary.
+    if (filePath.includes(`${path.sep}Resources${path.sep}meeting-bridge${path.sep}`)) {
+        return { entitlements: [] };
+    }
+    if (LOCAL_ADHOC_SIGNING && filePath.includes(`${path.sep}Frameworks${path.sep}Rowboat Helper`)) {
+        return {
+            entitlements: filePath.includes('(Plugin).app')
+                ? LOCAL_ADHOC_PLUGIN_ENTITLEMENTS
+                : LOCAL_ADHOC_HELPER_ENTITLEMENTS,
+        };
+    }
+    if (path.basename(filePath) === 'Rowboat.app') {
+        return {
+            // Independently ad-hoc-signed Mach-O files have no common Team ID,
+            // so only local contributor bundles need library validation off.
+            // Developer ID/release packages continue to use the strict plist.
+            entitlements: LOCAL_ADHOC_SIGNING ? LOCAL_ADHOC_APP_ENTITLEMENTS : ENTITLEMENTS,
+        };
+    }
+    // Preserve @electron/osx-sign's purpose-built helper entitlements.
+    return {};
+};
+
+const MACOS_SIGNING = SKIP_CODE_SIGNING
+    ? {}
+    : (LOCAL_SIGNING_IDENTITY || LOCAL_ADHOC_SIGNING)
+        ? {
+              // Forge/@electron/osx-sign walks code objects deepest-first. This
+              // seals `Resources/meeting-bridge`, which Electron main launches
+              // as an independently executed helper.
+              osxSign: {
+                  batchCodesignCalls: true,
+                  // A package that failed to seal is not a usable macOS
+                  // artifact. Never let Packager continue with a partial or
+                  // inherited Electron linker signature.
+                  continueOnError: false,
+                  identity: LOCAL_SIGNING_IDENTITY ?? '-',
+                  // `-` is deliberately an ad-hoc identity and cannot be
+                  // discovered in Keychain.
+                  ...(LOCAL_ADHOC_SIGNING && !LOCAL_SIGNING_IDENTITY
+                      ? {
+                            identityValidation: false,
+                            preAutoEntitlements: false,
+                            preEmbedProvisioningProfile: false,
+                        }
+                      : {}),
+                  optionsForFile: signingOptionsForFile,
+              },
+          }
+        : {
+              osxSign: {
+                  batchCodesignCalls: true,
+                  continueOnError: false,
+                  optionsForFile: signingOptionsForFile,
+              },
+              osxNotarize: {
+                  appleId: process.env.APPLE_ID,
+                  appleIdPassword: process.env.APPLE_PASSWORD,
+                  teamId: process.env.APPLE_TEAM_ID,
+              },
+          };
 
 // Windows code signing via Azure Trusted Signing — CI-only. The GitHub workflow
 // downloads the Azure dlib, writes metadata.json, and exports these env vars;
@@ -230,34 +336,32 @@ module.exports = {
         onlyModules: [],
     },
     packagerConfig: {
-        executableName: 'rowboat',
+        // Electron Packager derives both the .app bundle name and the output
+        // directory from `name`. Keep contributor qualification visibly
+        // distinct from the installed Rowboat release, not only by bundle ID.
+        ...(MEETING_CONTRIBUTOR_BUILD ? { name: 'Rowboat Meetings Dev' } : {}),
+        executableName: MEETING_CONTRIBUTOR_BUILD ? 'Rowboat Meetings Dev' : 'rowboat',
+        ...(ELECTRON_ZIP_DIR ? { electronZipDir: ELECTRON_ZIP_DIR } : {}),
         icon: './icons/icon',  // .icns extension added automatically
-        appBundleId: 'com.rowboat.app',
+        appBundleId: MEETING_CONTRIBUTOR_BUILD ? 'com.rowboat.meetings-dev' : 'com.rowboat.app',
         appCategoryType: 'public.app-category.productivity',
-        protocols: [
-            { name: 'Rowboat', schemes: ['rowboat'] },
-        ],
+        ...(MEETING_CONTRIBUTOR_BUILD ? {} : {
+            protocols: [
+                { name: 'Rowboat', schemes: ['rowboat'] },
+            ],
+        }),
         extendInfo: {
+            ...(MEETING_CONTRIBUTOR_BUILD ? {
+                CFBundleDisplayName: 'Rowboat Meetings Dev',
+                CFBundleName: 'Rowboat Meetings Dev',
+            } : {}),
             NSAudioCaptureUsageDescription: 'Rowboat needs access to system audio to transcribe meetings from other apps (Zoom, Meet, etc.)',
             NSCameraUsageDescription: 'Rowboat uses your camera in video chat mode so the assistant can see you and give feedback (e.g. pitch practice).',
         },
         // Signs the packaged app's executables (rowboat.exe etc.); the Squirrel
         // maker below separately signs the installer it produces.
         ...(WINDOWS_SIGN ? { windowsSign: WINDOWS_SIGN } : {}),
-        ...(SKIP_CODE_SIGNING ? {} : {
-            osxSign: {
-                batchCodesignCalls: true,
-                optionsForFile: () => ({
-                    entitlements: path.join(__dirname, 'entitlements.plist'),
-                    'entitlements-inherit': path.join(__dirname, 'entitlements.plist'),
-                }),
-            },
-            osxNotarize: {
-                appleId: process.env.APPLE_ID,
-                appleIdPassword: process.env.APPLE_PASSWORD,
-                teamId: process.env.APPLE_TEAM_ID
-            },
-        }),
+        ...MACOS_SIGNING,
         // Since we bundle the main process with esbuild, we don't need the workspace
         // node_modules. These settings prevent Forge's dependency walker (flora-colossus)
         // from trying to analyze/copy node_modules, which fails with pnpm's symlinked
@@ -267,7 +371,12 @@ module.exports = {
         // process.resourcesPath/meeting-bridge. It is absent from normal
         // packages; the alpha script creates it deterministically in
         // generateAssets before Packager reads it.
-        ...(MEETING_BRIDGE_ALPHA ? { extraResource: [MEETING_BRIDGE_STAGE_DIR] } : {}),
+        ...((MEETING_BRIDGE_ALPHA || MEETING_CONTRIBUTOR_BUILD) ? {
+            extraResource: [
+                ...(MEETING_BRIDGE_ALPHA ? [MEETING_BRIDGE_STAGE_DIR] : []),
+                ...(MEETING_CONTRIBUTOR_BUILD ? [MEETING_CONTRIBUTOR_MARKER] : []),
+            ],
+        } : {}),
         // Strip the workspace src/node_modules (paths are ANCHORED to the app root), BUT
         // always keep everything under `.package/` — that's our staged output: the
         // bundled main process, the ACP adapters + their dependency closure (staged by
@@ -434,7 +543,7 @@ module.exports = {
             });
 
             if (MEETING_BRIDGE_ALPHA) {
-                console.log(`Building and staging meeting bridge alpha for ${platform}/${arch}...`);
+                console.log(`Building and staging meeting bridge alpha for ${platform}/${arch}${MEETING_AEC_ALPHA ? ' with LocalVQE AEC assets' : ''}...`);
                 // Fixed script + argument vector: platform and architecture
                 // are validated by the script and never interpolated into a
                 // shell command.
