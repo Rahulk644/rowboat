@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  findCrossChannelEchoSuppressions,
   mergeMeetingTranscriptSegments,
   SelfHostedMeetingTranscription,
   type MeetingTranscriptSegment,
@@ -8,6 +9,22 @@ import {
 } from './meeting-transcription.js';
 
 const TOKEN = 'rowboat-test-token-that-is-at-least-32-characters';
+
+function echoSegment(
+  channel: 'mic' | 'system',
+  segmentId: string,
+  text: string,
+  startSample = 0,
+  endSample = 16_000,
+): MeetingTranscriptSegment {
+  return {
+    meetingId: 'echo-meeting', segmentId, revision: 2, epoch: 0,
+    startSample, endSample, timingConfidence: 'low', timingSource: 'feed-window',
+    channel, text, finality: 'stable', clusterIds: [], overlap: false,
+    speaker: { kind: 'unknown', displayName: 'Unknown speaker' },
+    attributionSource: 'self-hosted-feed-window', attributionConfidence: 0, supersedes: [],
+  };
+}
 
 test('self-hosted provider stays loopback-only and completes two source sessions', async (t) => {
   const originalUrl = process.env.ROWBOAT_MEETING_STT_URL;
@@ -115,6 +132,93 @@ test('canonical v2 segment merging is idempotent and accepts only higher revisio
   const revised = { ...base, revision: 1, text: 'first words', finality: 'final' as const };
   assert.deepEqual(mergeMeetingTranscriptSegments([base], [ignored]), [base]);
   assert.deepEqual(mergeMeetingTranscriptSegments([base], [revised]), [revised]);
+});
+
+test('suppresses one exact, interval-aligned system echo from the mic channel', () => {
+  const system = echoSegment('system', 'system-1', 'please review the deployment plan before lunch');
+  const mic = echoSegment('mic', 'mic-1', 'please review the deployment plan before lunch');
+  const suppression = findCrossChannelEchoSuppressions([system, mic]);
+
+  assert.deepEqual(suppression.suppressedMicSegmentIds, ['mic-1']);
+  assert.deepEqual(suppression.systemUpserts, [{
+    ...system,
+    revision: 3,
+    supersedes: ['mic-1'],
+  }]);
+});
+
+test('suppresses one very close STT revision only with strong time alignment', () => {
+  const system = echoSegment('system', 'system-1', 'please review the deployment plan before lunch');
+  const mic = echoSegment('mic', 'mic-1', 'please review deployment plan before lunch', 800, 16_000);
+  const suppression = findCrossChannelEchoSuppressions([system, mic]);
+
+  assert.deepEqual(suppression.suppressedMicSegmentIds, ['mic-1']);
+  assert.equal(suppression.systemUpserts[0]?.supersedes.includes('mic-1'), true);
+});
+
+test('preserves different simultaneous speakers and any ambiguous echo graph', () => {
+  const system = echoSegment('system', 'system-1', 'please review the deployment plan before lunch');
+  const differentMic = echoSegment('mic', 'mic-different', 'we should postpone the planning meeting until tomorrow');
+  const sameMicA = echoSegment('mic', 'mic-echo-a', 'please review the deployment plan before lunch');
+  const sameMicB = echoSegment('mic', 'mic-echo-b', 'please review the deployment plan before lunch');
+
+  assert.deepEqual(findCrossChannelEchoSuppressions([system, differentMic]), {
+    suppressedMicSegmentIds: [], systemUpserts: [],
+  });
+  assert.deepEqual(findCrossChannelEchoSuppressions([system, sameMicA, sameMicB]), {
+    suppressedMicSegmentIds: [], systemUpserts: [],
+  });
+});
+
+test('main emits one canonical system upsert when the matching mic segment is echo', async (t) => {
+  const originalUrl = process.env.ROWBOAT_MEETING_STT_URL;
+  const originalToken = process.env.ROWBOAT_MEETING_STT_TOKEN;
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    if (originalUrl === undefined) delete process.env.ROWBOAT_MEETING_STT_URL;
+    else process.env.ROWBOAT_MEETING_STT_URL = originalUrl;
+    if (originalToken === undefined) delete process.env.ROWBOAT_MEETING_STT_TOKEN;
+    else process.env.ROWBOAT_MEETING_STT_TOKEN = originalToken;
+    globalThis.fetch = originalFetch;
+  });
+
+  process.env.ROWBOAT_MEETING_STT_TOKEN = TOKEN;
+  process.env.ROWBOAT_MEETING_STT_URL = 'http://127.0.0.1:18091';
+  globalThis.fetch = async (input) => {
+    const url = new URL(input.toString());
+    const session = url.searchParams.get('session') ?? '';
+    if (url.pathname === '/stream/feed') {
+      return new Response(JSON.stringify({
+        session,
+        full: 'please review the deployment plan before lunch',
+        committed: 'please review the deployment plan before lunch',
+        tentative: '', changed: true, final: false, revision: 1, inputMs: 0, bufferedMs: 0,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({ ok: true, session }), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    });
+  };
+
+  const provider = new SelfHostedMeetingTranscription();
+  await provider.begin('echo pair', 'en');
+  const pcm = Buffer.alloc(32_000).toString('base64');
+  await provider.feed('echo pair', 'mic', pcm, {
+    startSample: 0, sampleCount: 16_000, sampleRate: 16_000, sequence: 0,
+  });
+  const system = await provider.feed('echo pair', 'system', pcm, {
+    startSample: 0, sampleCount: 16_000, sampleRate: 16_000, sequence: 0,
+  });
+
+  assert.deepEqual(system.segments.map((segment) => ({
+    segmentId: segment.segmentId,
+    revision: segment.revision,
+    supersedes: segment.supersedes,
+  })), [{
+    segmentId: 'echo-pair:system:e0:stable:0',
+    revision: 1,
+    supersedes: ['echo-pair:mic:e0:stable:0'],
+  }]);
 });
 
 test('revised provisional windows become deterministic stable windows without final duplicates', async (t) => {
