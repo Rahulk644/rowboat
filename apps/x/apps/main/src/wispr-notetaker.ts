@@ -7,12 +7,18 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { watch, type FSWatcher } from 'chokidar';
 import type { MeetingTranscriptSegment } from './meeting-transcription.js';
+import {
+  resolveMeetingSpeakerUpsert,
+  type MeetingSpeakerEvidence,
+} from './meeting-speaker-resolver.js';
 
 const PROTOCOL_VERSION = 1;
 const SAMPLE_RATE = 16_000;
 const MAX_LINE_BYTES = 128 * 1024;
 const MAX_TEXT_LENGTH = 20_000;
 const ACTIVE_MEETING_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
+const MEETING_STATE_POLL_INTERVAL_MS = 500;
+const MAX_RETAINED_SPEAKER_EVIDENCE = 2_048;
 const EXTENSION_NAME = 'rowboat-notetaker';
 
 export type WisprConnectorStatus = {
@@ -58,6 +64,8 @@ type WisprTranscriptEntry = {
   id: string;
   text: string;
   timestamp?: number;
+  startEpochMs?: number;
+  endEpochMs?: number;
   startRecordingMs?: number;
   endRecordingMs?: number;
   speaker: {
@@ -66,6 +74,12 @@ type WisprTranscriptEntry = {
     name?: string;
   };
 };
+
+export type WisprSpeakerMap = ReadonlyMap<string, {
+  personId: string;
+  name: string;
+  origin: string;
+}>;
 
 type PendingChunk = {
   segmentId: string;
@@ -81,11 +95,17 @@ type ActiveSession = {
   sequence: number;
   pending: PendingChunk[];
   endNotified: boolean;
+  recordingEpochMs?: number;
+  evidenceClockStartedAt?: number;
+  speakerEvidence: MeetingSpeakerEvidence[];
+  speakerMap: WisprSpeakerMap;
+  speakerMapFingerprint: string;
   segmentByEntryId: Map<string, {
     segmentId: string;
     revision: number;
     channel: 'mic' | 'system';
     fingerprint: string;
+    segment?: MeetingTranscriptSegment;
   }>;
 };
 
@@ -130,6 +150,67 @@ function firstString(record: Record<string, unknown>, keys: string[]): string | 
   return undefined;
 }
 
+function firstIdentifier(record: Record<string, unknown>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+    if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) return String(value);
+  }
+  return undefined;
+}
+
+function jsonRecord(value: unknown): Record<string, unknown> | null {
+  let parsed = value;
+  if (typeof parsed === 'string') {
+    if (!parsed.trim()) return null;
+    try { parsed = JSON.parse(parsed); } catch { return null; }
+  }
+  return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+    ? parsed as Record<string, unknown>
+    : null;
+}
+
+function assignmentPersonId(value: unknown): string | undefined {
+  if (typeof value === 'string' && value.trim()) return value.trim().slice(0, 160);
+  const record = jsonRecord(value);
+  return record ? firstIdentifier(record, ['personId', 'person_id', 'id'])?.slice(0, 160) : undefined;
+}
+
+/**
+ * Wispr persists participant identities separately from diarization cluster
+ * assignments. Only an explicit assignment may name a cluster; the passive
+ * participant roster is never guessed onto transcript text.
+ */
+export function parseWisprSpeakerMap(value: unknown): WisprSpeakerMap {
+  const root = jsonRecord(value);
+  const people = jsonRecord(root?.people);
+  const assignments = jsonRecord(root?.assignments);
+  const resolved = new Map<string, { personId: string; name: string; origin: string }>();
+  if (!people || !assignments) return resolved;
+
+  const names = new Map<string, string>();
+  for (const [personId, rawPerson] of Object.entries(people).slice(0, 256)) {
+    const person = jsonRecord(rawPerson);
+    const name = person ? firstString(person, ['name', 'displayName']) : undefined;
+    if (personId && personId.length <= 160 && name && name.length <= 160) names.set(personId, name);
+  }
+
+  const precedence = ['user', 'dom', 'mic', 'llm', 'consensus'] as const;
+  for (const [speakerId, rawAssignment] of Object.entries(assignments).slice(0, 256)) {
+    if (!speakerId || speakerId.length > 160) continue;
+    const assignment = jsonRecord(rawAssignment);
+    if (!assignment) continue;
+    for (const origin of precedence) {
+      const personId = assignmentPersonId(assignment[origin]);
+      const name = personId ? names.get(personId) : undefined;
+      if (!personId || !name) continue;
+      resolved.set(speakerId, { personId, name, origin });
+      break;
+    }
+  }
+  return resolved;
+}
+
 export function parseWisprTranscriptEntry(value: unknown): WisprTranscriptEntry | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
@@ -143,6 +224,8 @@ export function parseWisprTranscriptEntry(value: unknown): WisprTranscriptEntry 
   const source = speaker.source;
   if (source !== 'mic' && source !== 'system' && source !== 'refined') return null;
   const timestamp = firstFinite(record, ['timestamp', 'timestampMs', 'wallClockMs']);
+  const startEpochMs = firstFinite(record, ['startEpochMs', 'start_epoch_ms']);
+  const endEpochMs = firstFinite(record, ['endEpochMs', 'end_epoch_ms']);
   const startRecordingMs = firstFinite(record, [
     'startRecordingMs', 'start_recording_ms', 'startRecordingActiveMs', 'startMs',
   ]);
@@ -153,10 +236,12 @@ export function parseWisprTranscriptEntry(value: unknown): WisprTranscriptEntry 
     id,
     text,
     ...(timestamp !== undefined ? { timestamp } : {}),
+    ...(startEpochMs !== undefined ? { startEpochMs } : {}),
+    ...(endEpochMs !== undefined ? { endEpochMs } : {}),
     ...(startRecordingMs !== undefined ? { startRecordingMs } : {}),
     ...(endRecordingMs !== undefined ? { endRecordingMs } : {}),
     speaker: {
-      id: firstString(speaker, ['id', 'speakerId']),
+      id: firstIdentifier(speaker, ['id', 'speakerId']),
       source,
       name: firstString(speaker, ['name', 'displayName']),
     },
@@ -231,6 +316,8 @@ export class WisprNotetakerSource {
   private server: net.Server | null = null;
   private watcher: FSWatcher | null = null;
   private detectionWatcher: FSWatcher | null = null;
+  private meetingStateTimer: NodeJS.Timeout | null = null;
+  private meetingStatePollInFlight = false;
   private token = '';
   private authenticatedClients = 0;
   private restartRequired = false;
@@ -469,6 +556,9 @@ export class WisprNotetakerSource {
       sequence: 0,
       pending: [],
       endNotified: false,
+      speakerEvidence: [],
+      speakerMap: new Map(),
+      speakerMapFingerprint: JSON.stringify([]),
       segmentByEntryId: new Map(),
     };
     const pendingMeetingId = this.pendingWisprMeetingId ?? await this.findActiveMeetingId();
@@ -576,6 +666,14 @@ export class WisprNotetakerSource {
 
   private async startWatcher(wisprMeetingId: string): Promise<void> {
     await this.stopWatcher();
+    await this.pollWisprMeetingState(wisprMeetingId, false);
+    this.meetingStateTimer = setInterval(() => {
+      if (this.meetingStatePollInFlight) return;
+      this.meetingStatePollInFlight = true;
+      void this.pollWisprMeetingState(wisprMeetingId)
+        .finally(() => { this.meetingStatePollInFlight = false; });
+    }, MEETING_STATE_POLL_INTERVAL_MS);
+    this.meetingStateTimer.unref();
     const meetingDirectory = path.join(this.flowSupportDirectory, 'meetings', wisprMeetingId);
     // Chokidar climbs parent directories when asked to watch a missing file.
     // That is both noisy and unsafe here: the optional fast event can arrive
@@ -635,7 +733,124 @@ export class WisprNotetakerSource {
     });
   }
 
+  /**
+   * The native Zoom adapter may positively observe that the meeting surface
+   * ended before Wispr finishes its own refinement pipeline. This closes
+   * Rowboat immediately without writing to or controlling Wispr's private
+   * state.
+   */
+  notifyExternalMeetingEnded(rowboatMeetingId: string): void {
+    const session = this.session;
+    if (!session || session.rowboatMeetingId !== safeId(rowboatMeetingId) || !session.wisprMeetingId) return;
+    this.notifyEnded(session.wisprMeetingId);
+  }
+
+  setEvidenceClockOrigin(rowboatMeetingId: string, startedAtEpochMs: number): void {
+    const session = this.session;
+    if (!session || session.rowboatMeetingId !== safeId(rowboatMeetingId) || !Number.isFinite(startedAtEpochMs)) return;
+    session.evidenceClockStartedAt = startedAtEpochMs;
+  }
+
+  applySpeakerEvidence(
+    rowboatMeetingId: string,
+    evidence: readonly MeetingSpeakerEvidence[],
+  ): { segments: MeetingTranscriptSegment[] } {
+    const session = this.session;
+    if (!session || session.rowboatMeetingId !== safeId(rowboatMeetingId)) return { segments: [] };
+    session.speakerEvidence.push(...evidence.filter((item) => (
+      Number.isFinite(item.startSample) && Number.isFinite(item.endSample) && item.endSample >= item.startSample
+    )));
+    session.speakerEvidence = session.speakerEvidence.slice(-MAX_RETAINED_SPEAKER_EVIDENCE);
+    const updates: MeetingTranscriptSegment[] = [];
+    for (const tracked of session.segmentByEntryId.values()) {
+      if (!tracked.segment) continue;
+      const revised = this.resolveNativeSpeakerEvidence(session, tracked.segment);
+      if (!revised) continue;
+      tracked.segment = revised;
+      tracked.revision = revised.revision;
+      updates.push(revised);
+    }
+    if (updates.length > 0) this.emit(updates);
+    return { segments: updates };
+  }
+
+  private translatedSpeakerEvidence(session: ActiveSession): MeetingSpeakerEvidence[] {
+    if (session.recordingEpochMs === undefined || session.evidenceClockStartedAt === undefined) return [];
+    const offsetSamples = Math.round(
+      (session.evidenceClockStartedAt - session.recordingEpochMs) * SAMPLE_RATE / 1000,
+    );
+    return session.speakerEvidence.map((item) => ({
+      ...item,
+      startSample: item.startSample + offsetSamples,
+      endSample: item.endSample + offsetSamples,
+    }));
+  }
+
+  private resolveNativeSpeakerEvidence(
+    session: ActiveSession,
+    segment: MeetingTranscriptSegment,
+  ): MeetingTranscriptSegment | null {
+    if (segment.channel !== 'system') return null;
+    if (
+      segment.attributionSource === 'wispr_direct_name'
+      || segment.attributionSource.startsWith('wispr_speaker_map:')
+      || segment.attributionSource === 'wispr_refined_name'
+    ) return null;
+    const evidence = this.translatedSpeakerEvidence(session).filter((item) => (
+      item.endSample > segment.startSample && item.startSample < segment.endSample
+    ));
+    if (evidence.length === 0) return null;
+    return resolveMeetingSpeakerUpsert(segment, { evidence });
+  }
+
+  private async pollWisprMeetingState(wisprMeetingId: string, shouldEmit = true): Promise<void> {
+    const session = this.session;
+    if (!session || session.wisprMeetingId !== wisprMeetingId) return;
+    const databasePath = path.join(this.flowSupportDirectory, 'flow.sqlite');
+    if (!fs.existsSync(databasePath)) return;
+    let database: DatabaseSync | null = null;
+    try {
+      database = new DatabaseSync(databasePath, { readOnly: true });
+      // This runs on Electron main. Keep a transient Wispr writer lock below
+      // one animation frame budget rather than pausing Rowboat's UI.
+      database.exec('PRAGMA busy_timeout = 16');
+      const row = database.prepare(`
+        SELECT finalized, endedAt, speakerMap
+        FROM Meetings WHERE id = ? LIMIT 1
+      `)
+        .get(wisprMeetingId) as Record<string, unknown> | undefined;
+      if (!row) return;
+
+      const nextSpeakerMap = parseWisprSpeakerMap(row.speakerMap);
+      const nextFingerprint = JSON.stringify([...nextSpeakerMap.entries()]);
+      if (nextFingerprint !== session.speakerMapFingerprint) {
+        session.speakerMap = nextSpeakerMap;
+        session.speakerMapFingerprint = nextFingerprint;
+        const meetingDirectory = path.join(this.flowSupportDirectory, 'meetings', wisprMeetingId);
+        await this.reconcileTranscriptFile(path.join(meetingDirectory, 'live.ndjson'), shouldEmit);
+        await this.reconcileTranscriptFile(path.join(meetingDirectory, 'refined.ndjson'), shouldEmit);
+      }
+
+      const finalized = row.finalized === 1 || row.finalized === true;
+      const ended = typeof row.endedAt === 'string' || typeof row.endedAt === 'number';
+      if (finalized || ended) {
+        const meetingDirectory = path.join(this.flowSupportDirectory, 'meetings', wisprMeetingId);
+        await this.reconcileTranscriptFile(path.join(meetingDirectory, 'refined.ndjson'), shouldEmit);
+        await this.reconcileTranscriptFile(path.join(meetingDirectory, 'live.ndjson'), shouldEmit);
+        this.notifyEnded(wisprMeetingId);
+      }
+    } catch {
+      // Wispr may hold a short SQLite write lock. The next bounded poll
+      // retries; a transient local database failure never stops recording.
+    } finally {
+      database?.close();
+    }
+  }
+
   private async stopWatcher(): Promise<void> {
+    if (this.meetingStateTimer) clearInterval(this.meetingStateTimer);
+    this.meetingStateTimer = null;
+    this.meetingStatePollInFlight = false;
     const watcher = this.watcher;
     this.watcher = null;
     if (watcher) await watcher.close();
@@ -665,11 +880,18 @@ export class WisprNotetakerSource {
     entry: WisprTranscriptEntry,
     refined: boolean,
   ): MeetingTranscriptSegment | null {
+    if (entry.startEpochMs !== undefined && entry.startRecordingMs !== undefined) {
+      const recordingEpochMs = entry.startEpochMs - entry.startRecordingMs;
+      if (Number.isFinite(recordingEpochMs)) session.recordingEpochMs = recordingEpochMs;
+    }
+    const mappedSpeaker = entry.speaker.id ? session.speakerMap.get(entry.speaker.id) : undefined;
+    const resolvedName = entry.speaker.name ?? mappedSpeaker?.name;
     const fingerprint = JSON.stringify({
       text: entry.text,
       source: entry.speaker.source,
       speakerId: entry.speaker.id ?? null,
-      speakerName: entry.speaker.name ?? null,
+      speakerName: resolvedName ?? null,
+      speakerMapOrigin: mappedSpeaker?.origin ?? null,
       start: entry.startRecordingMs ?? null,
       end: entry.endRecordingMs ?? null,
       refined,
@@ -698,13 +920,17 @@ export class WisprNotetakerSource {
     const channel = existing.channel;
     const speaker = channel === 'mic'
       ? { kind: 'self' as const, id: 'self', displayName: 'You' }
-      : entry.speaker.name
-        ? { kind: 'named' as const, id: entry.speaker.id ?? `wispr-name:${safeId(entry.speaker.name, 80)}`, displayName: entry.speaker.name }
+      : resolvedName
+        ? {
+            kind: 'named' as const,
+            id: mappedSpeaker?.personId ?? entry.speaker.id ?? `wispr-name:${safeId(resolvedName, 80)}`,
+            displayName: resolvedName,
+          }
         : entry.speaker.id
           ? { kind: 'cluster' as const, id: entry.speaker.id, displayName: `Speaker ${entry.speaker.id}` }
           : { kind: 'unknown' as const, displayName: 'Unknown speaker' };
-    const confidence = channel === 'mic' ? 1 : entry.speaker.name ? 0.96 : entry.speaker.id ? 0.7 : 0;
-    return {
+    const confidence = channel === 'mic' ? 1 : entry.speaker.name ? 0.96 : mappedSpeaker ? 0.9 : entry.speaker.id ? 0.7 : 0;
+    let segment: MeetingTranscriptSegment = {
       meetingId: session.rowboatMeetingId,
       segmentId: existing.segmentId,
       revision: existing.revision,
@@ -719,10 +945,23 @@ export class WisprNotetakerSource {
       clusterIds: entry.speaker.id ? [entry.speaker.id] : [],
       overlap: false,
       speaker,
-      attributionSource: refined ? 'wispr_refined' : channel === 'mic' ? 'wispr_mic_source' : 'wispr_speaker_map',
+      attributionSource: refined
+        ? resolvedName ? 'wispr_refined_name' : 'wispr_refined'
+        : channel === 'mic'
+          ? 'wispr_mic_source'
+          : entry.speaker.name
+            ? 'wispr_direct_name'
+            : mappedSpeaker
+              ? `wispr_speaker_map:${mappedSpeaker.origin}`
+              : entry.speaker.id ? 'wispr_cluster' : 'wispr_unresolved',
       attributionConfidence: confidence,
       supersedes: [],
     };
+    const nativeResolution = this.resolveNativeSpeakerEvidence(session, segment);
+    if (nativeResolution) segment = nativeResolution;
+    existing.revision = segment.revision;
+    existing.segment = segment;
+    return segment;
   }
 
   private emit(segments: MeetingTranscriptSegment[]): void {

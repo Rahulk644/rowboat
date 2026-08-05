@@ -6,6 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import {
   normalizeWisprRichText,
+  parseWisprSpeakerMap,
   parseWisprTranscriptEntry,
   WisprNotetakerSource,
   type WisprMeetingEvent,
@@ -35,6 +36,30 @@ test('parses Wispr v3 entries without treating metadata as speech', () => {
     endRecordingMs: 1820,
     speaker: { id: '4', source: 'system', name: 'Akbar' },
   });
+  assert.equal(parseWisprTranscriptEntry({
+    id: 'entry-2',
+    text: 'Numeric cluster identifiers survive parsing',
+    speaker: { id: 7, source: 'system', name: null },
+  })?.speaker.id, '7');
+});
+
+test('resolves Wispr speaker assignments by explicit provenance precedence', () => {
+  const speakerMap = parseWisprSpeakerMap(JSON.stringify({
+    people: {
+      'person-dom': { name: 'Akbar' },
+      'person-llm': { name: 'Wrong fallback' },
+    },
+    assignments: {
+      7: { dom: 'person-dom', llm: 'person-llm' },
+      8: { llm: { personId: 'person-llm' } },
+    },
+  }));
+  assert.deepEqual(speakerMap.get('7'), { personId: 'person-dom', name: 'Akbar', origin: 'dom' });
+  assert.deepEqual(speakerMap.get('8'), { personId: 'person-llm', name: 'Wrong fallback', origin: 'llm' });
+  assert.equal(parseWisprSpeakerMap({
+    people: { passive: { name: 'Roster only' } },
+    assignments: {},
+  }).size, 0);
 });
 
 test('normalizes plain Markdown and Lexical note content', () => {
@@ -140,13 +165,14 @@ test('starts from an active Wispr local meeting without the extension stream', a
       createdAt TEXT NOT NULL,
       isDeleted INTEGER NOT NULL,
       finalized INTEGER NOT NULL,
-      endedAt INTEGER
+      endedAt INTEGER,
+      speakerMap TEXT
     );
   `);
   database.prepare(`
-    INSERT INTO Meetings (id, createdAt, isDeleted, finalized, endedAt)
-    VALUES (?, ?, 0, 0, NULL)
-  `).run(wisprMeetingId, new Date().toISOString());
+    INSERT INTO Meetings (id, createdAt, isDeleted, finalized, endedAt, speakerMap)
+    VALUES (?, ?, 0, 0, NULL, ?)
+  `).run(wisprMeetingId, new Date().toISOString(), JSON.stringify({ people: {}, assignments: {} }));
   database.close();
 
   const ended: string[] = [];
@@ -172,15 +198,86 @@ test('starts from an active Wispr local meeting without the extension stream', a
     assert.equal(initial.segments.length, 1);
     assert.equal(initial.segments[0]?.speaker.kind, 'self');
     assert.equal(initial.segments[0]?.speaker.displayName, 'You');
-    await fsp.writeFile(path.join(meetingDir, 'refined.ndjson'), `${JSON.stringify({
-      id: 'local-1',
-      text: 'Local append log works',
-      startRecordingMs: 250,
-      endRecordingMs: 900,
-      speaker: { id: 'self', source: 'refined', name: null },
-    })}\n`);
+    const update = new DatabaseSync(path.join(flow, 'flow.sqlite'));
+    update.prepare('UPDATE Meetings SET finalized = 1, endedAt = ? WHERE id = ?')
+      .run(Date.now(), wisprMeetingId);
+    update.close();
     await eventually(() => ended.length === 1);
     assert.deepEqual(ended, [wisprMeetingId]);
+  } finally {
+    await source.dispose();
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('native Zoom evidence names a timestamp-aligned Wispr system cluster', async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'rowboat-wispr-evidence-test-'));
+  const home = path.join(root, 'home');
+  const flow = path.join(home, 'Library', 'Application Support', 'Wispr Flow');
+  const rowboat = path.join(home, '.rowboat');
+  const wisprApp = path.join(root, 'Wispr Flow.app');
+  const wisprMeetingId = 'wispr-evidence-meeting';
+  const meetingDir = path.join(flow, 'meetings', wisprMeetingId);
+  const recordingEpochMs = 1_000_000;
+  await fsp.mkdir(meetingDir, { recursive: true });
+  await fsp.mkdir(wisprApp, { recursive: true });
+  await fsp.writeFile(path.join(meetingDir, 'live.ndjson'), `${JSON.stringify({
+    id: 'remote-1',
+    text: 'Remote participant is speaking',
+    startEpochMs: recordingEpochMs + 1_000,
+    endEpochMs: recordingEpochMs + 2_000,
+    startRecordingMs: 1_000,
+    endRecordingMs: 2_000,
+    speaker: { id: 7, source: 'system', name: null },
+  })}\n`);
+  const database = new DatabaseSync(path.join(flow, 'flow.sqlite'));
+  database.exec(`
+    CREATE TABLE Meetings (
+      id TEXT PRIMARY KEY,
+      createdAt TEXT NOT NULL,
+      isDeleted INTEGER NOT NULL,
+      finalized INTEGER NOT NULL,
+      endedAt INTEGER,
+      speakerMap TEXT
+    );
+  `);
+  database.prepare(`
+    INSERT INTO Meetings (id, createdAt, isDeleted, finalized, endedAt, speakerMap)
+    VALUES (?, ?, 0, 0, NULL, ?)
+  `).run(wisprMeetingId, new Date().toISOString(), JSON.stringify({ people: {}, assignments: {} }));
+  database.close();
+
+  const events: WisprMeetingEvent[] = [];
+  const source = new WisprNotetakerSource({
+    platform: 'darwin',
+    homeDirectory: home,
+    flowSupportDirectory: flow,
+    rowboatDirectory: rowboat,
+    wisprApplicationPath: wisprApp,
+    extensionSourceRoot: path.join(root, 'unused-extension'),
+    onEvent: (event) => events.push(event),
+  });
+
+  try {
+    await source.setPreferred(true);
+    const initial = await source.begin('rowboat-evidence-test');
+    assert.equal(initial.segments[0]?.speaker.displayName, 'Speaker 7');
+    source.setEvidenceClockOrigin('rowboat-evidence-test', recordingEpochMs);
+    const revised = source.applySpeakerEvidence('rowboat-evidence-test', [{
+      source: 'zoom_ax',
+      participantId: 'zoom-akbar',
+      displayName: 'Akbar',
+      isSelf: false,
+      isActive: true,
+      isMuted: false,
+      startSample: 16_000,
+      endSample: 32_000,
+      confidence: 0.95,
+    }]);
+    assert.equal(revised.segments.length, 1);
+    assert.equal(revised.segments[0]?.speaker.displayName, 'Akbar');
+    assert.equal(revised.segments[0]?.attributionSource, 'zoom_ax');
+    assert.equal(events.at(-1)?.segments[0]?.speaker.displayName, 'Akbar');
   } finally {
     await source.dispose();
     await fsp.rm(root, { recursive: true, force: true });

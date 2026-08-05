@@ -94,6 +94,7 @@ test('bridge runtime warms before capture, starts only when ready, keeps a healt
     meetingId: string;
     evidence: Array<{ source: string; displayName?: string; startSample: number; endSample: number }>;
   }> = [];
+  const lifecycle: Array<{ meetingId: string; state: string }> = [];
   const runtime = createMeetingBridgeRuntime({
     paths,
     enabled: () => true,
@@ -108,6 +109,9 @@ test('bridge runtime warms before capture, starts only when ready, keeps a healt
           { source, displayName, startSample, endSample }
         )),
       });
+    },
+    onMeetingLifecycle: (meetingId, state) => {
+      lifecycle.push({ meetingId, state });
     },
   });
 
@@ -142,11 +146,14 @@ test('bridge runtime warms before capture, starts only when ready, keeps a healt
       source: 'zoom_ax', confidence: 0.9, observedAtSample: 320, signals: [],
     },
   });
+  supervisor?.emit({ type: 'meeting_lifecycle', meeting_id: 'meeting-1', state: 'active' });
+  supervisor?.emit({ type: 'meeting_lifecycle', meeting_id: 'another-meeting', state: 'ended' });
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(applied, [{
     meetingId: 'meeting-1',
     evidence: [{ source: 'zoom_ax', displayName: 'Akbar', startSample: 0, endSample: 320 }],
   }]);
+  assert.deepEqual(lifecycle, [{ meetingId: 'meeting-1', state: 'active' }]);
 
   await runtime.stop('meeting-1');
   assert.equal(supervisor?.stopCalls, 1);

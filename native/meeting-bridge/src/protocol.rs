@@ -19,7 +19,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     aec::{AecConfig, AecCoordinator, AecOutputRoute, AecProcessorChain, AecReferenceAlignment},
-    evidence::{poll_bounded, EvidenceError, MeetingEvidenceSource, SpeakerEvidence},
+    evidence::{
+        poll_bounded, EvidenceError, MeetingEvidenceSource, MeetingSurfaceObservation,
+        SpeakerEvidence,
+    },
     types::{
         AecEngine, AecFrameDisposition, AecFrameMetadata, AecHealth, AecReferenceTiming,
         AudioFrame, AudioFrameMetadata, CaptureHealth, Channel, FrameFlags,
@@ -36,6 +39,7 @@ const MIN_CONSECUTIVE_EVIDENCE_SAMPLES: u64 = 3_200;
 const MAX_CONSECUTIVE_EVIDENCE_GAP_SAMPLES: u64 = 12_000;
 const COMMAND_QUEUE_CAPACITY: usize = 32;
 const MAX_EVIDENCE_PER_POLL: usize = 8;
+const MEETING_END_MISSING_SURFACE_POLLS: u8 = 3;
 const AEC_SAMPLES_PER_FRAME: usize = 320;
 const AEC_PCM_BYTES_PER_FRAME: usize = AEC_SAMPLES_PER_FRAME * 2;
 const MAX_AEC_RESULT_FRAMES: usize = 8;
@@ -204,6 +208,10 @@ pub enum BridgeEvent {
     SpeakerEvidence {
         evidence: SpeakerEvidence,
     },
+    MeetingLifecycle {
+        meeting_id: String,
+        state: MeetingLifecycleState,
+    },
     Backpressure {
         channel: crate::types::Channel,
         dropped_frames: u64,
@@ -213,6 +221,13 @@ pub enum BridgeEvent {
         code: &'static str,
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingLifecycleState {
+    Active,
+    Ended,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -299,6 +314,9 @@ struct ActiveEvidence {
     meeting_id: String,
     source: Box<dyn MeetingEvidenceSource>,
     previous_active_points: HashMap<SpeakerKey, u64>,
+    meeting_surface_seen: bool,
+    missing_surface_polls: u8,
+    meeting_end_emitted: bool,
 }
 
 /// Per-meeting private AEC coordinator. It has no access to the renderer,
@@ -316,6 +334,41 @@ struct SpeakerKey {
 }
 
 impl ActiveEvidence {
+    fn lifecycle_event(&mut self) -> Option<BridgeEvent> {
+        match self.source.surface_observation() {
+            MeetingSurfaceObservation::Active => {
+                self.missing_surface_polls = 0;
+                if self.meeting_surface_seen {
+                    None
+                } else {
+                    self.meeting_surface_seen = true;
+                    Some(BridgeEvent::MeetingLifecycle {
+                        meeting_id: self.meeting_id.clone(),
+                        state: MeetingLifecycleState::Active,
+                    })
+                }
+            }
+            MeetingSurfaceObservation::Missing
+                if self.meeting_surface_seen && !self.meeting_end_emitted =>
+            {
+                self.missing_surface_polls = self.missing_surface_polls.saturating_add(1);
+                if self.missing_surface_polls < MEETING_END_MISSING_SURFACE_POLLS {
+                    return None;
+                }
+                self.meeting_end_emitted = true;
+                Some(BridgeEvent::MeetingLifecycle {
+                    meeting_id: self.meeting_id.clone(),
+                    state: MeetingLifecycleState::Ended,
+                })
+            }
+            MeetingSurfaceObservation::Unknown => {
+                self.missing_surface_polls = 0;
+                None
+            }
+            MeetingSurfaceObservation::Missing => None,
+        }
+    }
+
     /// Emits only intervals between two observations of the same named active
     /// speaker. A point can establish a baseline, never a future duration.
     fn consecutive_speaker_events(
@@ -405,6 +458,9 @@ impl<F: EvidenceSessionFactory> ControlHost<F> {
                             meeting_id: meeting_id.clone(),
                             source,
                             previous_active_points: HashMap::new(),
+                            meeting_surface_seen: false,
+                            missing_surface_polls: 0,
+                            meeting_end_emitted: false,
                         });
                 // Poll on the next turn rather than from the command handler,
                 // so the stdio loop remains the only stdout writer and every
@@ -623,7 +679,9 @@ impl<F: EvidenceSessionFactory> ControlHost<F> {
                 .active_evidence
                 .as_mut()
                 .map_or_else(Vec::new, |active| {
-                    active.consecutive_speaker_events(observations)
+                    let mut events = active.lifecycle_event().into_iter().collect::<Vec<_>>();
+                    events.extend(active.consecutive_speaker_events(observations));
+                    events
                 }),
             Err(error) => {
                 // A failed AX poll is not a reason to retain stale speaker
@@ -992,7 +1050,10 @@ mod tests {
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
     use crate::{
-        evidence::{EvidenceError, EvidenceSource, MeetingEvidenceSource, SpeakerEvidence},
+        evidence::{
+            EvidenceError, EvidenceSource, MeetingEvidenceSource, MeetingSurfaceObservation,
+            SpeakerEvidence,
+        },
         protocol::{
             write_event, BridgeEvent, ControlCommand, ControlHost, DisabledEvidenceFactory,
             EvidenceSessionFactory, PrivateAecInputFrame, PrivateAecOutputRoute, PrivateChannel,
@@ -1020,6 +1081,41 @@ mod tests {
     }
 
     impl EvidenceSessionFactory for FakeEvidenceFactory {
+        fn create(&mut self, _: &str, _: Instant) -> Option<Box<dyn MeetingEvidenceSource>> {
+            self.source
+                .take()
+                .map(|source| Box::new(source) as Box<dyn MeetingEvidenceSource>)
+        }
+    }
+
+    struct LifecycleEvidenceSource {
+        observations: VecDeque<MeetingSurfaceObservation>,
+        current: MeetingSurfaceObservation,
+    }
+
+    impl MeetingEvidenceSource for LifecycleEvidenceSource {
+        fn source_id(&self) -> &str {
+            "lifecycle_zoom_provider"
+        }
+
+        fn poll(&mut self, _: usize) -> Result<Vec<SpeakerEvidence>, EvidenceError> {
+            self.current = self
+                .observations
+                .pop_front()
+                .unwrap_or(MeetingSurfaceObservation::Unknown);
+            Ok(Vec::new())
+        }
+
+        fn surface_observation(&self) -> MeetingSurfaceObservation {
+            self.current
+        }
+    }
+
+    struct LifecycleEvidenceFactory {
+        source: Option<LifecycleEvidenceSource>,
+    }
+
+    impl EvidenceSessionFactory for LifecycleEvidenceFactory {
         fn create(&mut self, _: &str, _: Instant) -> Option<Box<dyn MeetingEvidenceSource>> {
             self.source
                 .take()
@@ -1276,6 +1372,55 @@ mod tests {
             (evidence.start_sample, evidence.end_sample),
             (16_000, 20_000)
         );
+    }
+
+    #[test]
+    fn validated_zoom_surface_emits_one_active_and_one_debounced_end_edge() {
+        let mut host = ControlHost::new(LifecycleEvidenceFactory {
+            source: Some(LifecycleEvidenceSource {
+                observations: VecDeque::from([
+                    MeetingSurfaceObservation::Active,
+                    MeetingSurfaceObservation::Missing,
+                    MeetingSurfaceObservation::Missing,
+                    MeetingSurfaceObservation::Missing,
+                    MeetingSurfaceObservation::Missing,
+                ]),
+                current: MeetingSurfaceObservation::Unknown,
+            }),
+        });
+        let now = Instant::now();
+        let _ = host.handle(
+            ControlCommand::Start {
+                meeting_id: "meeting".into(),
+                aec_output_route: None,
+            },
+            now,
+        );
+
+        assert!(matches!(
+            host.poll_due(now).as_slice(),
+            [BridgeEvent::MeetingLifecycle {
+                meeting_id,
+                state: super::MeetingLifecycleState::Active,
+            }] if meeting_id == "meeting"
+        ));
+        assert!(host
+            .poll_due(now + EVIDENCE_POLL_INTERVAL + Duration::from_millis(1))
+            .is_empty());
+        assert!(host
+            .poll_due(now + EVIDENCE_POLL_INTERVAL * 2 + Duration::from_millis(2))
+            .is_empty());
+        assert!(matches!(
+            host.poll_due(now + EVIDENCE_POLL_INTERVAL * 3 + Duration::from_millis(3))
+                .as_slice(),
+            [BridgeEvent::MeetingLifecycle {
+                meeting_id,
+                state: super::MeetingLifecycleState::Ended,
+            }] if meeting_id == "meeting"
+        ));
+        assert!(host
+            .poll_due(now + EVIDENCE_POLL_INTERVAL * 4 + Duration::from_millis(4))
+            .is_empty());
     }
 
     #[test]

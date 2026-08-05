@@ -138,8 +138,10 @@ resolver contract, and UI stay cross-platform in Rowboat/Electron/Rust.
 
 1. Keep independent mic and system capture at meeting start, with the
    audio-only/approved-fallback selection and source-specific recovery.
-2. Finish the durable local meeting lifecycle: live and refined append logs,
-   explicit stop/flush ordering, retry states, and no editor overwrite.
+2. Qualify the durable local meeting lifecycle across apps: live/refined append
+   logs, read-only database finalization, independently debounced platform end
+   evidence, explicit stop/flush ordering, retry states, and no editor
+   overwrite.
 3. Persist bounded speaker observations and the meeting-local `speakerMap`;
    surface `You`, a directly evidenced name, `Unknown speaker`, or overlap
    honestly.
@@ -176,7 +178,11 @@ For Rowboat's current implementation and physical acceptance limits, see
 ## Implemented local connector
 
 Rowboat now has an optional clean-room local connector that follows Wispr's
-local live/refined meeting artifacts and read-only meeting database. The
+local live/refined meeting artifacts and read-only meeting database. Numeric
+Wispr clusters are retained, explicit `speakerMap` assignments are applied in
+their recorded provenance order, and the existing native Zoom Accessibility
+adapter can provide timestamp-aligned names and a debounced end edge without
+opening a second audio stream. The
 installed 1.6.399 build contains an extension transcript callback, but the
 entire extension system is controlled by Wispr's `ExtensionSystem` feature
 flag; it was disabled for the qualified account. Rowboat therefore treats that

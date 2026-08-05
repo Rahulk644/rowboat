@@ -208,6 +208,12 @@ test('main supervisor uses private stdio, completes handshake, and exposes metad
       source: 'zoom_ax', confidence: 0.9, observedAtSample: 320, signals: ['active_speaker_label'],
     },
   });
+  child.stdout.write(`${JSON.stringify({
+    type: 'meeting_lifecycle', meeting_id: 'meeting-A', state: 'ended',
+  })}\n`);
+  assert.deepEqual(events[2], {
+    type: 'meeting_lifecycle', meeting_id: 'meeting-A', state: 'ended',
+  });
   const manySmallEvents = Array.from(
     { length: 2_100 },
     () => '{"type":"pong","request_id":"unused"}\n',

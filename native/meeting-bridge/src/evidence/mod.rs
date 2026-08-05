@@ -29,6 +29,16 @@ pub enum EvidenceSource {
     Correction,
 }
 
+/// One bounded platform-surface observation. Adapters report snapshots only;
+/// the bridge owns debouncing and is the sole authority that can emit an end
+/// edge after a previously validated meeting surface disappears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeetingSurfaceObservation {
+    Active,
+    Missing,
+    Unknown,
+}
+
 /// Normalized platform evidence compatible with Anarlog's `meeting_ax` output.
 /// `display_name` is optional because a trustworthy active-speaker signal can
 /// still be ambiguous and must fail closed in the identity resolver.
@@ -67,11 +77,15 @@ impl SpeakerEvidence {
     }
 }
 
-/// A platform adapter that has a bounded poll budget. It is deliberately not a
-/// lifecycle detector and never decides that a meeting starts/ends.
+/// A platform adapter that has a bounded poll budget. It never decides that a
+/// meeting starts or ends; it may only expose its latest validated surface
+/// snapshot for the bridge's independent lifecycle debouncer.
 pub trait MeetingEvidenceSource: Send {
     fn source_id(&self) -> &str;
     fn poll(&mut self, max_observations: usize) -> Result<Vec<SpeakerEvidence>, EvidenceError>;
+    fn surface_observation(&self) -> MeetingSurfaceObservation {
+        MeetingSurfaceObservation::Unknown
+    }
 }
 
 /// Enforce the bridge privacy/performance boundary even if an adapter regresses.

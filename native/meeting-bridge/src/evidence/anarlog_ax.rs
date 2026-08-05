@@ -7,7 +7,10 @@
 //! the provider and translation boundary narrow enough that it cannot leak an
 //! AX tree into Rowboat.
 
-use super::{EvidenceError, EvidenceSource, MeetingEvidenceSource, SpeakerEvidence};
+use super::{
+    EvidenceError, EvidenceSource, MeetingEvidenceSource, MeetingSurfaceObservation,
+    SpeakerEvidence,
+};
 
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
 use std::{
@@ -1578,6 +1581,7 @@ fn plausible_participant_name(name: &str) -> bool {
 pub struct AnarlogAxSource<P> {
     meeting_id: String,
     provider: P,
+    surface_observation: MeetingSurfaceObservation,
 }
 
 impl<P> AnarlogAxSource<P> {
@@ -1585,6 +1589,7 @@ impl<P> AnarlogAxSource<P> {
         Self {
             meeting_id: meeting_id.into(),
             provider,
+            surface_observation: MeetingSurfaceObservation::Unknown,
         }
     }
 }
@@ -1595,8 +1600,20 @@ impl<P: AnarlogAxProvider> MeetingEvidenceSource for AnarlogAxSource<P> {
     }
 
     fn poll(&mut self, max_observations: usize) -> Result<Vec<SpeakerEvidence>, EvidenceError> {
+        let inspections = match self.provider.inspect() {
+            Ok(inspections) => inspections,
+            Err(error) => {
+                self.surface_observation = MeetingSurfaceObservation::Unknown;
+                return Err(error);
+            }
+        };
+        self.surface_observation = if inspections.is_empty() {
+            MeetingSurfaceObservation::Missing
+        } else {
+            MeetingSurfaceObservation::Active
+        };
         let mut evidence = Vec::new();
-        for inspection in self.provider.inspect()? {
+        for inspection in inspections {
             evidence.extend(normalize_anarlog_inspection(&self.meeting_id, inspection));
             if evidence.len() >= max_observations.min(64) {
                 break;
@@ -1604,6 +1621,10 @@ impl<P: AnarlogAxProvider> MeetingEvidenceSource for AnarlogAxSource<P> {
         }
         evidence.truncate(max_observations.min(64));
         Ok(evidence)
+    }
+
+    fn surface_observation(&self) -> MeetingSurfaceObservation {
+        self.surface_observation
     }
 }
 

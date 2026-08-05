@@ -33,6 +33,7 @@ export type MeetingBridgeRuntimeOptions = {
     meetingId: string,
     evidence: readonly MeetingSpeakerEvidence[],
   ) => Promise<void> | void;
+  onMeetingLifecycle?: (meetingId: string, state: 'active' | 'ended') => Promise<void> | void;
 };
 
 export type MeetingBridgeRuntime = {
@@ -84,6 +85,17 @@ export function createMeetingBridgeRuntime(options: MeetingBridgeRuntimeOptions)
     // cannot delay the capture-ready boundary by the default five seconds.
     handshakeTimeoutMs: 1_000,
     onEvent: (event) => {
+      if (event.type === 'meeting_lifecycle') {
+        const activeMatch = activeMeetingId === event.meeting_id;
+        if (diagnostics) {
+          console.error(`[MeetingBridge] meeting lifecycle state=${event.state} activeMatch=${activeMatch}`);
+        }
+        if (!activeMatch) return;
+        void Promise.resolve()
+          .then(() => options.onMeetingLifecycle?.(event.meeting_id, event.state))
+          .catch(() => {});
+        return;
+      }
       if (event.type !== 'speaker_evidence') {
         if (diagnostics) {
           const detail = event.type === 'error' ? ` code=${event.code}` : '';

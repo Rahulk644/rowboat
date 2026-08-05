@@ -129,6 +129,7 @@ export type BridgeEvent =
       };
     }
   | { type: 'speaker_evidence'; evidence: BridgeSpeakerEvidence }
+  | { type: 'meeting_lifecycle'; meeting_id: string; state: 'active' | 'ended' }
   | { type: 'backpressure'; channel: 'mic' | 'system'; dropped_frames: number; capacity: number }
   | { type: 'error'; code: string; message: string };
 
@@ -878,6 +879,12 @@ function parseBridgeEvent(line: Buffer): BridgeEvent | PrivateAecResultEvent {
     case 'speaker_evidence':
       assertKeys(parsed, ['type', 'evidence']);
       return { type: 'speaker_evidence', evidence: parseSpeakerEvidence(parsed.evidence) };
+    case 'meeting_lifecycle': {
+      assertKeys(parsed, ['type', 'meeting_id', 'state']);
+      const state = string(parsed.state, 16);
+      if (state !== 'active' && state !== 'ended') throw new Error('invalid meeting lifecycle state');
+      return { type: 'meeting_lifecycle', meeting_id: string(parsed.meeting_id, 128), state };
+    }
     case 'backpressure':
       assertKeys(parsed, ['type', 'channel', 'dropped_frames', 'capacity']);
       return {

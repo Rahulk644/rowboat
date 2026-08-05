@@ -117,20 +117,6 @@ function updateSelfCaptureState() {
   setSelfCaptureActive(meetingRecordingActive || voiceCallActive);
 }
 
-// The bridge is strictly opt-in and owns no renderer audio path. It adds
-// trusted, main-process-only speaker observations to the existing session;
-// unavailable native capture therefore cannot prevent meeting transcription.
-const meetingBridgeRuntime = createMeetingBridgeRuntime({
-  paths: () => ({
-    repositoryRoot: resolveRowboatRepositoryRoot(app.getAppPath()),
-    resourcesPath: process.resourcesPath,
-    isPackaged: app.isPackaged,
-  }),
-  applySpeakerEvidence: (meetingId, evidence) => {
-    selfHostedMeetingTranscription.applySpeakerEvidence(meetingId, evidence);
-  },
-});
-
 function resolveWisprExtensionSourceRoot(): string {
   return app.isPackaged
     ? path.join(process.resourcesPath, 'wispr-flow')
@@ -142,6 +128,27 @@ const wisprNotetakerSource = new WisprNotetakerSource({
   onEvent: (event) => broadcastToWindows('meeting:wispr:event', event),
   onDetected: (event) => broadcastToWindows('meeting:wispr:meetingDetected', event),
   onEnded: (event) => broadcastToWindows('meeting:wispr:meetingEnded', event),
+});
+
+// The bridge is strictly opt-in and owns no renderer audio path. It adds
+// trusted, main-process-only speaker observations to either transcription
+// source; unavailable native capture therefore cannot prevent meeting text.
+const meetingBridgeRuntime = createMeetingBridgeRuntime({
+  paths: () => ({
+    repositoryRoot: resolveRowboatRepositoryRoot(app.getAppPath()),
+    resourcesPath: process.resourcesPath,
+    isPackaged: app.isPackaged,
+  }),
+  applySpeakerEvidence: (meetingId, evidence) => {
+    // Each source rejects an unrelated meeting id. Keep the routes isolated
+    // so one inactive provider cannot prevent the active provider receiving
+    // the same trusted, bounded Accessibility observation.
+    try { selfHostedMeetingTranscription.applySpeakerEvidence(meetingId, evidence); } catch { /* inactive */ }
+    wisprNotetakerSource.applySpeakerEvidence(meetingId, evidence);
+  },
+  onMeetingLifecycle: (meetingId, state) => {
+    if (state === 'ended') wisprNotetakerSource.notifyExternalMeetingEnded(meetingId);
+  },
 });
 
 /**
@@ -1101,13 +1108,34 @@ export function setupIpcHandlers() {
       return { success: true as const };
     },
     'meeting:wispr:begin': async (_event, args) => {
-      return wisprNotetakerSource.begin(args.rowboatMeetingId);
+      const warm = meetingBridgeRuntime.warm(args.rowboatMeetingId);
+      try {
+        const result = await wisprNotetakerSource.begin(args.rowboatMeetingId);
+        if (await warm) {
+          // Anchor the helper's monotonic 16 kHz evidence clock to the epoch
+          // used by Wispr's transcript entries immediately before Start.
+          wisprNotetakerSource.setEvidenceClockOrigin(args.rowboatMeetingId, Date.now());
+          await meetingBridgeRuntime.captureReady(args.rowboatMeetingId, false);
+        }
+        return result;
+      } catch (error) {
+        await meetingBridgeRuntime.stop(args.rowboatMeetingId);
+        throw error;
+      }
     },
     'meeting:wispr:finalize': async (_event, args) => {
-      return wisprNotetakerSource.finalize(args.rowboatMeetingId);
+      try {
+        return await wisprNotetakerSource.finalize(args.rowboatMeetingId);
+      } finally {
+        await meetingBridgeRuntime.stop(args.rowboatMeetingId);
+      }
     },
     'meeting:wispr:reset': async (_event, args) => {
-      await wisprNotetakerSource.reset(args.rowboatMeetingId);
+      try {
+        await wisprNotetakerSource.reset(args.rowboatMeetingId);
+      } finally {
+        if (args.rowboatMeetingId) await meetingBridgeRuntime.stop(args.rowboatMeetingId);
+      }
       return { success: true as const };
     },
     'meeting:transcription:begin': async (_event, args) => {
