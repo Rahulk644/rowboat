@@ -63,20 +63,23 @@ const LOCAL_ADHOC_PLUGIN_ENTITLEMENTS = [
     'com.apple.security.cs.allow-unsigned-executable-memory',
     'com.apple.security.cs.disable-library-validation',
 ];
+const MACOS_PRODUCT_NAME = MEETING_CONTRIBUTOR_BUILD ? 'Rowboat Meetings Dev' : 'Rowboat';
+const MACOS_APP_BUNDLE_NAME = `${MACOS_PRODUCT_NAME}.app`;
+const MACOS_HELPER_BUNDLE_PREFIX = `${path.sep}Frameworks${path.sep}${MACOS_PRODUCT_NAME} Helper`;
 const signingOptionsForFile = (filePath) => {
     // The Rust bridge and its model/library are not Electron processes. Keep
     // JIT and device entitlements out of that trust boundary.
     if (filePath.includes(`${path.sep}Resources${path.sep}meeting-bridge${path.sep}`)) {
         return { entitlements: [] };
     }
-    if (LOCAL_ADHOC_SIGNING && filePath.includes(`${path.sep}Frameworks${path.sep}Rowboat Helper`)) {
+    if (LOCAL_ADHOC_SIGNING && filePath.includes(MACOS_HELPER_BUNDLE_PREFIX)) {
         return {
             entitlements: filePath.includes('(Plugin).app')
                 ? LOCAL_ADHOC_PLUGIN_ENTITLEMENTS
                 : LOCAL_ADHOC_HELPER_ENTITLEMENTS,
         };
     }
-    if (path.basename(filePath) === 'Rowboat.app') {
+    if (path.basename(filePath) === MACOS_APP_BUNDLE_NAME) {
         return {
             // Independently ad-hoc-signed Mach-O files have no common Team ID,
             // so only local contributor bundles need library validation off.

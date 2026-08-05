@@ -64,11 +64,26 @@ function localVqePackageLayout(app) {
 
 export function meetingPackageLayout(app, contributorBuild = false) {
   const contents = path.join(app, 'Contents');
+  const productName = contributorBuild ? 'Rowboat Meetings Dev' : 'Rowboat';
+  const helperNames = [
+    `${productName} Helper`,
+    `${productName} Helper (GPU)`,
+    `${productName} Helper (Plugin)`,
+    `${productName} Helper (Renderer)`,
+  ];
   return Object.freeze({
     infoPlist: path.join(contents, 'Info.plist'),
     mainExecutable: path.join(contents, 'MacOS', contributorBuild ? 'Rowboat Meetings Dev' : 'rowboat'),
     bridge: path.join(contents, 'Resources', BRIDGE_NAME, 'darwin', BRIDGE_NAME),
     contributorMarker: path.join(contents, 'Resources', 'meeting-contributor-build.json'),
+    helperExecutables: helperNames.map((helperName) => path.join(
+      contents,
+      'Frameworks',
+      `${helperName}.app`,
+      'Contents',
+      'MacOS',
+      helperName,
+    )),
   });
 }
 
@@ -128,6 +143,15 @@ function signingDetails(app) {
     teamIdentifier,
     adHoc,
   };
+}
+
+function requireDisabledLibraryValidationEntitlement(executable, label) {
+  const entitlements = command('/usr/bin/codesign', ['-d', '--entitlements', ':-', executable]);
+  if (!/<key>com\.apple\.security\.cs\.disable-library-validation<\/key>\s*<true\s*\/>/.test(entitlements)) {
+    throw new Error(
+      `${label} is independently ad-hoc signed without com.apple.security.cs.disable-library-validation; macOS will reject the Electron framework at launch`,
+    );
+  }
 }
 
 /**
@@ -216,6 +240,16 @@ export function verifyMeetingPackage(app, {
     command('/usr/bin/codesign', ['--verify', '--strict', localVqeAssets.library]);
   }
   const signing = signingDetails(app);
+  if (requireContributorBuild && signing.adHoc) {
+    requireDisabledLibraryValidationEntitlement(layout.mainExecutable, 'Rowboat executable');
+    for (const helperExecutable of layout.helperExecutables) {
+      if (!fs.existsSync(helperExecutable)) {
+        throw new Error(`Required Electron helper is missing: ${helperExecutable}`);
+      }
+      requireRegularExecutable(helperExecutable, 'Electron helper');
+      requireDisabledLibraryValidationEntitlement(helperExecutable, path.basename(helperExecutable));
+    }
+  }
   if (requireStableTcc) requireStableTccIdentity(signing);
   return { bundleId, ...layout, ...(localVqeAssets ? { localVqeAssets } : {}), signing };
 }

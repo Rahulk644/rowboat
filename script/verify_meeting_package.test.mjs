@@ -16,11 +16,24 @@ test('meeting package layout is fixed beneath the Rowboat bundle resources', () 
     mainExecutable: '/tmp/Rowboat.app/Contents/MacOS/rowboat',
     bridge: '/tmp/Rowboat.app/Contents/Resources/meeting-bridge/darwin/meeting-bridge',
     contributorMarker: '/tmp/Rowboat.app/Contents/Resources/meeting-contributor-build.json',
+    helperExecutables: [
+      '/tmp/Rowboat.app/Contents/Frameworks/Rowboat Helper.app/Contents/MacOS/Rowboat Helper',
+      '/tmp/Rowboat.app/Contents/Frameworks/Rowboat Helper (GPU).app/Contents/MacOS/Rowboat Helper (GPU)',
+      '/tmp/Rowboat.app/Contents/Frameworks/Rowboat Helper (Plugin).app/Contents/MacOS/Rowboat Helper (Plugin)',
+      '/tmp/Rowboat.app/Contents/Frameworks/Rowboat Helper (Renderer).app/Contents/MacOS/Rowboat Helper (Renderer)',
+    ],
   });
+  const contributorLayout = meetingPackageLayout('/tmp/Rowboat Meetings Dev.app', true);
   assert.equal(
-    meetingPackageLayout('/tmp/Rowboat Meetings Dev.app', true).mainExecutable,
+    contributorLayout.mainExecutable,
     '/tmp/Rowboat Meetings Dev.app/Contents/MacOS/Rowboat Meetings Dev',
   );
+  assert.deepEqual(contributorLayout.helperExecutables, [
+    '/tmp/Rowboat Meetings Dev.app/Contents/Frameworks/Rowboat Meetings Dev Helper.app/Contents/MacOS/Rowboat Meetings Dev Helper',
+    '/tmp/Rowboat Meetings Dev.app/Contents/Frameworks/Rowboat Meetings Dev Helper (GPU).app/Contents/MacOS/Rowboat Meetings Dev Helper (GPU)',
+    '/tmp/Rowboat Meetings Dev.app/Contents/Frameworks/Rowboat Meetings Dev Helper (Plugin).app/Contents/MacOS/Rowboat Meetings Dev Helper (Plugin)',
+    '/tmp/Rowboat Meetings Dev.app/Contents/Frameworks/Rowboat Meetings Dev Helper (Renderer).app/Contents/MacOS/Rowboat Meetings Dev Helper (Renderer)',
+  ]);
 });
 
 test('CLI carries the explicit LocalVQE verification requirement into package verification', () => {
