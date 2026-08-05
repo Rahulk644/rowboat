@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import { buildDeepgramListenUrl } from '@/lib/deepgram-listen-url';
 import { finalizeDeepgramStream } from '@/lib/deepgram-finalize';
@@ -9,6 +9,11 @@ import {
     createIpcSelfHostedMeetingTransport,
     type CanonicalTranscriptUpdate,
 } from '@/lib/self-hosted-meeting-transcriber';
+import {
+    appendZoomSpeakerEvidence,
+    resolveZoomSpeakerForInterval,
+    type ZoomSpeakerEvent,
+} from '@/lib/zoom-speaker-evidence';
 
 export type MeetingTranscriptionState = 'idle' | 'connecting' | 'recording' | 'stopping';
 
@@ -188,6 +193,32 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
     const dateRef = useRef<string>('');
     const calendarEventRef = useRef<CalendarEventMeta | undefined>(undefined);
     const transcriptionProviderRef = useRef<MeetingTranscriptionProvider | undefined>(undefined);
+    const captureStartedAtMsRef = useRef<number>(0);
+    const zoomSpeakerTimelineRef = useRef<ZoomSpeakerEvent[]>([]);
+    const accessibilityWarningShownRef = useRef(false);
+
+    useEffect(() => window.ipc.on('meeting:zoomAccessibilityEvidence', (event) => {
+        if (event.type === 'speaker') {
+            zoomSpeakerTimelineRef.current = appendZoomSpeakerEvidence(
+                zoomSpeakerTimelineRef.current,
+                event,
+            );
+            return;
+        }
+        if (event.type === 'permission' && !event.trusted && !accessibilityWarningShownRef.current) {
+            accessibilityWarningShownRef.current = true;
+            toast.info('Enable Accessibility for Zoom speaker names', {
+                description: 'Recording still works, but names will use generic speaker labels until Rowboat is allowed in System Settings.',
+                duration: 10_000,
+                action: {
+                    label: 'Open Settings',
+                    onClick: () => {
+                        void window.ipc.invoke('app:openPrivacySettings', { section: 'accessibility' });
+                    },
+                },
+            });
+        }
+    }), []);
 
     const writeTranscriptToFile = useCallback(async () => {
         if (!notePathRef.current) return;
@@ -281,8 +312,24 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
             channelIndex,
             text,
             isFinal,
+            stableStartMs,
+            stableEndMs,
         }: CanonicalTranscriptUpdate) => {
-            const speaker = channelIndex === 0 ? 'You' : 'System audio';
+            let speaker = channelIndex === 0 ? 'You' : 'System audio';
+            if (
+                channelIndex === 1
+                && isFinal
+                && captureStartedAtMsRef.current > 0
+                && stableStartMs !== undefined
+                && stableEndMs !== undefined
+            ) {
+                speaker = resolveZoomSpeakerForInterval(
+                    zoomSpeakerTimelineRef.current,
+                    captureStartedAtMsRef.current + stableStartMs,
+                    captureStartedAtMsRef.current + stableEndMs,
+                    speaker,
+                );
+            }
             if (isFinal) {
                 interimRef.current.delete(channelIndex);
                 if (!text) return;
@@ -437,6 +484,8 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
         transcriptRef.current = [];
         interimRef.current = new Map();
         transcriptionProviderRef.current = providerResult.value.provider;
+        zoomSpeakerTimelineRef.current = [];
+        accessibilityWarningShownRef.current = false;
         if (providerResult.value.kind === 'deepgram') {
             const ws = providerResult.value.ws;
             wsRef.current = ws;
@@ -449,9 +498,25 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
                 const channelIndex = (data.channel_index?.[0] ?? 0) as 0 | 1;
                 const words = data.channel.alternatives[0].words;
                 const speakerId = words?.[0]?.speaker;
-                const speaker = channelIndex === 0
-                    ? 'You'
-                    : speakerId != null ? `Speaker ${speakerId}` : 'System audio';
+                let speaker = 'You';
+                if (channelIndex === 1) {
+                    const fallback = speakerId != null ? `Speaker ${speakerId}` : 'System audio';
+                    const now = Date.now();
+                    const relativeStartSeconds = typeof data.start === 'number' ? data.start : null;
+                    const durationSeconds = typeof data.duration === 'number' ? data.duration : null;
+                    const intervalStartMs = relativeStartSeconds !== null && captureStartedAtMsRef.current > 0
+                        ? captureStartedAtMsRef.current + relativeStartSeconds * 1_000
+                        : now - 2_500;
+                    const intervalEndMs = durationSeconds !== null
+                        ? intervalStartMs + durationSeconds * 1_000
+                        : now;
+                    speaker = resolveZoomSpeakerForInterval(
+                        zoomSpeakerTimelineRef.current,
+                        intervalStartMs,
+                        intervalEndMs,
+                        fallback,
+                    );
+                }
 
                 if (data.is_final) {
                     interimRef.current.delete(channelIndex);
@@ -548,6 +613,7 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
 
         const processor = audioCtx.createScriptProcessor(4096, 2, 2);
         processorRef.current = processor;
+        captureStartedAtMsRef.current = Date.now();
 
         processor.onaudioprocess = (e) => {
             const deepgram = wsRef.current?.readyState === WebSocket.OPEN ? wsRef.current : null;

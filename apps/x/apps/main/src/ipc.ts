@@ -92,6 +92,7 @@ import { notifyIfEnabled } from '@x/core/dist/application/notification/notifier.
 import { consumePendingToggleMeetingNotes, setTrayRecordingState } from './tray.js';
 import { closeMeetingPopup, getMeetingPopupPayload, handleMeetingPopupAction } from './meeting-popup.js';
 import { selfHostedMeetingTranscription } from './self-hosted-meeting-transcription.js';
+import { zoomAccessibilitySupervisor } from './zoom-accessibility.js';
 
 // Ambient meeting detection must ignore Rowboat's own mic use: meeting
 // capture and assistant voice/video calls both hold the mic. Either being
@@ -965,6 +966,19 @@ export function setupIpcHandlers() {
       setTrayRecordingState(args.recording);
       meetingRecordingActive = args.recording;
       updateSelfCaptureState();
+      if (args.recording) {
+        zoomAccessibilitySupervisor.start({
+          helperPath: path.join(__dirname, 'zoom-accessibility'),
+          onEvent: (event) => {
+            broadcastToWindows('meeting:zoomAccessibilityEvidence', event);
+          },
+          onMeetingEnded: () => {
+            broadcastToWindows('meeting:externalCallEnded', null);
+          },
+        });
+      } else {
+        zoomAccessibilitySupervisor.stop();
+      }
       // Recording started through another path — a lingering "Take Notes?"
       // popup is stale now.
       if (args.recording) closeMeetingPopup();
@@ -1015,6 +1029,7 @@ export function setupIpcHandlers() {
         camera: 'Privacy_Camera',
         'screen-recording': 'Privacy_ScreenCapture',
         'input-monitoring': 'Privacy_ListenEvent',
+        accessibility: 'Privacy_Accessibility',
       } as const;
       try {
         await shell.openExternal(
