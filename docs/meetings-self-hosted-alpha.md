@@ -60,8 +60,9 @@ Rowboat permits only a loopback HTTP STT URL. Reach the private VPS through a
 restricted SSH tunnel (or equivalent private VPN); never publish the service.
 
 ```sh
-# Keep this process alive; replace only the configured SSH alias.
-ssh -N -L 18091:127.0.0.1:8091 <restricted-vps-alias>
+# Keep this process alive. Replace only the final hostname/alias; do not type
+# angle brackets because zsh interprets them as redirection.
+ssh -N -L 127.0.0.1:18091:127.0.0.1:18091 restricted-vps-alias
 
 # Set only in the shell launching Rowboat.
 export ROWBOAT_MEETING_STT_URL=http://127.0.0.1:18091
