@@ -25,13 +25,18 @@ test('self-hosted provider stays loopback-only and completes two source sessions
   process.env.ROWBOAT_MEETING_STT_URL = 'https://speech.example.com';
   assert.throws(() => loadSelfHostedMeetingConfig(), /loopback URL/);
 
-  const requests: Array<{ path: string; session: string; bytes: number }> = [];
+  const requests: Array<{ path: string; session: string; language: string | null; bytes: number }> = [];
   globalThis.fetch = async (input, init) => {
     const url = new URL(input.toString());
     const headers = new Headers(init?.headers);
     const body = init?.body ? Buffer.from(init.body as ArrayBuffer) : Buffer.alloc(0);
     const session = url.searchParams.get('session') ?? '';
-    requests.push({ path: url.pathname, session, bytes: body.length });
+    requests.push({
+      path: url.pathname,
+      session,
+      language: url.searchParams.get('language'),
+      bytes: body.length,
+    });
     assert.equal(headers.get('Authorization'), `Bearer ${TOKEN}`);
     const payload = url.pathname === '/stream/feed' || url.pathname === '/stream/finalize'
       ? {
@@ -92,6 +97,10 @@ test('self-hosted provider stays loopback-only and completes two source sessions
     ],
   );
   assert.equal(requests[2].bytes, 4);
+  assert.deepEqual(
+    requests.filter(({ path }) => path === '/stream/begin').map(({ language }) => language),
+    ['auto', 'auto', 'auto', 'auto'],
+  );
 });
 
 test('canonical v2 segment merging is idempotent and accepts only higher revisions', () => {

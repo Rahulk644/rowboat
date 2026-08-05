@@ -504,7 +504,7 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
                 if (provider.reason) console.warn('[meeting] Self-hosted provider unavailable:', provider.reason);
                 if (provider.provider === 'self-hosted-nemotron') {
                     const meetingId = `rowboat-${crypto.randomUUID()}`;
-                    await window.ipc.invoke('meeting:transcription:begin', { meetingId, language: 'en' });
+                    await window.ipc.invoke('meeting:transcription:begin', { meetingId, language: 'auto' });
                     console.log('[meeting] Using self-hosted Nemotron provider');
                     return { kind: 'self-hosted' as const, meetingId };
                 }

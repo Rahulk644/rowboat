@@ -275,7 +275,11 @@ export class SelfHostedMeetingTranscription {
     const id = safeMeetingId(meetingId);
     if (this.active.has(id)) throw new Error('Meeting transcription session already exists');
     const sessions = { mic: `${id}.mic`, system: `${id}.system` } satisfies Record<MeetingAudioChannel, string>;
-    const normalizedLanguage = /^[a-z]{2}(?:-[A-Z]{2})?$/.test(language) ? language : 'en';
+    // The qualified Nemotron worker accepts automatic detection and its
+    // explicit English locale (`en-US`), but rejects bare ISO-639 values such
+    // as `en`. Keep mixed-language meetings on automatic detection; callers
+    // may opt into the one explicitly qualified locale when needed.
+    const normalizedLanguage = language.trim() === 'en-US' ? 'en-US' : 'auto';
     try {
       await this.beginSessions(config, sessions, normalizedLanguage);
       this.active.set(id, {
