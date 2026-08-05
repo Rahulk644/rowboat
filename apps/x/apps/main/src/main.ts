@@ -126,22 +126,30 @@ if (process.defaultApp) {
   app.setAsDefaultProtocolClient(DEEP_LINK_SCHEME);
 }
 
+function dispatchUrlForCurrentMode(url: string): void {
+  if (process.env.ROWBOAT_MEETING_ONLY === '1') {
+    console.log('[Main] Meeting-only mode ignored a deep link.');
+    return;
+  }
+  dispatchUrl(url);
+}
+
 // First-launch URL on Windows/Linux comes through argv.
 {
   const initialUrl = extractDeepLinkFromArgv(process.argv);
-  if (initialUrl) dispatchUrl(initialUrl);
+  if (initialUrl) dispatchUrlForCurrentMode(initialUrl);
 }
 
 // macOS sends URLs via 'open-url' (both first launch and while running).
 app.on("open-url", (event, url) => {
   event.preventDefault();
-  dispatchUrl(url);
+  dispatchUrlForCurrentMode(url);
 });
 
 // Subsequent launches on Windows/Linux land here via the single-instance lock.
 app.on("second-instance", (_event, argv) => {
   const url = extractDeepLinkFromArgv(argv);
-  if (url) dispatchUrl(url);
+  if (url) dispatchUrlForCurrentMode(url);
 });
 
 // Fix PATH for packaged Electron apps on macOS/Linux.
@@ -172,6 +180,23 @@ function initializeExecutionEnvironment(): void {
   }
 }
 initializeExecutionEnvironment();
+
+// Physical meeting qualification must not wake unrelated account connectors,
+// agents, analytics, or background knowledge jobs. This mode keeps only the
+// renderer, IPC, meeting detector/capture, tray, and the local session index.
+const MEETING_ONLY_MODE = process.env.ROWBOAT_MEETING_ONLY === '1';
+
+// Keep physical meeting qualification isolated from the operator's normal
+// Chromium cookies, cache, and permission state as well as their Rowboat
+// workspace. The launcher owns this temporary directory and its cleanup.
+const meetingProfileDir = process.env.ROWBOAT_MEETING_PROFILE_DIR?.trim();
+if (MEETING_ONLY_MODE && meetingProfileDir) {
+  if (!path.isAbsolute(meetingProfileDir)) {
+    throw new Error('ROWBOAT_MEETING_PROFILE_DIR must be an absolute path');
+  }
+  app.setPath('userData', path.join(meetingProfileDir, 'electron-user-data'));
+  app.setPath('sessionData', path.join(meetingProfileDir, 'electron-session-data'));
+}
 
 // Path resolution differs between development and production:
 const preloadPath = app.isPackaged
@@ -483,6 +508,23 @@ app.on('child-process-gone', (_event, details) => {
 });
 
 app.whenReady().then(async () => {
+  if (MEETING_ONLY_MODE) {
+    session.defaultSession.webRequest.onBeforeRequest(
+      { urls: ['http://*/*', 'https://*/*', 'ws://*/*', 'wss://*/*'] },
+      (details, callback) => {
+        const target = new URL(details.url);
+        const local =
+          target.hostname === 'localhost' ||
+          target.hostname === '127.0.0.1' ||
+          target.hostname === '::1';
+        if (!local) {
+          console.log(`[Main] Meeting-only mode blocked renderer request to ${target.origin}`);
+        }
+        callback({ cancel: !local });
+      },
+    );
+  }
+
   // Register custom protocol before creating window.
   // In production this serves the renderer SPA; in dev (and prod) it also
   // serves workspace files via app://workspace/<rel-path> for media previews.
@@ -490,15 +532,17 @@ app.whenReady().then(async () => {
 
   // Initialize auto-updater (no-ops in dev). Update state is pushed to the
   // renderer (updater:status), which owns the restart prompt — see updater.ts.
-  initUpdater();
+  if (!MEETING_ONLY_MODE) initUpdater();
 
   // The agent-slack CLI ships bundled with the app (.package/dist/agent-slack.cjs)
   // and is resolved per call by the shared executor in @x/core. Availability is
   // exposed to the UI via the slack:cliStatus IPC channel; this startup log is
   // diagnostics only.
-  getAgentSlackCliStatus().then((status) => {
-    console.log('[Slack] agent-slack CLI status:', status);
-  }).catch(() => { /* probe failures already surface through slack:cliStatus */ });
+  if (!MEETING_ONLY_MODE) {
+    getAgentSlackCliStatus().then((status) => {
+      console.log('[Slack] agent-slack CLI status:', status);
+    }).catch(() => { /* probe failures already surface through slack:cliStatus */ });
+  }
 
   // Initialize all config files before UI can access them
   await initConfigs();
@@ -507,19 +551,23 @@ app.whenReady().then(async () => {
   // while the app runs). Every consumer — catalog listings, the reasoning
   // capability gate — reads the on-disk cache only. Best-effort: failures
   // leave any existing cache in use and never block boot.
-  startModelsDevRefresh();
+  if (!MEETING_ONLY_MODE) startModelsDevRefresh();
 
   // PostHog identify() is idempotent — call it on every startup so existing
   // signed-in installs (and every cold start of v0.3.4+) get re-identified.
   // Otherwise main-process events stay anonymous until the user re-signs-in.
-  identifyIfSignedIn().catch((error) => {
-    console.error('[Analytics] Failed to identify on startup:', error);
-  });
+  if (!MEETING_ONLY_MODE) {
+    identifyIfSignedIn().catch((error) => {
+      console.error('[Analytics] Failed to identify on startup:', error);
+    });
+  }
   // Baseline the provider person properties (llm_provider_flavors et al) on
   // every launch — existing installs get them without any provider action.
-  syncModelProviderPersonProperties().catch((error) => {
-    console.error('[Analytics] Failed to sync provider properties:', error);
-  });
+  if (!MEETING_ONLY_MODE) {
+    syncModelProviderPersonProperties().catch((error) => {
+      console.error('[Analytics] Failed to sync provider properties:', error);
+    });
+  }
 
   registerBrowserControlService(new ElectronBrowserControlService());
   registerNotificationService(new ElectronNotificationService(APP_LAUNCHED_AT));
@@ -530,7 +578,7 @@ app.whenReady().then(async () => {
 
   // Quick-ask bar: global ⌥⇧Space summons a Spotlight-style ask-anything
   // window over whatever app the user is in.
-  initQuickAsk();
+  if (!MEETING_ONLY_MODE) initQuickAsk();
 
   // Start the Rowboat Apps server (per-app origins on 127.0.0.1:3210) BEFORE
   // the window and the long service-init chain below. The Apps view is
@@ -538,23 +586,27 @@ app.whenReady().then(async () => {
   // every app iframe hit connection-refused (blank app) for the first ~10s of
   // each launch. Route registration and the token cipher are synchronous;
   // the listen itself is fire-and-forget.
-  registerAppsHostApi();
+  if (!MEETING_ONLY_MODE) registerAppsHostApi();
   // GitHub publish token at rest: encrypt via the OS keychain when available
   // (core stays electron-free; the cipher is injected here).
-  setGithubTokenCipher({
-    isAvailable: () => safeStorage.isEncryptionAvailable(),
-    encrypt: (plain) => safeStorage.encryptString(plain).toString('base64'),
-    decrypt: (encrypted) => safeStorage.decryptString(Buffer.from(encrypted, 'base64')),
-  });
+  if (!MEETING_ONLY_MODE) {
+    setGithubTokenCipher({
+      isAvailable: () => safeStorage.isEncryptionAvailable(),
+      encrypt: (plain) => safeStorage.encryptString(plain).toString('base64'),
+      decrypt: (encrypted) => safeStorage.decryptString(Buffer.from(encrypted, 'base64')),
+    });
+  }
   // ChatGPT subscription tokens at rest: same keychain-backed cipher.
-  setChatGPTTokenCipher({
-    isAvailable: () => safeStorage.isEncryptionAvailable(),
-    encrypt: (plain) => safeStorage.encryptString(plain).toString('base64'),
-    decrypt: (encrypted) => safeStorage.decryptString(Buffer.from(encrypted, 'base64')),
-  });
-  initAppsServer().catch((error) => {
-    console.error('[Apps] Failed to start:', error);
-  });
+  if (!MEETING_ONLY_MODE) {
+    setChatGPTTokenCipher({
+      isAvailable: () => safeStorage.isEncryptionAvailable(),
+      encrypt: (plain) => safeStorage.encryptString(plain).toString('base64'),
+      decrypt: (encrypted) => safeStorage.decryptString(Buffer.from(encrypted, 'base64')),
+    });
+    initAppsServer().catch((error) => {
+      console.error('[Apps] Failed to start:', error);
+    });
+  }
 
   // Resident app (Granola-style): register as an OS login item once, on the
   // first packaged run — and on Windows, migrate pre-existing registrations
@@ -562,7 +614,7 @@ app.whenReady().then(async () => {
   // OS registry is the source of truth — the Settings toggle writes it
   // directly, and disabling the login item in System Settings sticks because
   // we never re-register on boot.
-  ensureLoginItemRegistration();
+  if (!MEETING_ONLY_MODE) ensureLoginItemRegistration();
 
   createWindow({ startHidden: wasLaunchedAtLogin() });
 
@@ -621,6 +673,21 @@ app.whenReady().then(async () => {
       win.webContents.send("meeting:externalCallEnded", null);
     },
   });
+
+  if (MEETING_ONLY_MODE) {
+    // Live meeting captions are persisted through the ordinary workspace
+    // path, so the editor still needs local file-change notifications even
+    // though connector and agent services stay disabled.
+    startWorkspaceWatcher();
+    try {
+      await container.resolve<ISessions>('sessions').initialize();
+    } finally {
+      markSessionsIndexReady();
+    }
+    app.on("activate", () => showApp());
+    console.log('[Main] Meeting-only mode active; external syncs and background agents are disabled.');
+    return;
+  }
 
   // Start workspace watcher as a main-process service
   // Watcher runs independently and catches ALL filesystem changes:

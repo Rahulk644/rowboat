@@ -81,6 +81,13 @@ export class GoogleClientFactory {
      * the dedup invariant.
      */
     static async getClient(): Promise<OAuth2Client | null> {
+        // Physical meeting qualification is intentionally incapable of using
+        // or refreshing the operator's Google credentials. Keep this guard at
+        // the provider boundary so a future IPC handler cannot bypass it.
+        if (process.env.ROWBOAT_MEETING_ONLY === '1') {
+            this.clearCache();
+            return null;
+        }
         if (this.inFlightClient) {
             return this.inFlightClient;
         }

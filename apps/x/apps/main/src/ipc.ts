@@ -99,6 +99,8 @@ import { createMeetingBridgeRuntime, resolveRowboatRepositoryRoot } from './meet
 // active suppresses "Meeting detected" prompts.
 let meetingRecordingActive = false;
 let voiceCallActive = false;
+const MEETING_ONLY_MODE = process.env.ROWBOAT_MEETING_ONLY === '1';
+const MEETING_ONLY_UNAVAILABLE = 'Unavailable in meeting-only mode.';
 // A successfully opened self-hosted session warms the native helper before
 // capture. It can start only when the renderer reports its graph is prepared,
 // anchoring both sample clocks at the same instant.
@@ -929,7 +931,9 @@ export function setupIpcHandlers() {
   // - warmSentContacts(): kicks off a background Gmail API sync of the SENT label
   //   for full historical coverage of people you've actually emailed.
   warmContactIndex();
-  warmSentContacts();
+  if (!MEETING_ONLY_MODE) {
+    warmSentContacts();
+  }
 
   registerIpcHandlers({
     'app:getVersions': async () => {
@@ -1568,18 +1572,22 @@ export function setupIpcHandlers() {
       return { success: true };
     },
     'oauth:connect': async (_event, args) => {
+      if (MEETING_ONLY_MODE) return { success: false, error: MEETING_ONLY_UNAVAILABLE };
       const credentials = args.clientId && args.clientSecret
         ? { clientId: args.clientId.trim(), clientSecret: args.clientSecret.trim() }
         : undefined;
       return await connectProvider(args.provider, credentials);
     },
     'oauth:disconnect': async (_event, args) => {
+      if (MEETING_ONLY_MODE) return { success: false };
       return await disconnectProvider(args.provider);
     },
     'oauth:list-providers': async () => {
+      if (MEETING_ONLY_MODE) return { providers: [] };
       return listProviders();
     },
     'oauth:getState': async () => {
+      if (MEETING_ONLY_MODE) return { config: {} };
       const repo = container.resolve<IOAuthRepo>('oauthRepo');
       const config = await repo.getClientFacingConfig();
       return { config };
@@ -1613,6 +1621,7 @@ export function setupIpcHandlers() {
       }
     },
     'account:getRowboat': async () => {
+      if (MEETING_ONLY_MODE) return { signedIn: false, accessToken: null };
       const signedIn = await isSignedIn();
       if (!signedIn) {
         return { signedIn: false, accessToken: null };
@@ -1628,6 +1637,7 @@ export function setupIpcHandlers() {
     // BYOK users need its model recommendations when connecting a provider).
     // getRowboatConfig caches once per app run; best-effort null on failure.
     'rowboat:getConfig': async () => {
+      if (MEETING_ONLY_MODE) return null;
       return await getRowboatConfig().catch(() => null);
     },
     'granola:getConfig': async () => {
@@ -1917,6 +1927,9 @@ export function setupIpcHandlers() {
       return { channels };
     },
     'slack:getRecentMessages': async (_event, args) => {
+      if (MEETING_ONLY_MODE) {
+        return { enabled: false, messages: [], error: MEETING_ONLY_UNAVAILABLE, errorKind: 'network' as const };
+      }
       const repo = container.resolve<ISlackConfigRepo>('slackConfigRepo');
       const config = await repo.getConfig();
       if (!config.enabled || config.workspaces.length === 0) {
@@ -2037,37 +2050,48 @@ export function setupIpcHandlers() {
     },
     // Composio integration handlers
     'composio:is-configured': async () => {
+      if (MEETING_ONLY_MODE) return { configured: false };
       return composioHandler.isConfigured();
     },
     'composio:set-api-key': async (_event, args) => {
+      if (MEETING_ONLY_MODE) return { success: false, error: MEETING_ONLY_UNAVAILABLE };
       return composioHandler.setApiKey(args.apiKey);
     },
     'composio:initiate-connection': async (_event, args) => {
+      if (MEETING_ONLY_MODE) return { success: false, error: MEETING_ONLY_UNAVAILABLE };
       return composioHandler.initiateConnection(args.toolkitSlug);
     },
     'composio:get-connection-status': async (_event, args) => {
+      if (MEETING_ONLY_MODE) return { isConnected: false };
       return composioHandler.getConnectionStatus(args.toolkitSlug);
     },
     'composio:sync-connection': async (_event, args) => {
+      if (MEETING_ONLY_MODE) return { status: 'DISABLED' };
       return composioHandler.syncConnection(args.toolkitSlug, args.connectedAccountId);
     },
     'composio:disconnect': async (_event, args) => {
+      if (MEETING_ONLY_MODE) return { success: false };
       return composioHandler.disconnect(args.toolkitSlug);
     },
     'composio:list-connected': async () => {
+      if (MEETING_ONLY_MODE) return { toolkits: [] };
       return composioHandler.listConnected();
     },
     // Composio Tools Library handlers
     'composio:list-toolkits': async () => {
+      if (MEETING_ONLY_MODE) return { items: [], nextCursor: null, totalItems: 0 };
       return composioHandler.listToolkits();
     },
     'composio:execute-tool': async (_event, args) => {
+      if (MEETING_ONLY_MODE) return { successful: false, error: MEETING_ONLY_UNAVAILABLE };
       return composioHandler.executeTool(args.toolkitSlug, args.toolSlug, args.arguments);
     },
     'composio:search-tools': async (_event, args) => {
+      if (MEETING_ONLY_MODE) return { tools: [], error: MEETING_ONLY_UNAVAILABLE };
       return composioHandler.searchToolsInToolkit(args.toolkitSlug, args.query);
     },
     'migration:check-composio-google': async () => {
+      if (MEETING_ONLY_MODE) return { shouldShow: false };
       return qualifyAndDisconnectComposioGoogle();
     },
     // Rowboat Apps handlers (spec §13)
@@ -2951,6 +2975,7 @@ export function setupIpcHandlers() {
     },
     // Billing handler
     'billing:getInfo': async () => {
+      if (MEETING_ONLY_MODE) throw new Error(MEETING_ONLY_UNAVAILABLE);
       return await getBillingInfo();
     },
     // First-time-action credit rewards

@@ -21,6 +21,7 @@ import {
     SelfHostedMeetingAudioClock,
     type CapturedSelfHostedAudio,
 } from '@/lib/self-hosted-meeting-audio-clock';
+import { CoalescedAsyncWriter } from '@/lib/coalesced-async-writer';
 
 export type MeetingTranscriptionState = 'idle' | 'connecting' | 'recording' | 'stopping';
 
@@ -203,7 +204,7 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
     const legacySegmentSequenceRef = useRef<Record<SelfHostedChannel, number>>({ mic: 0, system: 0 });
     const legacyInterimRevisionRef = useRef<Record<SelfHostedChannel, number>>({ mic: 0, system: 0 });
     const notePathRef = useRef<string>('');
-    const writeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const transcriptWriterRef = useRef<CoalescedAsyncWriter | null>(null);
     const transcriptBlockMissingNotifiedRef = useRef(false);
     // Silence detection: timestamp of the last speech-level audio on either
     // channel, plus the interval that checks it. calendarEndMsRef holds the
@@ -254,10 +255,8 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
     }, []);
 
     const scheduleDebouncedWrite = useCallback(() => {
-        if (writeTimerRef.current) clearTimeout(writeTimerRef.current);
-        writeTimerRef.current = setTimeout(() => {
-            void writeTranscriptToFile();
-        }, 1000);
+        transcriptWriterRef.current ??= new CoalescedAsyncWriter(writeTranscriptToFile, 1000);
+        transcriptWriterRef.current.schedule();
     }, [writeTranscriptToFile]);
 
     const upsertSegments = useCallback((incoming: TranscriptSegment[]) => {
@@ -464,10 +463,8 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
     }, []);
 
     const cleanup = useCallback(() => {
-        if (writeTimerRef.current) {
-            clearTimeout(writeTimerRef.current);
-            writeTimerRef.current = null;
-        }
+        transcriptWriterRef.current?.cancel();
+        transcriptWriterRef.current = null;
         if (silenceCheckRef.current) {
             clearInterval(silenceCheckRef.current);
             silenceCheckRef.current = null;
@@ -510,7 +507,12 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
                 if (provider.reason) console.warn('[meeting] Self-hosted provider unavailable:', provider.reason);
                 if (provider.provider === 'self-hosted-nemotron') {
                     const meetingId = `rowboat-${crypto.randomUUID()}`;
-                    await window.ipc.invoke('meeting:transcription:begin', { meetingId, language: 'auto' });
+                    // English is the product default for meetings. Automatic
+                    // language detection repeatedly rendered Indian-English
+                    // speech in Devanagari during the physical Zoom run; a
+                    // future explicit language control can opt mixed calls
+                    // back into `auto` without degrading the default path.
+                    await window.ipc.invoke('meeting:transcription:begin', { meetingId, language: 'en-US' });
                     console.log('[meeting] Using self-hosted Nemotron provider');
                     return { kind: 'self-hosted' as const, meetingId };
                 }
