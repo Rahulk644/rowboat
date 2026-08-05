@@ -904,6 +904,11 @@ fn find_zoom_active_speakers(
     names: &mut HashSet<String>,
 ) -> Vec<AnarlogParticipantStream> {
     let mut streams = Vec::new();
+    // A participant row can establish only the local user's name, and only
+    // within this already-validated Zoom meeting window. It is never emitted
+    // as speaker evidence by itself; it can merely mark an independently
+    // explicit active-speaker label for that exact same name as self.
+    let participants_self_name = zoom_participants_self_name(nodes);
     for node in nodes {
         if is_text_input_role(node.role.as_deref()) {
             continue;
@@ -912,7 +917,7 @@ fn find_zoom_active_speakers(
             node.role.as_deref(),
             Some("AXGroup") | Some("AXCell") | Some("AXRow")
         );
-        let Some((label, name, is_self)) = node_labels(node).find_map(|label| {
+        let Some((label, name, label_marks_self)) = node_labels(node).find_map(|label| {
             let lower = label.trim().to_ascii_lowercase();
             (state_container || lower.starts_with("talking:") || lower.starts_with("video render "))
                 .then(|| parse_zoom_active_speaker_label(label))
@@ -923,9 +928,16 @@ fn find_zoom_active_speakers(
         if !names.insert(name.to_ascii_lowercase()) {
             continue;
         }
+        let is_participants_self_match = participants_self_name
+            .as_deref()
+            .is_some_and(|self_name| name.eq_ignore_ascii_case(self_name));
+        let is_self = label_marks_self || is_participants_self_match;
         let mut signals = vec!["speaker-state-label".to_string()];
         if label.to_ascii_lowercase().starts_with("video render ") {
             signals.push("video-label".to_string());
+        }
+        if is_participants_self_match && !label_marks_self {
+            signals.push("participants-self-match".to_string());
         }
         streams.push(AnarlogParticipantStream {
             participant_id: Some(format!("ax-element-{:x}", node.element_hash)),
@@ -991,19 +1003,40 @@ fn is_text_input_role(role: Option<&str>) -> bool {
     )
 }
 
+/// Return one self name only from an exact participant-row marker in a Zoom
+/// meeting window that also exposes the native Participants control. This is
+/// intentionally not a generic roster parser: ambiguous/missing rows are
+/// ignored, and the result is used only to classify an explicit speaker label.
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn zoom_participants_self_name(nodes: &[ZoomAxNode]) -> Option<String> {
+    let has_participants_control = nodes.iter().any(|node| {
+        !is_text_input_role(node.role.as_deref())
+            && node_labels(node).any(is_zoom_participants_control_label)
+    });
+    if !has_participants_control {
+        return None;
+    }
+
+    let self_names = nodes
+        .iter()
+        .filter(|node| node.role.as_deref() == Some("AXRow"))
+        .filter(|node| !is_text_input_role(node.role.as_deref()))
+        .flat_map(node_labels)
+        .filter_map(parse_zoom_participant_self_row_label)
+        .map(|name| name.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    (self_names.len() == 1)
+        .then(|| self_names.into_iter().next())
+        .flatten()
+}
+
 /// Adapted from Anarlog's `participant_name_from_speaker_label` at the pinned
 /// revision. It accepts only explicit speaker-state labels and rejects generic
 /// subject words, so a participant roster cannot become a false speaker claim.
 #[cfg(any(test, all(target_os = "macos", feature = "anarlog-ax")))]
 fn parse_zoom_active_speaker_label(label: &str) -> Option<(&str, String, bool)> {
     let label = label.trim();
-    let lower = label.to_ascii_lowercase();
-    let is_self = lower.ends_with(" (you)");
-    let without_self = if is_self {
-        &label[..label.len() - " (you)".len()]
-    } else {
-        label
-    };
+    let (without_self, is_self) = strip_zoom_self_suffix(label);
     let lower = without_self.to_ascii_lowercase();
     let name = if lower.starts_with("active speaker: ") {
         &without_self["active speaker: ".len()..]
@@ -1027,6 +1060,41 @@ fn parse_zoom_active_speaker_label(label: &str) -> Option<(&str, String, bool)> 
             rest.split(',').next().unwrap_or_default().trim()
         });
     plausible_participant_name(name).then(|| (label, name.to_string(), is_self))
+}
+
+/// Zoom's current English self markers vary by account role. They are parsed
+/// only after an explicit active-speaker grammar has matched; a suffix alone
+/// is never speaker evidence.
+#[cfg(any(test, all(target_os = "macos", feature = "anarlog-ax")))]
+fn strip_zoom_self_suffix(label: &str) -> (&str, bool) {
+    const SELF_SUFFIXES: &[&str] = &[" (you)", " (me)", " (host, me)", " (co-host, me)"];
+    let lower = label.to_ascii_lowercase();
+    for suffix in SELF_SUFFIXES {
+        if lower.ends_with(suffix) {
+            return (&label[..label.len() - suffix.len()], true);
+        }
+    }
+    (label, false)
+}
+
+/// Participant rows are passive identity evidence. Accept only a bare,
+/// plausible name with a current Zoom self suffix; active-state labels, video
+/// labels, punctuation-delimited UI phrases, and generic roster text remain
+/// out of this path.
+#[cfg(any(test, all(target_os = "macos", feature = "anarlog-ax")))]
+fn parse_zoom_participant_self_row_label(label: &str) -> Option<String> {
+    let label = label.trim();
+    if parse_zoom_active_speaker_label(label).is_some() {
+        return None;
+    }
+    let (name, is_self) = strip_zoom_self_suffix(label);
+    let name = name.trim();
+    (is_self
+        && !name.to_ascii_lowercase().starts_with("video render ")
+        && !name.contains(':')
+        && !name.contains(','))
+    .then(|| plausible_participant_name(name).then(|| name.to_string()))
+    .flatten()
 }
 
 #[cfg(any(test, all(target_os = "macos", feature = "anarlog-ax")))]
@@ -1157,8 +1225,8 @@ fn source_for_platform(platform: &str) -> EvidenceSource {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_anarlog_inspection, parse_zoom_active_speaker_label, AnarlogInspection,
-        AnarlogParticipantStream,
+        normalize_anarlog_inspection, parse_zoom_active_speaker_label,
+        parse_zoom_participant_self_row_label, AnarlogInspection, AnarlogParticipantStream,
     };
     use crate::evidence::EvidenceSource;
 
@@ -1223,6 +1291,37 @@ mod tests {
             .expect("explicit self speaker");
         assert_eq!(parsed.1, "Grace Hopper");
         assert!(parsed.2);
+    }
+
+    #[test]
+    fn accepts_current_zoom_self_suffixes_only_on_explicit_speaker_labels() {
+        for label in [
+            "Talking: Rahul Khatri (me)",
+            "Rahul Khatri, active speaker (Host, me)",
+            "Video render Rahul Khatri, active speaker (Co-host, me)",
+        ] {
+            let parsed = parse_zoom_active_speaker_label(label).expect("explicit self speaker");
+            assert_eq!(parsed.1, "Rahul Khatri");
+            assert!(parsed.2, "{label}");
+        }
+
+        // Muted/video labels establish a meeting surface but are not an
+        // active-speaker assertion, even when they contain a local name.
+        assert!(
+            parse_zoom_active_speaker_label("Video render Rahul Khatri, Computer audio muted")
+                .is_none()
+        );
+        assert!(parse_zoom_active_speaker_label("Rahul Khatri (Host, me)").is_none());
+    }
+
+    #[test]
+    fn accepts_a_bare_self_marked_participant_row_but_not_a_speaking_label() {
+        assert_eq!(
+            parse_zoom_participant_self_row_label("Rahul Khatri (Host, me)").as_deref(),
+            Some("Rahul Khatri")
+        );
+        assert!(parse_zoom_participant_self_row_label("Talking: Rahul Khatri (me)").is_none());
+        assert!(parse_zoom_participant_self_row_label("Rahul Khatri (Host, me), muted").is_none());
     }
 
     #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
@@ -1361,6 +1460,44 @@ mod tests {
             streams[0].participant_name.as_deref(),
             Some("Rakshit Singh")
         );
+    }
+
+    #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+    #[test]
+    fn participant_self_row_only_classifies_a_matching_explicit_speaker() {
+        let mut names = HashSet::new();
+        let streams = find_zoom_active_speakers(
+            &[
+                zoom_node(1, "AXButton", "Participants"),
+                zoom_node(2, "AXRow", "Rahul Khatri (Host, me)"),
+                zoom_node(3, "AXStaticText", "Talking: Rahul Khatri"),
+                zoom_node(4, "AXStaticText", "Talking: Vikram Prasanna"),
+            ],
+            &mut names,
+        );
+
+        assert_eq!(streams.len(), 2);
+        assert_eq!(streams[0].participant_name.as_deref(), Some("Rahul Khatri"));
+        assert_eq!(streams[0].is_self, Some(true));
+        assert!(streams[0]
+            .signals
+            .iter()
+            .any(|signal| signal == "participants-self-match"));
+        assert_eq!(
+            streams[1].participant_name.as_deref(),
+            Some("Vikram Prasanna")
+        );
+        assert_eq!(streams[1].is_self, Some(false));
+
+        let mut roster_only_names = HashSet::new();
+        let roster_only = find_zoom_active_speakers(
+            &[
+                zoom_node(5, "AXButton", "Participants"),
+                zoom_node(6, "AXRow", "Rahul Khatri (Host, me)"),
+            ],
+            &mut roster_only_names,
+        );
+        assert!(roster_only.is_empty());
     }
 
     #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
