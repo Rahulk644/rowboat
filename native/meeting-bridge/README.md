@@ -138,6 +138,13 @@ command or the next poll deadline. Permission or backend failure stops the
 evidence session and emits one bounded error; it never leaves stale speaker
 evidence active or retries in a tight loop.
 
+For a terminal-only physical qualification, set
+`ROWBOAT_MEETING_BRIDGE_AX_DIAGNOSTICS=1` before starting a feature-enabled
+helper. It writes a changed-state summary to stderr with Accessibility trust,
+process/surface counts, and validation outcome only. It never prints AX labels,
+speaker names, window titles, values, bounds, or process identifiers. This
+diagnostic is not forwarded by Electron and is off unless explicitly set.
+
 Default/non-macOS builds retain the existing fail-closed `start` response:
 `source_configuration_required`. Electron main must continue using Rowboat's
 selected capture path for audio. Do not enable this alpha in a package until

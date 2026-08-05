@@ -23,6 +23,10 @@ const MAX_TREE_DEPTH: usize = 18;
 const MAX_NODES: usize = 1_800;
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
 const MAX_WINDOWS: usize = 8;
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+const MAX_AUXILIARY_DIALOGS: usize = 4;
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+const AX_DIAGNOSTICS_ENV: &str = "ROWBOAT_MEETING_BRIDGE_AX_DIAGNOSTICS";
 
 /// The fields the bridge accepts from Anarlog's participant stream. Screen
 /// bounds are intentionally excluded: Rowboat needs evidence, not layout.
@@ -64,6 +68,7 @@ pub trait AnarlogAxProvider: Send {
 #[derive(Debug)]
 pub struct MacosZoomAnarlogProvider {
     meeting_started_at: Instant,
+    last_diagnostics: Option<AxDiagnostics>,
 }
 
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
@@ -73,12 +78,31 @@ impl MacosZoomAnarlogProvider {
     /// transcript audio intervals without exposing wall-clock meeting data.
     #[must_use]
     pub fn new(meeting_started_at: Instant) -> Self {
-        Self { meeting_started_at }
+        Self {
+            meeting_started_at,
+            last_diagnostics: None,
+        }
     }
 
     fn observed_at_sample(&self) -> u64 {
         let micros = self.meeting_started_at.elapsed().as_micros();
         micros.saturating_mul(16).min(u128::from(u64::MAX)) as u64
+    }
+
+    /// Direct-helper diagnostics are deliberately opt-in and summary-only.
+    /// They expose traversal counts/reasons, never AX labels, titles, values,
+    /// names, process identifiers, or window bounds. Electron intentionally
+    /// drains helper stderr, so this is for a terminal-driven physical
+    /// qualification run only.
+    fn emit_diagnostics_if_changed(&mut self, diagnostics: AxDiagnostics) {
+        if !ax_diagnostics_enabled() || self.last_diagnostics.as_ref() == Some(&diagnostics) {
+            return;
+        }
+        eprintln!(
+            "meeting-bridge AX diagnostic: trusted={} zoom_processes={} outcomes={:?}",
+            diagnostics.trusted, diagnostics.zoom_processes, diagnostics.outcomes
+        );
+        self.last_diagnostics = Some(diagnostics);
     }
 }
 
@@ -86,19 +110,25 @@ impl MacosZoomAnarlogProvider {
 impl AnarlogAxProvider for MacosZoomAnarlogProvider {
     fn inspect(&mut self) -> Result<Vec<AnarlogInspection>, EvidenceError> {
         if !macos_accessibility_client::accessibility::application_is_trusted() {
+            self.emit_diagnostics_if_changed(AxDiagnostics::permission_denied());
             return Err(EvidenceError::PermissionDenied);
         }
 
         let observed_at_sample = self.observed_at_sample();
         let bundle_id = ns::String::with_str(ZOOM_BUNDLE_ID);
         let mut inspections = Vec::new();
+        let mut zoom_processes = 0;
+        let mut outcomes = Vec::new();
         for app in ns::RunningApp::with_bundle_id(&bundle_id).iter() {
+            zoom_processes += 1;
             let ax_app = ax::UiElement::with_app_pid(app.pid());
             // Anarlog's per-process cap prevents an unresponsive AX target
             // from stalling capture/transport. Treat any inaccessible tree as
             // no evidence rather than guessing a speaker.
             let _ = ax_app.set_messaging_timeout_secs(0.6);
-            if let Some(active_speakers) = inspect_zoom_process(&ax_app) {
+            let inspection = inspect_zoom_process(&ax_app);
+            outcomes.push(inspection.diagnostic);
+            if let Some(active_speakers) = inspection.active_speakers {
                 inspections.push(AnarlogInspection {
                     platform: "zoom".to_string(),
                     surface: "native".to_string(),
@@ -107,37 +137,139 @@ impl AnarlogAxProvider for MacosZoomAnarlogProvider {
                 });
             }
         }
+        self.emit_diagnostics_if_changed(AxDiagnostics::trusted(zoom_processes, outcomes));
         Ok(inspections)
     }
 }
 
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
-fn inspect_zoom_process(ax_app: &ax::UiElement) -> Option<Vec<AnarlogParticipantStream>> {
-    let mut windows = Vec::new();
-    let mut visited = 0;
-    if !collect_windows(ax_app, 0, &mut visited, &mut windows) || windows.len() > MAX_WINDOWS {
-        return None;
+#[derive(Debug)]
+struct ZoomProcessInspection {
+    active_speakers: Option<Vec<AnarlogParticipantStream>>,
+    diagnostic: ZoomAxDiagnostic,
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ZoomAxDiagnostic {
+    SurfaceTraversalRejected {
+        primary_windows: usize,
+        top_level_dialogs: usize,
+    },
+    SurfaceNodeTraversalRejected {
+        primary_windows: usize,
+        top_level_dialogs: usize,
+    },
+    MeetingWindowCount {
+        primary_windows: usize,
+        validated_meetings: usize,
+        top_level_dialogs: usize,
+    },
+    ValidatedMeeting {
+        primary_windows: usize,
+        top_level_dialogs: usize,
+        active_speaker_labels: usize,
+    },
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AxDiagnostics {
+    trusted: bool,
+    zoom_processes: usize,
+    outcomes: Vec<ZoomAxDiagnostic>,
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+impl AxDiagnostics {
+    fn permission_denied() -> Self {
+        Self {
+            trusted: false,
+            zoom_processes: 0,
+            outcomes: Vec::new(),
+        }
     }
+
+    fn trusted(zoom_processes: usize, outcomes: Vec<ZoomAxDiagnostic>) -> Self {
+        Self {
+            trusted: true,
+            zoom_processes,
+            outcomes,
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn ax_diagnostics_enabled() -> bool {
+    std::env::var_os(AX_DIAGNOSTICS_ENV).is_some_and(|value| value == "1")
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn inspect_zoom_process(ax_app: &ax::UiElement) -> ZoomProcessInspection {
+    let mut windows = Vec::new();
+    let mut auxiliary_dialogs = Vec::new();
+    let mut visited = 0;
+    if !collect_zoom_surfaces(
+        ax_app,
+        0,
+        &mut visited,
+        &mut windows,
+        &mut auxiliary_dialogs,
+    ) || windows.len() > MAX_WINDOWS
+        || auxiliary_dialogs.len() > MAX_AUXILIARY_DIALOGS
+    {
+        return ZoomProcessInspection {
+            active_speakers: None,
+            diagnostic: ZoomAxDiagnostic::SurfaceTraversalRejected {
+                primary_windows: windows.len(),
+                top_level_dialogs: auxiliary_dialogs.len(),
+            },
+        };
+    }
+    let primary_window_count = windows.len();
+    let top_level_dialog_count = auxiliary_dialogs.len();
 
     let mut window_nodes = Vec::new();
     for window in windows {
         let mut nodes = Vec::new();
         if !collect_nodes(&window, 0, &mut nodes) {
-            return None;
+            return ZoomProcessInspection {
+                active_speakers: None,
+                diagnostic: ZoomAxDiagnostic::SurfaceNodeTraversalRejected {
+                    primary_windows: primary_window_count,
+                    top_level_dialogs: top_level_dialog_count,
+                },
+            };
         }
         window_nodes.push(nodes);
     }
-    inspect_zoom_windows(window_nodes)
+
+    let mut auxiliary_dialog_nodes = Vec::new();
+    for dialog in auxiliary_dialogs {
+        let mut nodes = Vec::new();
+        if !collect_nodes(&dialog, 0, &mut nodes) {
+            return ZoomProcessInspection {
+                active_speakers: None,
+                diagnostic: ZoomAxDiagnostic::SurfaceNodeTraversalRejected {
+                    primary_windows: primary_window_count,
+                    top_level_dialogs: top_level_dialog_count,
+                },
+            };
+        }
+        auxiliary_dialog_nodes.push(nodes);
+    }
+    inspect_zoom_windows(window_nodes, auxiliary_dialog_nodes)
 }
 
 /// One validated meeting surface proves that this Zoom process is in a call.
-/// With that proof, small auxiliary Zoom surfaces (such as the floating
-/// speaking-state dialog) may contribute only an explicit `Talking: Name`
-/// assertion. Their other labels never become speaker evidence.
+/// With that proof, bounded Zoom windows and top-level macOS system dialogs
+/// may contribute only an explicit `Talking: Name` assertion. Their other
+/// labels never become speaker evidence.
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
 fn inspect_zoom_windows(
     window_nodes: Vec<Vec<ZoomAxNode>>,
-) -> Option<Vec<AnarlogParticipantStream>> {
+    auxiliary_dialog_nodes: Vec<Vec<ZoomAxNode>>,
+) -> ZoomProcessInspection {
     let candidates = window_nodes
         .iter()
         .enumerate()
@@ -146,7 +278,14 @@ fn inspect_zoom_windows(
     // More than one plausible Zoom meeting window is ambiguous. The bridge
     // has no permission to choose based on title/layout heuristics.
     if candidates.len() != 1 {
-        return None;
+        return ZoomProcessInspection {
+            active_speakers: None,
+            diagnostic: ZoomAxDiagnostic::MeetingWindowCount {
+                primary_windows: window_nodes.len(),
+                validated_meetings: candidates.len(),
+                top_level_dialogs: auxiliary_dialog_nodes.len(),
+            },
+        };
     }
     let meeting_window_index = candidates[0];
     let mut names = HashSet::new();
@@ -157,15 +296,26 @@ fn inspect_zoom_windows(
         }
         speakers.extend(find_zoom_auxiliary_talking_speakers(nodes, &mut names));
     }
-    Some(speakers)
+    for nodes in &auxiliary_dialog_nodes {
+        speakers.extend(find_zoom_auxiliary_talking_speakers(nodes, &mut names));
+    }
+    ZoomProcessInspection {
+        diagnostic: ZoomAxDiagnostic::ValidatedMeeting {
+            primary_windows: window_nodes.len(),
+            top_level_dialogs: auxiliary_dialog_nodes.len(),
+            active_speaker_labels: speakers.len(),
+        },
+        active_speakers: Some(speakers),
+    }
 }
 
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
-fn collect_windows(
+fn collect_zoom_surfaces(
     element: &ax::UiElement,
     depth: usize,
     visited: &mut usize,
     windows: &mut Vec<arc::R<ax::UiElement>>,
+    auxiliary_dialogs: &mut Vec<arc::R<ax::UiElement>>,
 ) -> bool {
     if depth > MAX_TREE_DEPTH || *visited >= MAX_NODES {
         return false;
@@ -180,13 +330,27 @@ fn collect_windows(
         windows.push(element.retained());
         return windows.len() <= MAX_WINDOWS;
     }
+    // Sky AX reports the speaking indicator as a `system dialog zoom floating
+    // video window`, not an `AXWindow`. Accept only a direct child of Zoom's
+    // application AX root, then later read only explicit `Talking: Name`
+    // labels from it. Nested dialogs remain part of their owning window and do
+    // not widen this auxiliary-surface boundary.
+    if depth == 1 && is_zoom_top_level_auxiliary_dialog(&role) {
+        auxiliary_dialogs.push(element.retained());
+        return auxiliary_dialogs.len() <= MAX_AUXILIARY_DIALOGS;
+    }
 
     let Ok(children) = element.children() else {
         return !ax_role_may_have_children(&role);
     };
     children
         .iter()
-        .all(|child| collect_windows(child, depth + 1, visited, windows))
+        .all(|child| collect_zoom_surfaces(child, depth + 1, visited, windows, auxiliary_dialogs))
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn is_zoom_top_level_auxiliary_dialog(role: &str) -> bool {
+    matches!(role, "AXSystemDialog" | "AXDialog")
 }
 
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
@@ -385,7 +549,10 @@ fn find_zoom_auxiliary_talking_speakers(
             is_active_speaker: Some(true),
             is_muted: None,
             confidence: 0.95,
-            signals: vec!["speaker-state-label".to_string(), "auxiliary-talking-label".to_string()],
+            signals: vec![
+                "speaker-state-label".to_string(),
+                "auxiliary-talking-label".to_string(),
+            ],
         });
     }
     streams
@@ -393,7 +560,10 @@ fn find_zoom_auxiliary_talking_speakers(
 
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
 fn is_text_input_role(role: Option<&str>) -> bool {
-    matches!(role, Some("AXTextArea") | Some("AXTextField") | Some("AXSecureTextField"))
+    matches!(
+        role,
+        Some("AXTextArea") | Some("AXTextField") | Some("AXSecureTextField")
+    )
 }
 
 /// Adapted from Anarlog's `participant_name_from_speaker_label` at the pinned
@@ -568,7 +738,9 @@ mod tests {
     use crate::evidence::EvidenceSource;
 
     #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
-    use super::{inspect_zoom_windows, ZoomAxNode};
+    use super::{
+        inspect_zoom_windows, is_zoom_top_level_auxiliary_dialog, ZoomAxDiagnostic, ZoomAxNode,
+    };
 
     #[test]
     fn roster_presence_does_not_turn_into_a_speaking_claim() {
@@ -635,22 +807,65 @@ mod tests {
 
     #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
     #[test]
-    fn auxiliary_floating_window_contributes_only_an_explicit_talking_label() {
+    fn top_level_system_dialog_contributes_only_an_explicit_talking_label() {
         // The main meeting surface validates the Zoom meeting but has no
-        // active-speaker state. macOS exposes that state in a separate floating
-        // AX window, represented here by its static-text label.
+        // active-speaker state. Sky AX exposes that state in a top-level system
+        // dialog instead of an AXWindow, represented here by static text.
         let meeting_window = vec![zoom_node(
             1,
             "AXGroup",
             "Video render Vikram Prasanna, Computer audio unmuted",
         )];
-        let floating_window = vec![zoom_node(2, "AXStaticText", "Talking: Vikram Prasanna")];
-        let speakers = inspect_zoom_windows(vec![meeting_window, floating_window])
+        let system_dialog = vec![zoom_node(2, "AXStaticText", "Talking: Vikram Prasanna")];
+        let inspection = inspect_zoom_windows(vec![meeting_window], vec![system_dialog]);
+        let speakers = inspection
+            .active_speakers
+            .as_ref()
             .expect("exactly one validated meeting window");
 
         assert_eq!(speakers.len(), 1);
-        assert_eq!(speakers[0].participant_name.as_deref(), Some("Vikram Prasanna"));
+        assert_eq!(
+            speakers[0].participant_name.as_deref(),
+            Some("Vikram Prasanna")
+        );
         assert_eq!(speakers[0].is_active_speaker, Some(true));
-        assert!(speakers[0].signals.iter().any(|signal| signal == "auxiliary-talking-label"));
+        assert!(speakers[0]
+            .signals
+            .iter()
+            .any(|signal| signal == "auxiliary-talking-label"));
+        assert!(matches!(
+            inspection.diagnostic,
+            ZoomAxDiagnostic::ValidatedMeeting {
+                primary_windows: 1,
+                top_level_dialogs: 1,
+                active_speaker_labels: 1,
+            }
+        ));
+    }
+
+    #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+    #[test]
+    fn top_level_dialog_cannot_name_a_transcript_without_one_validated_window() {
+        let system_dialog = vec![zoom_node(2, "AXStaticText", "Talking: Vikram Prasanna")];
+        let inspection = inspect_zoom_windows(Vec::new(), vec![system_dialog]);
+
+        assert!(inspection.active_speakers.is_none());
+        assert!(matches!(
+            inspection.diagnostic,
+            ZoomAxDiagnostic::MeetingWindowCount {
+                primary_windows: 0,
+                validated_meetings: 0,
+                top_level_dialogs: 1,
+            }
+        ));
+    }
+
+    #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+    #[test]
+    fn only_explicit_top_level_system_dialog_roles_are_auxiliary_surfaces() {
+        assert!(is_zoom_top_level_auxiliary_dialog("AXSystemDialog"));
+        assert!(is_zoom_top_level_auxiliary_dialog("AXDialog"));
+        assert!(!is_zoom_top_level_auxiliary_dialog("AXGroup"));
+        assert!(!is_zoom_top_level_auxiliary_dialog("AXSheet"));
     }
 }
