@@ -472,8 +472,13 @@ fn inspect_zoom_windows(
         };
     }
     let meeting_window_index = candidates[0];
+    let account_self_name = zoom_account_self_name(&window_nodes);
     let mut names = HashSet::new();
-    let mut speakers = find_zoom_active_speakers(&window_nodes[meeting_window_index], &mut names);
+    let mut speakers = find_zoom_active_speakers(
+        &window_nodes[meeting_window_index],
+        &mut names,
+        account_self_name.as_deref(),
+    );
     for (index, nodes) in window_nodes.iter().enumerate() {
         if index == meeting_window_index {
             continue;
@@ -741,6 +746,7 @@ fn ax_role_may_have_children(role: &str) -> bool {
 struct ZoomAxNode {
     element_hash: usize,
     role: Option<String>,
+    role_description: Option<String>,
     title: Option<String>,
     description: Option<String>,
     placeholder: Option<String>,
@@ -758,6 +764,7 @@ fn snapshot_node(element: &ax::UiElement) -> ZoomAxNode {
     ZoomAxNode {
         element_hash: element.hash(),
         role,
+        role_description: element.role_desc().ok().map(|value| value.to_string()),
         title: string_attr(element, ax::attr::title()),
         description: string_attr(element, ax::attr::desc()),
         placeholder: string_attr(element, ax::attr::placeholder_value()),
@@ -819,8 +826,11 @@ fn zoom_meeting_window_validation(nodes: &[ZoomAxNode]) -> ZoomWindowValidation 
             Some("AXStaticText") => validation.static_text_nodes += 1,
             _ => validation.other_non_input_nodes += 1,
         }
-        let has_audio_state = node_labels(node).any(is_zoom_audio_state_label);
-        let has_video_evidence = node_labels(node).any(is_zoom_video_evidence_label);
+        let video_tile = parse_zoom_video_tile_node(node);
+        let has_audio_state =
+            video_tile.is_some() || node_labels(node).any(is_zoom_audio_state_label);
+        let has_video_evidence =
+            video_tile.is_some() || node_labels(node).any(is_zoom_video_evidence_label);
         let has_leave_control = node_labels(node).any(is_zoom_leave_control_label);
         let has_participants_control = node_labels(node).any(is_zoom_participants_control_label);
         let has_mute_control = node_labels(node).any(is_zoom_mute_control_label);
@@ -842,6 +852,57 @@ fn zoom_meeting_window_validation(nodes: &[ZoomAxNode]) -> ZoomWindowValidation 
 fn is_zoom_audio_state_label(label: &str) -> bool {
     let lower = label.to_ascii_lowercase();
     lower.contains("computer audio") || lower.contains("no audio connected")
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ZoomTileAudioState {
+    Unmuted,
+    Muted,
+    Disconnected,
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ZoomVideoTile {
+    element_hash: usize,
+    participant_name: String,
+    audio_state: ZoomTileAudioState,
+}
+
+/// Zoom 6.x exposes a video tile as an AXTabGroup whose localized role
+/// description is `Video render`. The participant name and audio state are in
+/// one separate AXDescription, not in a synthesized `Video render ...` label.
+/// Accept this measured native shape without depending on screen geometry.
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn parse_zoom_video_tile_node(node: &ZoomAxNode) -> Option<ZoomVideoTile> {
+    if node.role.as_deref() != Some("AXTabGroup")
+        || !node
+            .role_description
+            .as_deref()
+            .is_some_and(|description| description.eq_ignore_ascii_case("Video render"))
+    {
+        return None;
+    }
+    let (name, state) = node.description.as_deref()?.split_once(',')?;
+    let name = name.trim();
+    if !plausible_participant_name(name) {
+        return None;
+    }
+    let audio_state = state
+        .split(',')
+        .map(|part| part.trim().to_ascii_lowercase())
+        .find_map(|part| match part.as_str() {
+            "computer audio unmuted" => Some(ZoomTileAudioState::Unmuted),
+            "computer audio muted" => Some(ZoomTileAudioState::Muted),
+            "no audio connected" => Some(ZoomTileAudioState::Disconnected),
+            _ => None,
+        })?;
+    Some(ZoomVideoTile {
+        element_hash: node.element_hash,
+        participant_name: name.to_string(),
+        audio_state,
+    })
 }
 
 /// Exact native Zoom meeting controls. These never inspect a window title or
@@ -902,6 +963,7 @@ fn is_zoom_video_evidence_label(label: &str) -> bool {
 fn find_zoom_active_speakers(
     nodes: &[ZoomAxNode],
     names: &mut HashSet<String>,
+    account_self_name: Option<&str>,
 ) -> Vec<AnarlogParticipantStream> {
     let mut streams = Vec::new();
     // A participant row can establish only the local user's name, and only
@@ -909,6 +971,7 @@ fn find_zoom_active_speakers(
     // as speaker evidence by itself; it can merely mark an independently
     // explicit active-speaker label for that exact same name as self.
     let participants_self_name = zoom_participants_self_name(nodes);
+    let tile_name_counts = zoom_video_tile_name_counts(nodes);
     for node in nodes {
         if is_text_input_role(node.role.as_deref()) {
             continue;
@@ -931,13 +994,22 @@ fn find_zoom_active_speakers(
         let is_participants_self_match = participants_self_name
             .as_deref()
             .is_some_and(|self_name| name.eq_ignore_ascii_case(self_name));
-        let is_self = label_marks_self || is_participants_self_match;
+        let is_account_self_match = account_self_name.is_some_and(|self_name| {
+            name.eq_ignore_ascii_case(self_name)
+                && tile_name_counts
+                    .get(&name.to_ascii_lowercase())
+                    .is_some_and(|count| *count == 1)
+        });
+        let is_self = label_marks_self || is_participants_self_match || is_account_self_match;
         let mut signals = vec!["speaker-state-label".to_string()];
         if label.to_ascii_lowercase().starts_with("video render ") {
             signals.push("video-label".to_string());
         }
         if is_participants_self_match && !label_marks_self {
             signals.push("participants-self-match".to_string());
+        }
+        if is_account_self_match && !label_marks_self && !is_participants_self_match {
+            signals.push("account-self-match".to_string());
         }
         streams.push(AnarlogParticipantStream {
             participant_id: Some(format!("ax-element-{:x}", node.element_hash)),
@@ -949,7 +1021,107 @@ fn find_zoom_active_speakers(
             signals,
         });
     }
+    if streams.is_empty() {
+        streams.extend(find_zoom_sole_unmuted_speaker(
+            nodes,
+            names,
+            participants_self_name.as_deref(),
+            account_self_name,
+        ));
+    }
     streams
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn zoom_video_tile_name_counts(nodes: &[ZoomAxNode]) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for tile in nodes.iter().filter_map(parse_zoom_video_tile_node) {
+        *counts
+            .entry(tile.participant_name.to_ascii_lowercase())
+            .or_insert(0) += 1;
+    }
+    counts
+}
+
+/// Zoom's signed-in account button is passive self-identity evidence. It can
+/// classify a separately proven speaker or an acoustically qualified mic, but
+/// it never emits a speaking interval on its own.
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn zoom_account_self_name(windows: &[Vec<ZoomAxNode>]) -> Option<String> {
+    let candidates = windows
+        .iter()
+        .flatten()
+        .filter(|node| node.role.as_deref() == Some("AXButton"))
+        .filter_map(|node| node.description.as_deref())
+        .filter_map(|description| {
+            let mut parts = description.split(',').map(str::trim);
+            let product = parts.next()?;
+            let name = parts.next()?;
+            let meeting_state = parts.next()?;
+            (product.eq_ignore_ascii_case("Zoom")
+                && meeting_state.eq_ignore_ascii_case("In a Zoom Meeting")
+                && plausible_participant_name(name))
+            .then(|| name.to_string())
+        })
+        .collect::<Vec<_>>();
+    let unique = candidates
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    (unique.len() == 1)
+        .then(|| candidates.into_iter().next())
+        .flatten()
+}
+
+/// Current compact Zoom 6.x windows expose audio state but no textual active
+/// speaker marker. When exactly one participant tile is unmuted, any aligned
+/// system-ASR speech has one possible participant source. Multiple unmuted
+/// tiles remain ambiguous and produce no evidence.
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn find_zoom_sole_unmuted_speaker(
+    nodes: &[ZoomAxNode],
+    names: &mut HashSet<String>,
+    participants_self_name: Option<&str>,
+    account_self_name: Option<&str>,
+) -> Vec<AnarlogParticipantStream> {
+    let tiles = nodes
+        .iter()
+        .filter_map(parse_zoom_video_tile_node)
+        .collect::<Vec<_>>();
+    let unmuted = tiles
+        .iter()
+        .filter(|tile| tile.audio_state == ZoomTileAudioState::Unmuted)
+        .collect::<Vec<_>>();
+    let [tile] = unmuted.as_slice() else {
+        return Vec::new();
+    };
+    if !names.insert(tile.participant_name.to_ascii_lowercase()) {
+        return Vec::new();
+    }
+    let same_name_tiles = tiles
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .participant_name
+                .eq_ignore_ascii_case(&tile.participant_name)
+        })
+        .count();
+    let known_self_name = participants_self_name.or(account_self_name);
+    let is_self = known_self_name.map(|self_name| {
+        same_name_tiles == 1 && tile.participant_name.eq_ignore_ascii_case(self_name)
+    });
+    vec![AnarlogParticipantStream {
+        participant_id: Some(format!("ax-element-{:x}", tile.element_hash)),
+        participant_name: Some(tile.participant_name.clone()),
+        is_self,
+        is_active_speaker: Some(true),
+        is_muted: Some(false),
+        confidence: 0.78,
+        signals: vec![
+            "video-tile-audio-state".to_string(),
+            "sole-unmuted-tile".to_string(),
+        ],
+    }]
 }
 
 /// Auxiliary Zoom surfaces are intentionally stricter than the validated
@@ -1233,8 +1405,8 @@ mod tests {
     #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
     use super::{
         find_zoom_active_speakers, inspect_zoom_windows, is_zoom_top_level_auxiliary_dialog,
-        zoom_ax_enhancement_retry_due, zoom_meeting_window_validation, AxEnhancementAttempt,
-        SurfaceDiscoveryStats, ZoomAxDiagnostic, ZoomAxNode,
+        zoom_account_self_name, zoom_ax_enhancement_retry_due, zoom_meeting_window_validation,
+        AxEnhancementAttempt, SurfaceDiscoveryStats, ZoomAxDiagnostic, ZoomAxNode,
     };
     #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
     use std::{
@@ -1329,8 +1501,35 @@ mod tests {
         ZoomAxNode {
             element_hash,
             role: Some(role.to_string()),
+            role_description: None,
             title: Some(title.to_string()),
             description: None,
+            placeholder: None,
+            value: None,
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+    fn zoom_video_node(element_hash: usize, name: &str, audio_state: &str) -> ZoomAxNode {
+        ZoomAxNode {
+            element_hash,
+            role: Some("AXTabGroup".to_string()),
+            role_description: Some("Video render".to_string()),
+            title: None,
+            description: Some(format!("{name}, {audio_state}")),
+            placeholder: None,
+            value: None,
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+    fn zoom_account_node(element_hash: usize, description: &str) -> ZoomAxNode {
+        ZoomAxNode {
+            element_hash,
+            role: Some("AXButton".to_string()),
+            role_description: Some("button".to_string()),
+            title: None,
+            description: Some(description.to_string()),
             placeholder: None,
             value: None,
         }
@@ -1367,6 +1566,83 @@ mod tests {
         let audio_only =
             zoom_meeting_window_validation(&[zoom_node(4, "AXCell", "Computer audio unmuted")]);
         assert!(!audio_only.is_valid());
+    }
+
+    #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+    #[test]
+    fn current_zoom_video_render_role_validates_and_names_a_sole_unmuted_tile() {
+        let nodes = [
+            zoom_video_node(1, "Akbar Khan", "Computer audio unmuted"),
+            zoom_video_node(2, "Parminder Singh", "Computer audio muted, Video off"),
+        ];
+        let validation = zoom_meeting_window_validation(&nodes);
+        assert_eq!(validation.video_evidence_nodes, 2);
+        assert_eq!(validation.audio_state_nodes, 2);
+        assert_eq!(validation.colocated_evidence_nodes, 2);
+        assert!(validation.is_valid());
+
+        let mut names = HashSet::new();
+        let speakers = find_zoom_active_speakers(&nodes, &mut names, Some("Parminder Singh"));
+        assert_eq!(speakers.len(), 1);
+        assert_eq!(speakers[0].participant_name.as_deref(), Some("Akbar Khan"));
+        assert_eq!(speakers[0].is_self, Some(false));
+        assert_eq!(speakers[0].is_muted, Some(false));
+        assert!(speakers[0]
+            .signals
+            .iter()
+            .any(|signal| signal == "sole-unmuted-tile"));
+    }
+
+    #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+    #[test]
+    fn multiple_unmuted_tiles_and_duplicate_self_names_remain_ambiguous() {
+        let both_unmuted = [
+            zoom_video_node(1, "Akbar Khan", "Computer audio unmuted"),
+            zoom_video_node(2, "Parminder Singh", "Computer audio unmuted"),
+        ];
+        let mut ambiguous_names = HashSet::new();
+        assert!(find_zoom_active_speakers(
+            &both_unmuted,
+            &mut ambiguous_names,
+            Some("Parminder Singh"),
+        )
+        .is_empty());
+
+        let duplicate_names = [
+            zoom_video_node(3, "Rahul Khatri", "Computer audio unmuted"),
+            zoom_video_node(4, "Rahul Khatri", "Computer audio muted"),
+        ];
+        let mut duplicate_name_set = HashSet::new();
+        let speakers = find_zoom_active_speakers(
+            &duplicate_names,
+            &mut duplicate_name_set,
+            Some("Rahul Khatri"),
+        );
+        assert_eq!(speakers.len(), 1);
+        assert_eq!(
+            speakers[0].participant_name.as_deref(),
+            Some("Rahul Khatri")
+        );
+        assert_eq!(speakers[0].is_self, Some(false));
+    }
+
+    #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+    #[test]
+    fn signed_in_zoom_account_is_passive_self_identity_only() {
+        let windows = vec![vec![
+            zoom_account_node(1, "Zoom, Rahul Khatri, In a Zoom Meeting, Basic account"),
+            zoom_account_node(2, "Open activity center, New messages"),
+        ]];
+        assert_eq!(
+            zoom_account_self_name(&windows).as_deref(),
+            Some("Rahul Khatri")
+        );
+
+        let not_in_meeting = vec![vec![zoom_account_node(
+            3,
+            "Zoom, Rahul Khatri, Available, Basic account",
+        )]];
+        assert!(zoom_account_self_name(&not_in_meeting).is_none());
     }
 
     #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
@@ -1453,6 +1729,7 @@ mod tests {
                 zoom_node(3, "AXTextField", "Talking: Input Text"),
             ],
             &mut names,
+            None,
         );
 
         assert_eq!(streams.len(), 1);
@@ -1474,6 +1751,7 @@ mod tests {
                 zoom_node(4, "AXStaticText", "Talking: Vikram Prasanna"),
             ],
             &mut names,
+            None,
         );
 
         assert_eq!(streams.len(), 2);
@@ -1496,6 +1774,7 @@ mod tests {
                 zoom_node(6, "AXRow", "Rahul Khatri (Host, me)"),
             ],
             &mut roster_only_names,
+            None,
         );
         assert!(roster_only.is_empty());
     }

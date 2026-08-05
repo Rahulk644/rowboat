@@ -31,6 +31,10 @@ host. The token is read only by the main process and never returned over IPC.
   interval, and materially different simultaneous speech is preserved.
 - The live note renders contiguous canonical chunks as one speaker turn. Raw segment IDs, revisions, timing,
   overlap, and correction evidence stay intact beneath that display projection.
+- Native Zoom 6.x video tiles are read from their measured Accessibility role (`Video render`) plus the
+  participant/audio-state description. A direct active-speaker label wins; in a compact window that exposes
+  no such label, only one sole-unmuted tile may name aligned system speech. Two or more unmuted tiles remain
+  unknown rather than guessing.
 - Requests are serialized because the qualified CPU worker shares one loaded model and one compute lane.
 - A transient connection failure restarts both streaming sessions and replays the uncommitted channel pair.
 - Pending audio is bounded to 24 pairs (13.44 seconds). Rowboat reports a degraded live transcript and drops

@@ -52,6 +52,12 @@ system speech are removed only when shared, conservative time/text evidence is
 unique; different concurrent speech is retained. This is reconciliation, not
 a claim of acoustic echo cancellation.
 
+Zoom 6.x compact windows expose participant tiles through the native
+`Video render` role and a separate participant/audio-state description. Direct
+active-speaker evidence remains authoritative. If Zoom omits it, exactly one
+unmuted tile can provide bounded two-person fallback evidence; multiple
+unmuted tiles remain unknown.
+
 Speaker trust order is explicit correction; qualified healthy mic for `You`;
 dominant active Accessibility evidence; confirmed voice profile clearing both
 threshold and runner-up margin; anonymous stable cluster; unknown. Passive
