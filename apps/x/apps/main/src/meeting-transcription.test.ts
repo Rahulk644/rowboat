@@ -134,6 +134,81 @@ test('canonical v2 segment merging is idempotent and accepts only higher revisio
   assert.deepEqual(mergeMeetingTranscriptSegments([base], [revised]), [revised]);
 });
 
+test('opt-in PCM diagnostics expose only ephemeral per-channel pipeline metadata', async (t) => {
+  const originalUrl = process.env.ROWBOAT_MEETING_STT_URL;
+  const originalToken = process.env.ROWBOAT_MEETING_STT_TOKEN;
+  const originalDiagnostics = process.env.ROWBOAT_MEETING_PCM_DIAGNOSTICS;
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    if (originalUrl === undefined) delete process.env.ROWBOAT_MEETING_STT_URL;
+    else process.env.ROWBOAT_MEETING_STT_URL = originalUrl;
+    if (originalToken === undefined) delete process.env.ROWBOAT_MEETING_STT_TOKEN;
+    else process.env.ROWBOAT_MEETING_STT_TOKEN = originalToken;
+    if (originalDiagnostics === undefined) delete process.env.ROWBOAT_MEETING_PCM_DIAGNOSTICS;
+    else process.env.ROWBOAT_MEETING_PCM_DIAGNOSTICS = originalDiagnostics;
+    globalThis.fetch = originalFetch;
+  });
+
+  delete process.env.ROWBOAT_MEETING_PCM_DIAGNOSTICS;
+  process.env.ROWBOAT_MEETING_STT_TOKEN = TOKEN;
+  process.env.ROWBOAT_MEETING_STT_URL = 'http://127.0.0.1:18091';
+  globalThis.fetch = async (input) => {
+    const url = new URL(input.toString());
+    const session = url.searchParams.get('session') ?? '';
+    const payload = url.pathname === '/stream/feed' || url.pathname === '/stream/finalize'
+      ? {
+          session, full: '', committed: '', tentative: '', changed: false,
+          final: url.pathname === '/stream/finalize', revision: 0, inputMs: 560, bufferedMs: 0,
+        }
+      : { ok: true, session };
+    return new Response(JSON.stringify(payload), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    });
+  };
+
+  const provider = new SelfHostedMeetingTranscription();
+  await provider.begin('diagnostic meeting', 'auto');
+  assert.deepEqual(provider.getPcmDiagnostics(), { enabled: false, activeMeetings: [] });
+  provider.getPcmDiagnostics(true);
+
+  const audible = Buffer.from([0, 0, 0xff, 0x7f]).toString('base64');
+  const silent = Buffer.alloc(4).toString('base64');
+  await provider.feed('diagnostic meeting', 'mic', audible, {
+    startSample: 0, sampleCount: 2, sampleRate: 16_000, sequence: 0,
+  });
+  await provider.feed('diagnostic meeting', 'system', silent, {
+    startSample: 0, sampleCount: 2, sampleRate: 16_000, sequence: 0,
+  });
+
+  const diagnostics = provider.getPcmDiagnostics();
+  assert.equal(diagnostics.enabled, true);
+  assert.equal(diagnostics.activeMeetings.length, 1);
+  const { mic, system } = diagnostics.activeMeetings[0]!;
+  assert.deepEqual(
+    Object.keys(mic).sort(),
+    [
+      'acceptedBatches', 'acceptedSamples', 'signalBatches', 'workerRequests', 'workerResponses',
+      'workerFailures', 'changedResponses', 'emittedSegmentUpserts', 'lastSequence', 'lastFeedAgeMs',
+      'lastWorkerResponseAgeMs', 'lastWorkerInputMs', 'lastWorkerBufferedMs',
+    ].sort(),
+  );
+  assert.deepEqual(
+    { acceptedBatches: mic.acceptedBatches, acceptedSamples: mic.acceptedSamples, signalBatches: mic.signalBatches,
+      workerRequests: mic.workerRequests, workerResponses: mic.workerResponses, workerFailures: mic.workerFailures,
+      changedResponses: mic.changedResponses, emittedSegmentUpserts: mic.emittedSegmentUpserts, lastSequence: mic.lastSequence,
+      lastWorkerInputMs: mic.lastWorkerInputMs, lastWorkerBufferedMs: mic.lastWorkerBufferedMs },
+    { acceptedBatches: 1, acceptedSamples: 2, signalBatches: 1, workerRequests: 1, workerResponses: 1,
+      workerFailures: 0, changedResponses: 0, emittedSegmentUpserts: 0, lastSequence: 0,
+      lastWorkerInputMs: 560, lastWorkerBufferedMs: 0 },
+  );
+  assert.equal(system.signalBatches, 0);
+  assert.equal(system.workerResponses, 1);
+  assert.equal(JSON.stringify(diagnostics).includes('diagnostic-meeting'), false);
+
+  await provider.finalize('diagnostic meeting');
+  assert.deepEqual(provider.getPcmDiagnostics(), { enabled: false, activeMeetings: [] });
+});
+
 test('suppresses one exact, interval-aligned system echo from the mic channel', () => {
   const system = echoSegment('system', 'system-1', 'please review the deployment plan before lunch');
   const mic = echoSegment('mic', 'mic-1', 'please review the deployment plan before lunch');

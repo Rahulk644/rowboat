@@ -1003,6 +1003,9 @@ export function setupIpcHandlers() {
       }
       return { success: true as const };
     },
+    'meeting:transcription:pcmDiagnostics': async (_event, args) => {
+      return selfHostedMeetingTranscription.getPcmDiagnostics(args.enable === true);
+    },
     'meeting:transcription:feed': async (_event, args) => {
       return selfHostedMeetingTranscription.feed(args.meetingId, args.channel, args.pcmBase64, args.audio);
     },

@@ -161,6 +161,33 @@ const SelfHostedMeetingSnapshotSchema = z.object({
   segments: z.array(MeetingTranscriptSegmentSchema),
 });
 
+// Explicit developer/operator probe for a live self-hosted session. It
+// intentionally contains only bounded pipeline counters and timings: never
+// PCM, transcript text, identities, session IDs, tokens, or worker URLs.
+const MeetingPcmChannelDiagnosticsSchema = z.object({
+  acceptedBatches: z.number().int().nonnegative(),
+  acceptedSamples: z.number().int().nonnegative(),
+  signalBatches: z.number().int().nonnegative(),
+  workerRequests: z.number().int().nonnegative(),
+  workerResponses: z.number().int().nonnegative(),
+  workerFailures: z.number().int().nonnegative(),
+  changedResponses: z.number().int().nonnegative(),
+  emittedSegmentUpserts: z.number().int().nonnegative(),
+  lastSequence: z.number().int().nonnegative().nullable(),
+  lastFeedAgeMs: z.number().int().nonnegative().nullable(),
+  lastWorkerResponseAgeMs: z.number().int().nonnegative().nullable(),
+  lastWorkerInputMs: z.number().int().nonnegative().nullable(),
+  lastWorkerBufferedMs: z.number().int().nonnegative().nullable(),
+});
+
+const MeetingPcmDiagnosticsSchema = z.object({
+  enabled: z.boolean(),
+  activeMeetings: z.array(z.object({
+    mic: MeetingPcmChannelDiagnosticsSchema,
+    system: MeetingPcmChannelDiagnosticsSchema,
+  })),
+});
+
 const KnowledgeSourceConfigSchema = z.object({
   id: z.string(),
   provider: z.enum(['gmail', 'meeting', 'voice_memo', 'slack', 'github', 'linear']),
@@ -1167,6 +1194,13 @@ const ipcSchemas = {
   'meeting:transcription:captureReady': {
     req: z.object({ meetingId: z.string().min(1).max(120) }),
     res: z.object({ success: z.literal(true) }),
+  },
+  // A developer/operator must explicitly enable this. It creates only
+  // in-memory aggregate counters for currently active sessions; no audio or
+  // transcript data is ever returned or persisted.
+  'meeting:transcription:pcmDiagnostics': {
+    req: z.object({ enable: z.boolean().optional() }),
+    res: MeetingPcmDiagnosticsSchema,
   },
   'meeting:transcription:feed': {
     req: z.object({

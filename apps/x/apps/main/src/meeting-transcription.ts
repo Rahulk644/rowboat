@@ -96,6 +96,35 @@ export type MeetingTranscriptionSnapshot = {
   segments: MeetingTranscriptSegment[];
 };
 
+/**
+ * Explicit, in-memory-only capture diagnostics. These describe pipeline
+ * progress, never audio, transcript text, identities, session IDs, or worker
+ * URLs. They exist solely to diagnose a live self-hosted meeting session.
+ */
+export type MeetingPcmChannelDiagnostics = {
+  acceptedBatches: number;
+  acceptedSamples: number;
+  signalBatches: number;
+  workerRequests: number;
+  workerResponses: number;
+  workerFailures: number;
+  changedResponses: number;
+  emittedSegmentUpserts: number;
+  lastSequence: number | null;
+  lastFeedAgeMs: number | null;
+  lastWorkerResponseAgeMs: number | null;
+  lastWorkerInputMs: number | null;
+  lastWorkerBufferedMs: number | null;
+};
+
+export type MeetingPcmDiagnostics = {
+  enabled: boolean;
+  activeMeetings: Array<{
+    mic: MeetingPcmChannelDiagnostics;
+    system: MeetingPcmChannelDiagnostics;
+  }>;
+};
+
 /** Inputs a future bridge can submit after normalizing AX/diarization data. */
 export type SpeakerEvidenceApplicationOptions = {
   voiceProfilesBySegment?: Readonly<Record<string, ConfirmedVoiceProfileMatch | undefined>>;
@@ -133,6 +162,14 @@ type ActiveMeeting = {
   corrections: Map<string, { displayName: string; rememberVoice: boolean }>;
   speakerEvidence: MeetingSpeakerEvidence[];
   pendingAttributionUpserts: Map<string, MeetingTranscriptSegment>;
+  /** Absent unless explicitly requested by the operator or dev environment. */
+  diagnostics: Record<MeetingAudioChannel, ChannelDiagnosticsState> | null;
+};
+
+type ChannelDiagnosticsState = Omit<MeetingPcmChannelDiagnostics,
+  'lastFeedAgeMs' | 'lastWorkerResponseAgeMs'> & {
+  lastFeedAt: number | null;
+  lastWorkerResponseAt: number | null;
 };
 
 const SnapshotSchema = z.object({
@@ -163,6 +200,8 @@ const SPEAKER_EVIDENCE_HISTORY_SAMPLES = SAMPLE_RATE * 120;
 const MAX_PENDING_ATTRIBUTION_UPSERTS = 512;
 const DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]']);
+const MAX_DIAGNOSTIC_COUNTER = 1_000_000_000;
+const PCM_SIGNAL_RMS_THRESHOLD = 0.005;
 
 function envValue(name: string): string | null {
   const value = process.env[name]?.trim();
@@ -185,6 +224,65 @@ function segmentId(meetingId: string, channel: MeetingAudioChannel, epoch: numbe
 
 function isPrefix(prefix: string, text: string): boolean {
   return text.startsWith(prefix);
+}
+
+function diagnosticsEnabledByEnvironment(): boolean {
+  return process.env.ROWBOAT_MEETING_PCM_DIAGNOSTICS === '1';
+}
+
+function newChannelDiagnostics(): ChannelDiagnosticsState {
+  return {
+    acceptedBatches: 0,
+    acceptedSamples: 0,
+    signalBatches: 0,
+    workerRequests: 0,
+    workerResponses: 0,
+    workerFailures: 0,
+    changedResponses: 0,
+    emittedSegmentUpserts: 0,
+    lastSequence: null,
+    lastFeedAt: null,
+    lastWorkerResponseAt: null,
+    lastWorkerInputMs: null,
+    lastWorkerBufferedMs: null,
+  };
+}
+
+function newMeetingDiagnostics(): Record<MeetingAudioChannel, ChannelDiagnosticsState> {
+  return { mic: newChannelDiagnostics(), system: newChannelDiagnostics() };
+}
+
+function incrementDiagnostic(value: number, amount = 1): number {
+  return Math.min(MAX_DIAGNOSTIC_COUNTER, value + amount);
+}
+
+/** Measure only aggregate signal energy; PCM bytes are never retained or logged. */
+function pcmHasSignal(pcm: Buffer): boolean {
+  let sumSquares = 0;
+  const samples = pcm.length / 2;
+  for (let offset = 0; offset < pcm.length; offset += 2) {
+    const normalized = pcm.readInt16LE(offset) / 0x8000;
+    sumSquares += normalized * normalized;
+  }
+  return Math.sqrt(sumSquares / samples) >= PCM_SIGNAL_RMS_THRESHOLD;
+}
+
+function snapshotDiagnostics(state: ChannelDiagnosticsState, now: number): MeetingPcmChannelDiagnostics {
+  return {
+    acceptedBatches: state.acceptedBatches,
+    acceptedSamples: state.acceptedSamples,
+    signalBatches: state.signalBatches,
+    workerRequests: state.workerRequests,
+    workerResponses: state.workerResponses,
+    workerFailures: state.workerFailures,
+    changedResponses: state.changedResponses,
+    emittedSegmentUpserts: state.emittedSegmentUpserts,
+    lastSequence: state.lastSequence,
+    lastFeedAgeMs: state.lastFeedAt === null ? null : Math.max(0, now - state.lastFeedAt),
+    lastWorkerResponseAgeMs: state.lastWorkerResponseAt === null ? null : Math.max(0, now - state.lastWorkerResponseAt),
+    lastWorkerInputMs: state.lastWorkerInputMs,
+    lastWorkerBufferedMs: state.lastWorkerBufferedMs,
+  };
 }
 
 /**
@@ -421,6 +519,7 @@ export class SelfHostedMeetingTranscription {
         corrections: new Map(),
         speakerEvidence: [],
         pendingAttributionUpserts: new Map(),
+        diagnostics: diagnosticsEnabledByEnvironment() ? newMeetingDiagnostics() : null,
       });
     } catch (error) {
       await this.bestEffortReset(config, sessions.mic);
@@ -445,19 +544,50 @@ export class SelfHostedMeetingTranscription {
     return this.serialized(async () => {
       const state = active.channels[channel];
       const feed = this.prepareFeed(state, channel, pcm.length / 2, parsedMetadata);
-      // A capture discontinuity is also an ASR-prefix boundary. Reset only
-      // the affected named session before forwarding the first new frame so a
-      // worker cannot return text from the prior epoch as if it belonged to
-      // this interval. The other channel keeps its existing session/model.
-      if (feed.epoch !== state.epoch) {
-        await this.request(config, '/stream/reset', active.sessions[channel]);
-        await this.request(config, '/stream/begin', active.sessions[channel], undefined, active.language);
-        this.beginNewEpoch(state, 'capture discontinuity', feed.epoch);
+      this.recordPcmFeed(active, channel, feed, pcm);
+      try {
+        // A capture discontinuity is also an ASR-prefix boundary. Reset only
+        // the affected named session before forwarding the first new frame so a
+        // worker cannot return text from the prior epoch as if it belonged to
+        // this interval. The other channel keeps its existing session/model.
+        if (feed.epoch !== state.epoch) {
+          await this.request(config, '/stream/reset', active.sessions[channel]);
+          await this.request(config, '/stream/begin', active.sessions[channel], undefined, active.language);
+          this.beginNewEpoch(state, 'capture discontinuity', feed.epoch);
+        }
+        this.recordWorkerRequest(active, channel);
+        const worker = SnapshotSchema.parse(await this.request(config, '/stream/feed', active.sessions[channel], pcm));
+        this.recordWorkerResponse(active, channel, worker);
+        this.commitFeed(state, feed);
+        const snapshot = this.adaptSnapshot(safeMeetingId(meetingId), active, channel, worker, feed);
+        this.recordEmittedSegments(active, channel, snapshot.segments.length);
+        return snapshot;
+      } catch (error) {
+        this.recordWorkerFailure(active, channel);
+        throw error;
       }
-      const worker = SnapshotSchema.parse(await this.request(config, '/stream/feed', active.sessions[channel], pcm));
-      this.commitFeed(state, feed);
-      return this.adaptSnapshot(safeMeetingId(meetingId), active, channel, worker, feed);
     });
+  }
+
+  /**
+   * Enable a metadata-only live probe on all current sessions, then return a
+   * bounded snapshot. There is deliberately no durable history: reset and
+   * finalization remove these counters together with the meeting session.
+   */
+  getPcmDiagnostics(enable = false): MeetingPcmDiagnostics {
+    if (enable) {
+      for (const active of this.active.values()) {
+        active.diagnostics ??= newMeetingDiagnostics();
+      }
+    }
+    const now = Date.now();
+    const activeMeetings = [...this.active.values()]
+      .filter((active) => active.diagnostics !== null)
+      .map((active) => ({
+        mic: snapshotDiagnostics(active.diagnostics!.mic, now),
+        system: snapshotDiagnostics(active.diagnostics!.system, now),
+      }));
+    return { enabled: activeMeetings.length > 0, activeMeetings };
   }
 
   async finalize(meetingId: string): Promise<Record<MeetingAudioChannel, MeetingTranscriptionSnapshot>> {
@@ -912,6 +1042,49 @@ export class SelfHostedMeetingTranscription {
     const active = this.active.get(safeMeetingId(meetingId));
     if (!active) throw new Error('Meeting transcription session is not active');
     return active;
+  }
+
+  private recordPcmFeed(
+    active: ActiveMeeting,
+    channel: MeetingAudioChannel,
+    feed: MeetingAudioFeed,
+    pcm: Buffer,
+  ): void {
+    const diagnostics = active.diagnostics?.[channel];
+    if (!diagnostics) return;
+    diagnostics.acceptedBatches = incrementDiagnostic(diagnostics.acceptedBatches);
+    diagnostics.acceptedSamples = incrementDiagnostic(diagnostics.acceptedSamples, feed.sampleCount);
+    if (pcmHasSignal(pcm)) diagnostics.signalBatches = incrementDiagnostic(diagnostics.signalBatches);
+    diagnostics.lastSequence = feed.sequence;
+    diagnostics.lastFeedAt = Date.now();
+  }
+
+  private recordWorkerRequest(active: ActiveMeeting, channel: MeetingAudioChannel): void {
+    const diagnostics = active.diagnostics?.[channel];
+    if (!diagnostics) return;
+    diagnostics.workerRequests = incrementDiagnostic(diagnostics.workerRequests);
+  }
+
+  private recordWorkerResponse(active: ActiveMeeting, channel: MeetingAudioChannel, worker: WorkerSnapshot): void {
+    const diagnostics = active.diagnostics?.[channel];
+    if (!diagnostics) return;
+    diagnostics.workerResponses = incrementDiagnostic(diagnostics.workerResponses);
+    if (worker.changed) diagnostics.changedResponses = incrementDiagnostic(diagnostics.changedResponses);
+    diagnostics.lastWorkerResponseAt = Date.now();
+    diagnostics.lastWorkerInputMs = worker.inputMs;
+    diagnostics.lastWorkerBufferedMs = worker.bufferedMs;
+  }
+
+  private recordWorkerFailure(active: ActiveMeeting, channel: MeetingAudioChannel): void {
+    const diagnostics = active.diagnostics?.[channel];
+    if (!diagnostics) return;
+    diagnostics.workerFailures = incrementDiagnostic(diagnostics.workerFailures);
+  }
+
+  private recordEmittedSegments(active: ActiveMeeting, channel: MeetingAudioChannel, count: number): void {
+    const diagnostics = active.diagnostics?.[channel];
+    if (!diagnostics) return;
+    diagnostics.emittedSegmentUpserts = incrementDiagnostic(diagnostics.emittedSegmentUpserts, count);
   }
 
   private async beginSessions(config: SelfHostedConfig, sessions: Record<MeetingAudioChannel, string>, language: string): Promise<void> {

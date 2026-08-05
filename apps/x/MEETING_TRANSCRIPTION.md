@@ -31,6 +31,24 @@ host. The token is read only by the main process and never returned over IPC.
   new batches rather than allowing an outage to grow renderer memory without limit.
 - Finalization flushes both streams and resets their remote session slots.
 
+## Opt-in live PCM diagnostics
+
+For a physical self-hosted capture investigation, launch the dev app with
+`ROWBOAT_MEETING_PCM_DIAGNOSTICS=1`. Alternatively, enable counters only from the current point in an active
+session through the renderer DevTools console:
+
+```js
+await window.ipc.invoke('meeting:transcription:pcmDiagnostics', { enable: true })
+await window.ipc.invoke('meeting:transcription:pcmDiagnostics', {})
+```
+
+The result is ephemeral and contains only per-channel batch/sample counts, a non-silent-batch count, worker
+request/response/failure counts, worker progress timings, and emitted-segment counts. It contains no PCM,
+audio levels, transcript text, identities, session IDs, tokens, or worker URLs; it is erased on reset or
+finalization. A healthy live capture should advance `acceptedBatches`, `workerRequests`, and
+`workerResponses` for both `mic` and `system`. `signalBatches` shows that a channel contained aggregate
+non-silent PCM, while `emittedSegmentUpserts` can remain zero during silence or before the ASR model commits.
+
 ## Remaining production work
 
 Environment configuration is the developer/qualification seam. A settings surface backed by Electron
