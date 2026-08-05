@@ -45,6 +45,7 @@ export function resolveRowboatRepositoryRoot(appPath: string): string {
 
 export function createMeetingBridgeRuntime(options: MeetingBridgeRuntimeOptions): MeetingBridgeRuntime {
   const enabled = options.enabled ?? isMeetingBridgeEnabled;
+  const diagnostics = process.env.ROWBOAT_MEETING_BRIDGE_AX_DIAGNOSTICS === '1';
   let activeMeetingId: string | null = null;
   let warmedMeetingId: string | null = null;
   let warmingMeetingId: string | null = null;
@@ -62,7 +63,20 @@ export function createMeetingBridgeRuntime(options: MeetingBridgeRuntimeOptions)
     // cannot delay the capture-ready boundary by the default five seconds.
     handshakeTimeoutMs: 1_000,
     onEvent: (event) => {
-      if (event.type !== 'speaker_evidence' || activeMeetingId !== event.evidence.meetingId) return;
+      if (event.type !== 'speaker_evidence') {
+        if (diagnostics) {
+          const detail = event.type === 'error' ? ` code=${event.code}` : '';
+          console.error(`[MeetingBridge] event type=${event.type}${detail}`);
+        }
+        return;
+      }
+      const activeMatch = activeMeetingId === event.evidence.meetingId;
+      if (diagnostics) {
+        console.error(
+          `[MeetingBridge] speaker evidence activeMatch=${activeMatch} startSample=${event.evidence.startSample} endSample=${event.evidence.endSample}`,
+        );
+      }
+      if (!activeMatch) return;
       // The pending-upsert delivery is deliberately best-effort. A bridge
       // failure or a temporarily unavailable transcription implementation can
       // never stop the existing audio capture/ASR route.
@@ -70,7 +84,17 @@ export function createMeetingBridgeRuntime(options: MeetingBridgeRuntimeOptions)
       // contained too. The native helper must never interrupt current ASR.
       void Promise.resolve()
         .then(() => options.applySpeakerEvidence(event.evidence.meetingId, [toMeetingSpeakerEvidence(event.evidence)]))
-        .catch(() => {});
+        .then(() => {
+          if (diagnostics) console.error('[MeetingBridge] speaker evidence applied');
+        })
+        .catch(() => {
+          if (diagnostics) console.error('[MeetingBridge] speaker evidence apply failed');
+        });
+    },
+    onStatus: (status) => {
+      if (diagnostics) {
+        console.error(`[MeetingBridge] status=${status.state} restarts=${status.restartCount}`);
+      }
     },
   });
 
@@ -98,9 +122,19 @@ export function createMeetingBridgeRuntime(options: MeetingBridgeRuntimeOptions)
 
   return {
     async warm(meetingId: string): Promise<boolean> {
-      if (!enabled()) return false;
-      if (activeMeetingId && activeMeetingId !== meetingId) return false;
-      if (warmingMeetingId === meetingId && warmPromise) return warmPromise;
+      if (!enabled()) {
+        if (diagnostics) console.error('[MeetingBridge] warm skipped reason=disabled');
+        return false;
+      }
+      if (activeMeetingId && activeMeetingId !== meetingId) {
+        if (diagnostics) console.error('[MeetingBridge] warm skipped reason=other-active-meeting');
+        return false;
+      }
+      if (warmingMeetingId === meetingId && warmPromise) {
+        if (diagnostics) console.error('[MeetingBridge] warm joined existing attempt');
+        return warmPromise;
+      }
+      if (diagnostics) console.error('[MeetingBridge] warm requested');
 
       // Record identity/generation before the await. `stop()` can then
       // invalidate the attempt while a slow handshake is still resolving.
@@ -121,6 +155,7 @@ export function createMeetingBridgeRuntime(options: MeetingBridgeRuntimeOptions)
         .then((ready) => {
           if (generation !== warmGeneration || warmingMeetingId !== meetingId) return false;
           warmedMeetingId = ready ? meetingId : null;
+          if (diagnostics) console.error(`[MeetingBridge] warm completed ready=${ready}`);
           return ready;
         })
         .catch(() => {
@@ -138,7 +173,12 @@ export function createMeetingBridgeRuntime(options: MeetingBridgeRuntimeOptions)
       warmPromise = attempt;
       return attempt;
     },
-    captureReady: activate,
+    async captureReady(meetingId: string): Promise<boolean> {
+      if (diagnostics) console.error('[MeetingBridge] capture ready requested');
+      const started = await activate(meetingId);
+      if (diagnostics) console.error(`[MeetingBridge] capture ready completed started=${started}`);
+      return started;
+    },
     // A self-hosted ASR session restart does not need to tear down healthy
     // native capture. An active matching bridge is left running; a crashed
     // helper stays off until the next meeting because its sample clock resets.

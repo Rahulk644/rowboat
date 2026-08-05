@@ -101,8 +101,7 @@ impl MacosZoomAnarlogProvider {
     }
 
     fn observed_at_sample(&self) -> u64 {
-        let micros = self.meeting_started_at.elapsed().as_micros();
-        micros.saturating_mul(16).min(u128::from(u64::MAX)) as u64
+        samples_at_16khz(self.meeting_started_at.elapsed())
     }
 
     /// Direct-helper diagnostics are deliberately opt-in and summary-only.
@@ -124,6 +123,16 @@ impl MacosZoomAnarlogProvider {
         );
         self.last_diagnostics = Some(diagnostics);
     }
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn samples_at_16khz(elapsed: Duration) -> u64 {
+    elapsed
+        .as_nanos()
+        .saturating_mul(16_000)
+        .checked_div(1_000_000_000)
+        .unwrap_or(0)
+        .min(u128::from(u64::MAX)) as u64
 }
 
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
@@ -1405,14 +1414,23 @@ mod tests {
     #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
     use super::{
         find_zoom_active_speakers, inspect_zoom_windows, is_zoom_top_level_auxiliary_dialog,
-        zoom_account_self_name, zoom_ax_enhancement_retry_due, zoom_meeting_window_validation,
-        AxEnhancementAttempt, SurfaceDiscoveryStats, ZoomAxDiagnostic, ZoomAxNode,
+        samples_at_16khz, zoom_account_self_name, zoom_ax_enhancement_retry_due,
+        zoom_meeting_window_validation, AxEnhancementAttempt, SurfaceDiscoveryStats,
+        ZoomAxDiagnostic, ZoomAxNode,
     };
     #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
     use std::{
         collections::HashSet,
         time::{Duration, Instant},
     };
+
+    #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+    #[test]
+    fn monotonic_duration_uses_the_canonical_16khz_sample_clock() {
+        assert_eq!(samples_at_16khz(Duration::from_secs(1)), 16_000);
+        assert_eq!(samples_at_16khz(Duration::from_millis(250)), 4_000);
+        assert_eq!(samples_at_16khz(Duration::from_micros(1)), 0);
+    }
 
     #[test]
     fn roster_presence_does_not_turn_into_a_speaking_claim() {
