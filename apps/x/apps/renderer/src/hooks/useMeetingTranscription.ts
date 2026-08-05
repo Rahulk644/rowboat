@@ -6,6 +6,7 @@ import { useRowboatAccount } from '@/hooks/useRowboatAccount';
 import { fetchRowboatConfig } from '@/hooks/use-rowboat-config';
 import {
     createTranscriptV2Block,
+    isCanonicalTranscriptSnapshot,
     normalizeTranscriptSegments,
     removeTranscriptSegment,
     renderNewMeetingNote,
@@ -276,11 +277,16 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
     const applySelfHostedSnapshot = useCallback((channel: SelfHostedChannel, snapshot: SelfHostedSnapshot) => {
         // Canonical bridge events have segment IDs, revisions, intervals, and
         // resolved speaker evidence. Prefer them wholesale over the legacy
-        // text-prefix protocol.
+        // text-prefix protocol. An empty v2 `segments` array is an intentional
+        // no-op delta, not a legacy snapshot: falling through would replay the
+        // cumulative `full`/`committed` text because the legacy cursor has
+        // never advanced on this v2 session.
         const v2Segments = normalizeTranscriptSegments(snapshot);
-        if (v2Segments.length > 0) {
+        if (isCanonicalTranscriptSnapshot(snapshot)) {
             const meetingId = transcriptMeetingIdRef.current ?? undefined;
-            upsertSegments(v2Segments.map(segment => ({ ...segment, meetingId: segment.meetingId ?? meetingId })));
+            if (v2Segments.length > 0) {
+                upsertSegments(v2Segments.map(segment => ({ ...segment, meetingId: segment.meetingId ?? meetingId })));
+            }
             return;
         }
 

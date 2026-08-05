@@ -117,6 +117,101 @@ test('canonical v2 segment merging is idempotent and accepts only higher revisio
   assert.deepEqual(mergeMeetingTranscriptSegments([base], [revised]), [revised]);
 });
 
+test('revised provisional windows become deterministic stable windows without final duplicates', async (t) => {
+  const originalUrl = process.env.ROWBOAT_MEETING_STT_URL;
+  const originalToken = process.env.ROWBOAT_MEETING_STT_TOKEN;
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    if (originalUrl === undefined) delete process.env.ROWBOAT_MEETING_STT_URL;
+    else process.env.ROWBOAT_MEETING_STT_URL = originalUrl;
+    if (originalToken === undefined) delete process.env.ROWBOAT_MEETING_STT_TOKEN;
+    else process.env.ROWBOAT_MEETING_STT_TOKEN = originalToken;
+    globalThis.fetch = originalFetch;
+  });
+
+  process.env.ROWBOAT_MEETING_STT_TOKEN = TOKEN;
+  process.env.ROWBOAT_MEETING_STT_URL = 'http://127.0.0.1:18091';
+  const liveSnapshots = [
+    { full: 'this time taken you', committed: 'this time', tentative: 'taken you', revision: 1 },
+    { full: 'this time taken you are shown', committed: 'this time', tentative: 'taken you are shown', revision: 2 },
+    { full: 'this time taken you are showing', committed: 'this time taken you', tentative: 'are showing', revision: 3 },
+  ];
+  const finalSnapshot = {
+    full: 'this time taken you are showing is this the av',
+    committed: 'this time taken you',
+    tentative: 'are showing is this the av',
+    revision: 4,
+  };
+  let systemFeed = 0;
+  globalThis.fetch = async (input) => {
+    const url = new URL(input.toString());
+    const session = url.searchParams.get('session') ?? '';
+    if (url.pathname === '/stream/feed') {
+      const snapshot = session.endsWith('.system') ? liveSnapshots[systemFeed++]! : {
+        full: '', committed: '', tentative: '', revision: 0,
+      };
+      return new Response(JSON.stringify({
+        session, ...snapshot, changed: true, final: false, inputMs: 0, bufferedMs: 0,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    if (url.pathname === '/stream/finalize') {
+      const snapshot = session.endsWith('.system') ? finalSnapshot : {
+        full: '', committed: '', tentative: '', revision: 0,
+      };
+      return new Response(JSON.stringify({
+        session, ...snapshot, changed: true, final: true, inputMs: 0, bufferedMs: 0,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({ ok: true, session }), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    });
+  };
+
+  const provider = new SelfHostedMeetingTranscription();
+  await provider.begin('revised window', 'en');
+  const pcm = Buffer.alloc(32_000).toString('base64');
+  const first = await provider.feed('revised window', 'system', pcm, {
+    startSample: 0, sampleCount: 16_000, sampleRate: 16_000, sequence: 0,
+  });
+  assert.deepEqual(first.segments.map((segment) => [segment.segmentId, segment.revision, segment.text]), [
+    ['revised-window:system:e0:stable:0', 0, 'this time'],
+    ['revised-window:system:e0:provisional:16000', 0, 'taken you'],
+  ]);
+
+  const revised = await provider.feed('revised window', 'system', pcm, {
+    startSample: 16_000, sampleCount: 16_000, sampleRate: 16_000, sequence: 1,
+  });
+  assert.deepEqual(revised.segments.map((segment) => [segment.segmentId, segment.revision, segment.text]), [
+    ['revised-window:system:e0:provisional:16000', 1, 'taken you are shown'],
+  ]);
+
+  const committed = await provider.feed('revised window', 'system', pcm, {
+    startSample: 32_000, sampleCount: 16_000, sampleRate: 16_000, sequence: 2,
+  });
+  assert.deepEqual(committed.segments.map((segment) => [segment.segmentId, segment.text, segment.supersedes]), [
+    ['revised-window:system:e0:stable:16000', 'taken you', ['revised-window:system:e0:provisional:16000']],
+    ['revised-window:system:e0:provisional:48000', 'are showing', []],
+  ]);
+
+  const final = await provider.finalize('revised window');
+  const finalSegments = final.system.segments;
+  assert.equal(finalSegments.some((segment) => segment.segmentId.includes(':provisional:')), false);
+  assert.deepEqual(
+    finalSegments
+      .filter((segment) => segment.segmentId.includes(':stable:'))
+      .map((segment) => [segment.segmentId, segment.finality, segment.text]),
+    [
+      ['revised-window:system:e0:stable:0', 'final', 'this time'],
+      ['revised-window:system:e0:stable:16000', 'final', 'taken you'],
+      ['revised-window:system:e0:stable:48000', 'final', 'are showing is this the av'],
+    ],
+  );
+  assert.deepEqual(
+    finalSegments.find((segment) => segment.segmentId.endsWith(':stable:48000'))?.supersedes,
+    ['revised-window:system:e0:provisional:48000'],
+  );
+});
+
 test('a discontinuity resets only its worker session and starts a non-duplicating epoch', async (t) => {
   const originalUrl = process.env.ROWBOAT_MEETING_STT_URL;
   const originalToken = process.env.ROWBOAT_MEETING_STT_TOKEN;

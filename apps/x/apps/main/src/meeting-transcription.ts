@@ -119,7 +119,6 @@ type ChannelState = {
   nextSequence: number;
   pendingStartSample: number | null;
   committed: string;
-  nextStableOrdinal: number;
   interimSegmentId: string | null;
   interimRevision: number;
   lastFeed?: MeetingAudioFeed;
@@ -239,7 +238,6 @@ function newChannelState(meetingId: string, channel: MeetingAudioChannel): Chann
     nextSequence: 0,
     pendingStartSample: null,
     committed: '',
-    nextStableOrdinal: 0,
     interimSegmentId: null,
     interimRevision: 0,
     health: {
@@ -584,7 +582,6 @@ export class SelfHostedMeetingTranscription {
     state.epoch = epoch;
     state.pendingStartSample = null;
     state.committed = '';
-    state.nextStableOrdinal = 0;
     state.interimSegmentId = null;
     state.interimRevision = 0;
     state.health = {
@@ -609,37 +606,43 @@ export class SelfHostedMeetingTranscription {
     const startSample = state.pendingStartSample ?? endSample;
     const updates: MeetingTranscriptSegment[] = [];
     const priorInterim = state.interimSegmentId;
+    const finalizingSnapshot = finalizing || worker.final;
+    let supersededPriorInterim = false;
 
-    // The server currently returns a text prefix without token timestamps.
-    // Only append-only committed deltas become stable segments, and their
-    // entire pending feed window is deliberately labelled low-confidence.
+    // Nemotron streams a cumulative committed prefix plus a revisable tail.
+    // A stable prefix closes one audio window; its identity derives from that
+    // window's start sample, rather than from delivery order. The next
+    // tentative tail therefore has a new deterministic ID and can coexist in
+    // the same snapshot without being mistaken for the just-superseded tail.
     if (worker.committed && isPrefix(state.committed, worker.committed)) {
       const appended = worker.committed.slice(state.committed.length).trim();
       if (appended) {
-        const id = segmentId(meetingId, channel, state.epoch, `stable:${state.nextStableOrdinal++}`);
+        const id = segmentId(meetingId, channel, state.epoch, `stable:${startSample}`);
         updates.push({
           meetingId, segmentId: id, revision: 0, epoch: state.epoch,
           startSample, endSample,
           timingConfidence: 'low', timingSource: 'feed-window', channel, text: appended,
-          finality: finalizing || worker.final ? 'final' : 'stable',
+          finality: finalizingSnapshot ? 'final' : 'stable',
           clusterIds: [], overlap: false, speaker: unknownSpeaker(),
           attributionSource: 'self-hosted-feed-window', attributionConfidence: 0,
           supersedes: priorInterim ? [priorInterim] : [],
         });
         state.pendingStartSample = endSample;
+        supersededPriorInterim = priorInterim !== null;
       }
       state.committed = worker.committed;
     }
 
     const tentative = worker.tentative.trim();
-    if (tentative && !finalizing && !worker.final) {
-      const id = segmentId(meetingId, channel, state.epoch, 'interim');
+    if (tentative && !finalizingSnapshot) {
+      const tentativeStartSample = state.pendingStartSample ?? endSample;
+      const id = segmentId(meetingId, channel, state.epoch, `provisional:${tentativeStartSample}`);
       const previous = active.segments.get(id);
       const interim: MeetingTranscriptSegment = {
         meetingId, segmentId: id,
         revision: previous ? previous.revision + 1 : 0,
         epoch: state.epoch,
-        startSample: state.pendingStartSample ?? startSample,
+        startSample: tentativeStartSample,
         endSample,
         timingConfidence: 'low', timingSource: 'feed-window', channel, text: tentative,
         finality: 'interim', clusterIds: [], overlap: false, speaker: unknownSpeaker(),
@@ -653,11 +656,74 @@ export class SelfHostedMeetingTranscription {
       state.interimSegmentId = null;
     }
 
-    if (finalizing || worker.final) {
+    if (finalizingSnapshot) {
+      // The final response is the authoritative cumulative text for the
+      // current window. Convert only its not-yet-committed tail to a stable
+      // segment and tombstone the revisable provisional record. Promoting the
+      // provisional record itself would leave the same words both in the
+      // final full window and in older stable fragments.
+      const finalText = worker.full.trim();
+      if (finalText && isPrefix(state.committed, finalText)) {
+        const finalTail = finalText.slice(state.committed.length).trim();
+        if (finalTail) {
+          const finalStartSample = state.pendingStartSample ?? startSample;
+          const finalId = segmentId(meetingId, channel, state.epoch, `stable:${finalStartSample}`);
+          const previous = active.segments.get(finalId);
+          updates.push({
+            meetingId, segmentId: finalId,
+            revision: previous ? previous.revision + 1 : 0,
+            epoch: state.epoch,
+            startSample: finalStartSample,
+            endSample,
+            timingConfidence: 'low', timingSource: 'feed-window', channel, text: finalTail,
+            finality: 'final', clusterIds: [], overlap: false, speaker: unknownSpeaker(),
+            attributionSource: 'self-hosted-feed-window', attributionConfidence: 0,
+            supersedes: priorInterim ? [priorInterim] : [],
+          });
+          state.committed = finalText;
+          state.pendingStartSample = endSample;
+          supersededPriorInterim = priorInterim !== null;
+        }
+      }
+
+      // If there is no final tail (for example, all text was already
+      // committed), one existing stable segment still carries the tombstone so
+      // the renderer removes the provisional record. This is a real revision,
+      // not a duplicate transcript line.
+      if (priorInterim && !supersededPriorInterim) {
+        const stable = [...active.segments.values()]
+          .filter((segment) => segment.channel === channel && segment.epoch === state.epoch && segment.segmentId !== priorInterim)
+          .sort((left, right) => right.endSample - left.endSample || right.revision - left.revision)[0];
+        if (stable) {
+          updates.push({
+            ...stable,
+            revision: stable.revision + 1,
+            finality: 'final',
+            supersedes: [...new Set([...(stable.supersedes ?? []), priorInterim])],
+          });
+          supersededPriorInterim = true;
+        }
+      }
+
+      const updateIds = new Set(updates.map((update) => update.segmentId));
       for (const existing of active.segments.values()) {
-        if (existing.channel !== channel || existing.epoch !== state.epoch || existing.finality === 'final') continue;
+        if (
+          existing.channel !== channel
+          || existing.epoch !== state.epoch
+          || existing.finality === 'final'
+          || existing.segmentId === priorInterim
+          || updateIds.has(existing.segmentId)
+        ) continue;
         updates.push({ ...existing, revision: existing.revision + 1, finality: 'final' });
       }
+    }
+
+    // Main owns the same tombstone semantics as the renderer. Otherwise a
+    // later finalize would see an already-superseded provisional record and
+    // incorrectly promote it to a second final fragment.
+    if (supersededPriorInterim && priorInterim) {
+      active.segments.delete(priorInterim);
+      active.pendingAttributionUpserts.delete(priorInterim);
     }
 
     const merged = mergeMeetingTranscriptSegments(active.segments.values(), updates);

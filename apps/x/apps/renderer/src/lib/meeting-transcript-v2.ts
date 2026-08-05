@@ -165,6 +165,15 @@ export function normalizeTranscriptSegments(value: unknown): TranscriptSegment[]
   })
 }
 
+/**
+ * A canonical snapshot may legitimately contain no segment upserts. Callers
+ * must treat that as a v2 no-op rather than replaying its legacy cumulative
+ * text fields into a second transcript representation.
+ */
+export function isCanonicalTranscriptSnapshot(value: unknown): boolean {
+  return isRecord(value) && (value.version === TRANSCRIPT_V2_VERSION || Array.isArray(value.segments))
+}
+
 function compareSegments(a: TranscriptSegment, b: TranscriptSegment): number {
   return a.startSample - b.startSample
     || a.endSample - b.endSample
