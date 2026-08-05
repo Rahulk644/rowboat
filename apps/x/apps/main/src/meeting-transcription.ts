@@ -163,6 +163,8 @@ type ActiveMeeting = {
   corrections: Map<string, { displayName: string; rememberVoice: boolean }>;
   speakerEvidence: MeetingSpeakerEvidence[];
   pendingAttributionUpserts: Map<string, MeetingTranscriptSegment>;
+  /** True only when the capture-time output device is acoustically isolated. */
+  outputRouteIsolated: boolean;
   /** Absent unless explicitly requested by the operator or dev environment. */
   diagnostics: Record<MeetingAudioChannel, ChannelDiagnosticsState> | null;
 };
@@ -390,6 +392,7 @@ export class SelfHostedMeetingTranscription {
         corrections: new Map(),
         speakerEvidence: [],
         pendingAttributionUpserts: new Map(),
+        outputRouteIsolated: false,
         diagnostics: diagnosticsEnabledByEnvironment() ? newMeetingDiagnostics() : null,
       });
     } catch (error) {
@@ -552,11 +555,28 @@ export class SelfHostedMeetingTranscription {
     return { segments: updated };
   }
 
+  /**
+   * Records capture-time device evidence for this meeting. A headphone/wired
+   * route qualifies microphone text as the local speaker; a loudspeaker route
+   * deliberately remains unresolved until measured AEC/leak evidence exists.
+   */
+  setOutputRouteIsolation(
+    meetingId: string,
+    outputRouteIsolated: boolean,
+  ): { segments: MeetingTranscriptSegment[] } {
+    const active = this.requireActive(meetingId);
+    active.outputRouteIsolated = outputRouteIsolated;
+    const updated = this.resolveStoredSpeakerEvidence(active, active.segments.keys());
+    this.enqueueAttributionUpserts(active, updated);
+    return { segments: updated };
+  }
+
   private resolveStoredSpeakerEvidence(
     active: ActiveMeeting,
     segmentIds: Iterable<string>,
     options: SpeakerEvidenceApplicationOptions = {},
   ): MeetingTranscriptSegment[] {
+    const outputRouteIsolated = options.outputRouteIsolated ?? active.outputRouteIsolated;
     const updated: MeetingTranscriptSegment[] = [];
     for (const segmentIdValue of segmentIds) {
       const segment = active.segments.get(segmentIdValue);
@@ -567,7 +587,7 @@ export class SelfHostedMeetingTranscription {
       const voiceProfile = options.voiceProfilesBySegment?.[segment.segmentId];
       const stableClusterIds = options.stableClusterIdsBySegment?.[segment.segmentId];
       const qualifiedMic = segment.channel === 'mic'
-        && (options.playbackReferenceHealthy === true || options.outputRouteIsolated === true);
+        && (options.playbackReferenceHealthy === true || outputRouteIsolated);
       // Do not touch unrelated historical records when a bridge batch covers
       // another interval. A remembered explicit correction remains in the
       // resolver input for the intervals that are re-evaluated.
@@ -577,7 +597,7 @@ export class SelfHostedMeetingTranscription {
         correction: correction ? { displayName: correction.displayName } : undefined,
         micHealth: active.channels[segment.channel].health,
         playbackReferenceHealthy: options.playbackReferenceHealthy,
-        outputRouteIsolated: options.outputRouteIsolated,
+        outputRouteIsolated,
         micLeakSuspected: options.micLeakSuspected,
         evidence: segmentEvidence,
         voiceProfile,

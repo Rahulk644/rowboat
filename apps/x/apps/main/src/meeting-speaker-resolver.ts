@@ -94,6 +94,7 @@ function isQualifiedMic(segment: MeetingTranscriptSegment, input: SpeakerResolut
 type ActiveCandidate = {
   id: string;
   name: string;
+  isSelf: boolean;
   coverage: number;
   weightedCoverage: number;
   maxConfidence: number;
@@ -137,8 +138,10 @@ function activeCandidates(
     ) continue;
     const id = item.participantId?.trim() || `name:${name.toLocaleLowerCase()}`;
     const candidate = byParticipant.get(id) ?? {
-      id, name, coverage: 0, weightedCoverage: 0, maxConfidence: 0, sources: new Set<string>(), ranges: [],
+      id, name, isSelf: item.isSelf === true,
+      coverage: 0, weightedCoverage: 0, maxConfidence: 0, sources: new Set<string>(), ranges: [],
     };
+    candidate.isSelf ||= item.isSelf === true;
     candidate.ranges.push({
       start: Math.max(segment.startSample, item.startSample),
       end: Math.min(segment.endSample, item.endSample),
@@ -184,7 +187,9 @@ function activeResolution(
   const [winner, runnerUp] = candidates;
   if (!runnerUp || winner.weightedCoverage >= runnerUp.weightedCoverage * DOMINANCE_RATIO) {
     return {
-      speaker: { kind: 'named', id: winner.id, displayName: winner.name },
+      speaker: winner.isSelf
+        ? { kind: 'self', id: 'self', displayName: 'You' }
+        : { kind: 'named', id: winner.id, displayName: winner.name },
       clusterIds: [], overlap: false,
       attributionSource: [...winner.sources].sort().join('+'),
       attributionConfidence: Math.max(0, Math.min(1, winner.maxConfidence)),
@@ -194,7 +199,10 @@ function activeResolution(
   // evidence. The two names remain visible in the resolution label while the
   // canonical speaker kind deliberately stays unknown.
   return {
-    speaker: { kind: 'unknown', displayName: candidates.map((candidate) => candidate.name).join(' + ') },
+    speaker: {
+      kind: 'unknown',
+      displayName: candidates.map((candidate) => candidate.isSelf ? 'You' : candidate.name).join(' + '),
+    },
     clusterIds: [], overlap: true,
     attributionSource: 'trusted-ax-overlap',
     attributionConfidence: Math.max(0, Math.min(1, winner.maxConfidence)),

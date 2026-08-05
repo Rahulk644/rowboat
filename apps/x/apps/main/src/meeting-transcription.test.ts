@@ -339,13 +339,12 @@ test('main emits one canonical system upsert when the matching mic segment is ec
 
   const provider = new SelfHostedMeetingTranscription();
   await provider.begin('echo pair', 'en');
+  provider.setOutputRouteIsolation('echo pair', true);
   const pcm = Buffer.alloc(32_000).toString('base64');
   const mic = await provider.feed('echo pair', 'mic', pcm, {
     startSample: 0, sampleCount: 16_000, sampleRate: 16_000, sequence: 0,
   });
-  assert.equal(mic.segments[0]?.speaker.kind, 'unknown');
-  const qualified = provider.applySpeakerEvidence('echo pair', [], { outputRouteIsolated: true });
-  assert.deepEqual(qualified.segments.map((segment) => ({
+  assert.deepEqual(mic.segments.map((segment) => ({
     kind: segment.speaker.kind,
     displayName: segment.speaker.displayName,
     source: segment.attributionSource,

@@ -827,6 +827,7 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
             try {
                 await window.ipc.invoke('meeting:transcription:captureReady', {
                     meetingId: selfHostedCaptureMeetingId,
+                    outputRouteIsolated: usingHeadphones,
                 });
             } catch (error) {
                 console.error('[meeting] Failed to mark capture ready:', error);

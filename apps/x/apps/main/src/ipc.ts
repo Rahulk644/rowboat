@@ -1003,6 +1003,10 @@ export function setupIpcHandlers() {
     },
     'meeting:transcription:captureReady': async (_event, args) => {
       if (bridgeEligibleMeetings.has(args.meetingId)) {
+        selfHostedMeetingTranscription.setOutputRouteIsolation(
+          args.meetingId,
+          args.outputRouteIsolated,
+        );
         await meetingBridgeRuntime.captureReady(args.meetingId);
       }
       return { success: true as const };

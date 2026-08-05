@@ -1192,7 +1192,16 @@ const ipcSchemas = {
   // immediately before it connects the graph. This starts an already-warm
   // helper at the same sample origin rather than after capture has advanced.
   'meeting:transcription:captureReady': {
-    req: z.object({ meetingId: z.string().min(1).max(120) }),
+    req: z.object({
+      meetingId: z.string().min(1).max(120),
+      // This is capture-time device evidence, not a user preference. Only a
+      // physically isolated output route makes microphone ownership safe
+      // without an acoustic playback-leak detector.
+      // Default false keeps a stale development renderer fail-closed during
+      // hot reload instead of preventing the independent evidence bridge from
+      // starting.
+      outputRouteIsolated: z.boolean().default(false),
+    }),
     res: z.object({ success: z.literal(true) }),
   },
   // A developer/operator must explicitly enable this. It creates only

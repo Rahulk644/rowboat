@@ -55,7 +55,7 @@ test('self AX evidence can label microphone text but cannot label system text', 
     isActive: true, startSample: 0, endSample: 16_000, confidence: 1,
   }] as const;
   const mic = resolveMeetingSpeaker(segment({ channel: 'mic' }), { evidence: [...evidence] });
-  assert.deepEqual(mic.speaker, { kind: 'named', id: 'rahul', displayName: 'Rahul' });
+  assert.deepEqual(mic.speaker, { kind: 'self', id: 'self', displayName: 'You' });
   assert.equal(mic.attributionSource, 'zoom_ax');
 
   const system = resolveMeetingSpeaker(segment(), { evidence: [...evidence] });

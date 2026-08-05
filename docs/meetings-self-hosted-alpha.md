@@ -64,6 +64,13 @@ threshold and runner-up margin; anonymous stable cluster; unknown. Passive
 rosters do not name a turn. Simultaneous active people are overlap, not a
 fabricated word split.
 
+At capture-ready time the renderer forwards its output-route classification to
+main. A headphone/wired route qualifies healthy microphone segments as `You`;
+an explicit local active-speaker Accessibility assertion does the same. Laptop
+speakers remain fail-closed because remote playback can enter the microphone:
+without measured AEC/reference health, ambiguous mic segments stay `Unknown
+speaker` instead of repeating a remote participant under `You`.
+
 ## KVM and SSH tunnel
 
 Rowboat permits only a loopback HTTP STT URL. Reach the private VPS through a
