@@ -26,12 +26,14 @@ import { isNotificationCategoryEnabled } from "../config/notification_config.js"
  * Fires at most once per continuous mic-in-use session; the session resets
  * after the mic has been idle for MIC_SESSION_RESET_MS.
  *
- * While Rowboat records, the same owner list powers call-end detection: once
- * a meeting app has been seen on the mic, its absence for CALL_END_GRACE_MS
- * means the call ended.
+ * While Rowboat records, mic ownership can prove that a call is active, but
+ * it can never prove that a call ended: Zoom and other clients release the
+ * microphone when the local participant mutes. Automatic stop therefore
+ * requires a separate, explicit lifecycle observation. Without one, capture
+ * stays active until the user stops it.
  */
 
-// 1s so call-end lands within ~2s of hang-up; all tick work is in-memory
+// One second keeps ambient detection responsive; all tick work is in-memory
 // (the helper pushes owner updates, nothing is spawned).
 const POLL_INTERVAL_MS = 1_000;
 // Mic must be in use continuously this long before we prompt — filters out
@@ -42,10 +44,6 @@ const MIC_SESSION_RESET_MS = 30_000;
 // A calendar event merges with a detected call from 15 min before its start
 // (Granola merges ad-hoc calls within 15 minutes of a scheduled event).
 const CALENDAR_MERGE_LEAD_MS = 15 * 60_000;
-// While recording, the meeting app must be off the mic this long before we
-// call the meeting over. Kept short so notes arrive right after hang-up;
-// only guards against sub-poll device churn, not full reconnects.
-const CALL_END_GRACE_MS = 1_000;
 const CALENDAR_SYNC_DIR = path.join(WorkDir, "calendar_sync");
 const HELPER_MAX_RESTARTS = 3;
 
@@ -138,17 +136,84 @@ interface MicOwner {
     path: string;
 }
 
+/**
+ * A trusted platform adapter may report a positive meeting lifecycle state.
+ * Missing/failed observations must be represented as `unknown`; importantly,
+ * they are not evidence that the meeting surface disappeared.
+ */
+export type ExternalCallLifecycleEvidence = "active" | "ended" | "unknown";
+
+export type ExternalCallEndState = {
+    externalAppSeen: boolean;
+    callEndFired: boolean;
+};
+
+export type ExternalCallEndObservation = {
+    selfCaptureActive: boolean;
+    externalMeetingAppOwnsMic: boolean;
+    lifecycleEvidence: ExternalCallLifecycleEvidence;
+};
+
+export type ExternalCallEndDecision = {
+    state: ExternalCallEndState;
+    shouldEnd: boolean;
+};
+
+/**
+ * Advance automatic call-end state without treating microphone ownership as a
+ * lifecycle signal. A known meeting app on the mic is useful positive proof
+ * that a call exists. Its later absence is ambiguous (mute, device change,
+ * or the client merely releasing input) and must retain recording. Only a
+ * separate, trusted `ended` observation can request automatic finalization.
+ */
+export function observeExternalCallEnd(
+    previous: ExternalCallEndState,
+    observation: ExternalCallEndObservation,
+): ExternalCallEndDecision {
+    if (!observation.selfCaptureActive) {
+        return {
+            state: { externalAppSeen: false, callEndFired: false },
+            shouldEnd: false,
+        };
+    }
+    if (previous.callEndFired) return { state: previous, shouldEnd: false };
+
+    if (observation.externalMeetingAppOwnsMic) {
+        return {
+            state: { externalAppSeen: true, callEndFired: false },
+            shouldEnd: false,
+        };
+    }
+
+    // Active and unknown both intentionally retain the recording. `unknown`
+    // is the normal path today: the current mic monitor cannot observe a
+    // platform's call lifecycle, only its local microphone usage.
+    if (observation.lifecycleEvidence !== "ended" || !previous.externalAppSeen) {
+        return { state: previous, shouldEnd: false };
+    }
+    return {
+        state: { externalAppSeen: true, callEndFired: true },
+        shouldEnd: true,
+    };
+}
+
 interface DetectorOptions {
     /** Absolute path to the compiled mic-monitor helper binary. */
     helperPath: string;
     onDetected: (meeting: DetectedMeeting) => void;
     /**
-     * Fired once per recording session when the meeting app that was on the
-     * mic has released it for CALL_END_GRACE_MS while Rowboat is still
-     * capturing — i.e. the call ended. Needs per-process attribution
-     * (macOS 14.4+); silently unavailable otherwise.
+     * Fired once per recording session only after a trusted platform adapter
+     * positively reports that the meeting ended. Microphone ownership changes
+     * (including mute) can never trigger this callback on their own.
      */
     onExternalCallEnded?: () => void;
+    /**
+     * Optional positive lifecycle observation from a bounded, trusted
+     * meeting-surface/process adapter. Omit this until an adapter can
+     * distinguish `ended` from merely unavailable; the detector then fails
+     * safe to manual stop.
+     */
+    getExternalCallLifecycleEvidence?: () => ExternalCallLifecycleEvidence;
 }
 
 let started = false;
@@ -162,7 +227,6 @@ let sessionNotified = false;
 let helperRestarts = 0;
 // Call-end tracking for the current self-capture session.
 let externalAppSeen = false;
-let externalAbsentSince: number | null = null;
 let callEndFired = false;
 
 /**
@@ -171,10 +235,12 @@ let callEndFired = false;
  * prompt about our own audio.
  */
 export function setSelfCaptureActive(active: boolean): void {
+    if (selfCaptureActive === active) return;
     selfCaptureActive = active;
-    // Fresh capture session — re-arm call-end tracking.
+    // A capture transition starts a fresh session and re-arms lifecycle
+    // tracking. Repeated status reports within the same capture must not
+    // discard a verified prior observation.
     externalAppSeen = false;
-    externalAbsentSince = null;
     callEndFired = false;
     if (active) {
         // Whatever mic session is in flight is ours — don't prompt when the
@@ -199,7 +265,7 @@ export function init(options: DetectorOptions): void {
     setInterval(() => {
         try {
             tick(options.onDetected);
-            checkExternalCallEnd(options.onExternalCallEnded);
+            checkExternalCallEnd(options);
         } catch (err) {
             console.error("[MeetingDetect] tick failed:", err);
         }
@@ -292,44 +358,39 @@ function tick(onDetected: DetectorOptions["onDetected"]): void {
 }
 
 /**
- * While Rowboat is recording, watch whether any known meeting app/browser
- * still owns the mic. Once one has been seen, its absence for
- * CALL_END_GRACE_MS means the call ended — fire once per session. Fully
- * synchronous: reads the helper-provided owner list, spawns nothing.
+ * While Rowboat is recording, keep track of whether a known meeting
+ * app/browser has been observed on the mic. Its absence never means that the
+ * call ended because muting releases that ownership. The optional lifecycle
+ * adapter must supply an explicit `ended` state before this can fire.
  */
-function checkExternalCallEnd(onExternalCallEnded?: () => void): void {
-    if (!onExternalCallEnded) return;
-    if (!selfCaptureActive || callEndFired) return;
-    // No attribution data (pre-14.4 macOS) — feature unavailable.
-    if (micOwners.length === 0) return;
-
-    const now = Date.now();
+function checkExternalCallEnd(options: DetectorOptions): void {
+    if (!options.onExternalCallEnded) return;
     const externalOnMic = micOwners.some((owner) => {
         const match = matchOwner(owner);
         return match !== null && match !== "self";
     });
-    if (externalOnMic) {
-        if (!externalAppSeen) {
-            console.log(
-                `[MeetingDetect] call-end watch armed — mic owners: ${describeOwners(micOwners)}`,
-            );
-        }
-        externalAppSeen = true;
-        externalAbsentSince = null;
-        return;
+    let lifecycleEvidence: ExternalCallLifecycleEvidence = "unknown";
+    try {
+        const reported = options.getExternalCallLifecycleEvidence?.();
+        if (reported === "active" || reported === "ended") lifecycleEvidence = reported;
+    } catch {
+        // An unavailable adapter is unknown, never a false call end.
     }
-    if (!externalAppSeen) return;
-    if (externalAbsentSince === null) {
-        externalAbsentSince = now;
+    const wasExternalAppSeen = externalAppSeen;
+    const decision = observeExternalCallEnd(
+        { externalAppSeen, callEndFired },
+        { selfCaptureActive, externalMeetingAppOwnsMic: externalOnMic, lifecycleEvidence },
+    );
+    externalAppSeen = decision.state.externalAppSeen;
+    callEndFired = decision.state.callEndFired;
+    if (externalOnMic && !wasExternalAppSeen) {
         console.log(
-            `[MeetingDetect] meeting app off the mic — remaining owners: ${describeOwners(micOwners)}`,
+            `[MeetingDetect] call lifecycle observed active on mic: ${describeOwners(micOwners)}`,
         );
-        return;
     }
-    if (now - externalAbsentSince >= CALL_END_GRACE_MS) {
-        callEndFired = true;
-        console.log("[MeetingDetect] meeting app released the mic — call likely ended");
-        onExternalCallEnded();
+    if (decision.shouldEnd) {
+        console.log("[MeetingDetect] trusted meeting lifecycle reports call ended");
+        options.onExternalCallEnded();
     }
 }
 
