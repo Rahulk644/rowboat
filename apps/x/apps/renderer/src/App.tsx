@@ -6529,14 +6529,38 @@ function App() {
 
   const handleToggleMeeting = useCallback(async () => {
     if (meetingTranscription.state === 'recording') {
-      await meetingTranscription.stop()
+      const stopResult = await meetingTranscription.stop()
       const recordingStartedAt = meetingRecordingStartedAtMsRef.current
       meetingRecordingStartedAtMsRef.current = null
       analytics.meetingRecordingStopped(recordingStartedAt != null ? (performance.now() - recordingStartedAt) / 1000 : 0)
       setRecordingMeetingSource(null)
 
-      // Read the final transcript and generate meeting notes via LLM
+      // Wispr is the single processing owner for its provider path. The hook
+      // has already merged Wispr's title, thoughts, summary, participants,
+      // and final transcript into the Rowboat note. Refresh/index that note,
+      // but never spend another model call re-summarizing the same meeting.
       const notePath = meetingNotePathRef.current
+      if (notePath && stopResult?.provider === 'wispr-flow') {
+        if (stopResult.artifactImported) {
+          await handleVoiceNoteCreated(notePath)
+          void window.ipc.invoke('app:focusMainWindow', null).catch(() => {})
+          void window.ipc
+            .invoke('meeting:notifyNotesReady', {
+              notePath,
+              title: stopResult.title ?? 'Meeting Notes',
+            })
+            .catch(() => { /* notification is best-effort */ })
+        } else {
+          toast.error('Wispr meeting saved, but its finished notes were not available', {
+            description: 'The live transcript remains in Rowboat. Open Wispr Flow to confirm its post-call processing completed.',
+            duration: 10_000,
+          })
+        }
+        meetingNotePathRef.current = null
+        return
+      }
+
+      // Rowboat-owned capture still needs Rowboat's selected LLM workflow.
       if (notePath) {
         setMeetingSummarizing(true)
         try {

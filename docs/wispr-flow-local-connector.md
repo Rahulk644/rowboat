@@ -22,10 +22,12 @@ private endpoint, copied application code, or second Rowboat audio capture.
    and revise that same segment when the durable row arrives.
 5. End the call normally in Zoom. Rowboat finalizes on either a debounced,
    previously validated native Zoom surface end edge or Wispr's finalized
-   database state, imports the final transcript plus any locally available
-   Wispr summary, notes, and participant names into a separate owned block,
-   then runs Rowboat's selected LLM workflow. Wispr still owns its own UI and
-   auto-end behavior; Rowboat never invokes an undocumented Wispr stop action.
+   database state. It waits for Wispr's bounded post-call refinement and
+   imports the final meeting title, transcript, summary, **My thoughts**, and
+   participant names into the Rowboat Markdown note. Wispr is the single
+   processing owner in this mode: Rowboat does not run its meeting summarizer
+   or require a Rowboat LLM provider. Wispr still owns its own UI and auto-end
+   behavior; Rowboat never invokes an undocumented Wispr stop action.
 
 Rowboat does not request microphone or screen-capture permission in this mode.
 Its packaged native helper uses Rowboat's Accessibility permission only for a
@@ -52,7 +54,7 @@ Rowboat Electron main
 Rowboat meeting-bridge (Zoom Accessibility only; no Wispr audio)
           │
           ▼
-Rowboat meeting note + selected LLM/knowledge workflow
+Rowboat meeting note + normal indexing/search/agent knowledge (no second summary)
 ```
 
 The optional accelerator is packaged under
@@ -105,7 +107,8 @@ Use a consenting two-person call and do not commit transcript/audio evidence.
 7. End the Zoom call without pressing Rowboat Stop. After the helper has first
    validated the active Zoom meeting surface, verify Rowboat stops
    automatically; final text revisions and locally available Wispr
-   notes/summary must appear without overwriting the scratchpad. Separately
+   title, **My thoughts**, and summary must appear without overwriting the
+   scratchpad, and Rowboat must not invoke `meeting:summarize`. Separately
    record whether Wispr's own advertised auto-end fired; that is Wispr-owned
    behavior and not proof of Rowboat's end edge.
 

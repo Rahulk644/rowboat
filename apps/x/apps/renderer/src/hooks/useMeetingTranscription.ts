@@ -25,6 +25,10 @@ import { CoalescedAsyncWriter } from '@/lib/coalesced-async-writer';
 import { MeetingCaptureWatchdog, type MeetingCaptureChannel } from '@/lib/meeting-capture-watchdog';
 import { isKnownIsolatedOutputLabel } from '@/lib/meeting-output-route';
 import { MeetingLifecycleGate } from '@/lib/meeting-lifecycle-gate';
+import {
+    mergeWisprMeetingArtifact,
+    type WisprMeetingArtifact,
+} from '@/lib/wispr-meeting-artifact';
 
 export type MeetingTranscriptionState = 'idle' | 'connecting' | 'recording' | 'stopping';
 
@@ -162,38 +166,10 @@ export interface CalendarEventMeta {
     source?: string
 }
 
-type WisprMeetingArtifact = {
-    meetingId: string
+export type MeetingStopResult = {
+    provider: 'rowboat' | 'wispr-flow'
+    artifactImported: boolean
     title?: string
-    notes?: string
-    summary?: string
-    participantNames: string[]
-    finalized: boolean
-    endedAt?: string | number
-}
-
-const WISPR_ARTIFACT_START = '<!-- rowboat:wispr-artifact:start -->';
-const WISPR_ARTIFACT_END = '<!-- rowboat:wispr-artifact:end -->';
-
-function renderWisprArtifact(artifact: WisprMeetingArtifact): string {
-    const sections = [WISPR_ARTIFACT_START, '## Wispr Flow meeting artifact'];
-    if (artifact.summary?.trim()) sections.push('', '### Summary', '', artifact.summary.trim());
-    if (artifact.notes?.trim()) sections.push('', '### Notes', '', artifact.notes.trim());
-    if (artifact.participantNames.length > 0) {
-        sections.push('', '### Participants', '', artifact.participantNames.map(name => `- ${name}`).join('\n'));
-    }
-    sections.push('', WISPR_ARTIFACT_END);
-    return sections.join('\n');
-}
-
-function replaceWisprArtifact(content: string, artifact: WisprMeetingArtifact): string {
-    const block = renderWisprArtifact(artifact);
-    const start = content.indexOf(WISPR_ARTIFACT_START);
-    const end = content.indexOf(WISPR_ARTIFACT_END);
-    if (start >= 0 && end >= start) {
-        return `${content.slice(0, start)}${block}${content.slice(end + WISPR_ARTIFACT_END.length)}`;
-    }
-    return `${content.trimEnd()}\n\n${block}\n`;
 }
 
 function formatTranscript(date: string, calendarEvent?: CalendarEventMeta, source = 'rowboat'): string {
@@ -1197,10 +1173,13 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
         }
     }, [cleanup, scheduleDebouncedWrite, refreshRowboatAccount, queueSelfHostedBatch, upsertSegments, flushSelfHostedPcm]);
 
-    const stop = useCallback(async () => {
-        if (stateRef.current !== 'recording') return;
+    const stop = useCallback(async (): Promise<MeetingStopResult | null> => {
+        if (stateRef.current !== 'recording') return null;
         const lifecycleToken = lifecycleGateRef.current.begin('stopping');
-        if (lifecycleToken === null) return;
+        if (lifecycleToken === null) return null;
+        const usesWispr = Boolean(wisprMeetingIdRef.current);
+        let artifactImported = false;
+        let importedWisprTitle: string | undefined;
         stateRef.current = 'stopping';
         setState('stopping');
 
@@ -1249,11 +1228,14 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
                     path: notePathRef.current,
                     encoding: 'utf8',
                 });
+                const merged = mergeWisprMeetingArtifact(existing.data, wisprArtifact);
                 await window.ipc.invoke('workspace:writeFile', {
                     path: notePathRef.current,
-                    data: replaceWisprArtifact(existing.data, wisprArtifact),
+                    data: merged.content,
                     opts: { encoding: 'utf8' },
                 });
+                artifactImported = true;
+                importedWisprTitle = merged.title;
             } catch (error) {
                 console.warn('[meeting] Could not import the final Wispr meeting artifact:', error);
             }
@@ -1267,6 +1249,11 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
             }
             lifecycleGateRef.current.finish(lifecycleToken);
         }
+        return {
+            provider: usesWispr ? 'wispr-flow' : 'rowboat',
+            artifactImported,
+            ...(importedWisprTitle ? { title: importedWisprTitle } : {}),
+        };
     }, [cleanup, stopInputCapture, writeTranscriptToFile, flushSelfHostedPcm, applySelfHostedSnapshot, upsertSegments]);
 
     return { state, start, stop };

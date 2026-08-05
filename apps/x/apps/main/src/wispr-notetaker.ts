@@ -18,6 +18,9 @@ const MAX_LINE_BYTES = 128 * 1024;
 const MAX_TEXT_LENGTH = 20_000;
 const ACTIVE_MEETING_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
 const MEETING_STATE_POLL_INTERVAL_MS = 500;
+const ARTIFACT_POLL_INTERVAL_MS = 500;
+const ARTIFACT_WAIT_TIMEOUT_MS = 90_000;
+const ARTIFACT_START_GRACE_MS = 5_000;
 const MAX_RETAINED_SPEAKER_EVIDENCE = 2_048;
 const EXTENSION_NAME = 'rowboat-notetaker';
 
@@ -40,6 +43,11 @@ export type WisprMeetingArtifact = {
   participantNames: string[];
   finalized: boolean;
   endedAt?: string | number;
+};
+
+type WisprMeetingArtifactState = {
+  artifact: WisprMeetingArtifact;
+  refineStatus?: string;
 };
 
 export type WisprMeetingEvent = {
@@ -117,6 +125,8 @@ type SourceOptions = {
   wisprApplicationPath?: string;
   extensionSourceRoot: string;
   now?: () => number;
+  artifactPollIntervalMs?: number;
+  artifactWaitTimeoutMs?: number;
   onEvent: (event: WisprMeetingEvent) => void;
   onDetected?: (event: WisprMeetingDetectedEvent) => void;
   onEnded?: (event: WisprMeetingEndedEvent) => void;
@@ -309,6 +319,8 @@ export class WisprNotetakerSource {
   private readonly wisprApplicationPath: string;
   private readonly extensionSourceRoot: string;
   private readonly now: () => number;
+  private readonly artifactPollIntervalMs: number;
+  private readonly artifactWaitTimeoutMs: number;
   private readonly onEvent: (event: WisprMeetingEvent) => void;
   private readonly onDetected?: (event: WisprMeetingDetectedEvent) => void;
   private readonly onEnded?: (event: WisprMeetingEndedEvent) => void;
@@ -334,6 +346,8 @@ export class WisprNotetakerSource {
     this.wisprApplicationPath = options.wisprApplicationPath ?? '/Applications/Wispr Flow.app';
     this.extensionSourceRoot = options.extensionSourceRoot;
     this.now = options.now ?? Date.now;
+    this.artifactPollIntervalMs = Math.max(10, options.artifactPollIntervalMs ?? ARTIFACT_POLL_INTERVAL_MS);
+    this.artifactWaitTimeoutMs = Math.max(0, options.artifactWaitTimeoutMs ?? ARTIFACT_WAIT_TIMEOUT_MS);
     this.onEvent = options.onEvent;
     this.onDetected = options.onDetected;
     this.onEnded = options.onEnded;
@@ -985,25 +999,30 @@ export class WisprNotetakerSource {
       if (refined.length > 0) segments.push(...refined);
       else segments.push(...await this.reconcileTranscriptFile(path.join(meetingDirectory, 'live.ndjson')));
     }
-    const artifact = session.wisprMeetingId ? this.readArtifact(session.wisprMeetingId) : undefined;
     await this.stopWatcher();
     this.session = null;
+    // Zoom's end edge can arrive before Wispr's post-call refinement. Audio
+    // capture is already over; wait asynchronously for Wispr's own result so
+    // Rowboat imports it once instead of racing it with a second LLM job.
+    const artifact = session.wisprMeetingId
+      ? await this.waitForFinalArtifact(session.wisprMeetingId)
+      : undefined;
     return { segments, ...(artifact ? { artifact } : {}) };
   }
 
-  private readArtifact(meetingId: string): WisprMeetingArtifact | undefined {
+  private readArtifactState(meetingId: string): WisprMeetingArtifactState | undefined {
     const databasePath = path.join(this.flowSupportDirectory, 'flow.sqlite');
     if (!fs.existsSync(databasePath)) return undefined;
     let database: DatabaseSync | null = null;
     try {
       database = new DatabaseSync(databasePath, { readOnly: true });
-      database.exec('PRAGMA busy_timeout = 750');
+      database.exec('PRAGMA busy_timeout = 16');
       const row = database.prepare(`
-        SELECT id, title, notes, summary, participantNames, finalized, endedAt
+        SELECT id, title, notes, summary, participantNames, finalized, endedAt, refineStatus
         FROM Meetings WHERE id = ? LIMIT 1
       `).get(meetingId) as Record<string, unknown> | undefined;
       if (!row) return undefined;
-      return {
+      const artifact: WisprMeetingArtifact = {
         meetingId,
         ...(typeof row.title === 'string' && row.title.trim() ? { title: row.title.trim() } : {}),
         ...(normalizeWisprRichText(row.notes) ? { notes: normalizeWisprRichText(row.notes) } : {}),
@@ -1012,11 +1031,46 @@ export class WisprNotetakerSource {
         finalized: row.finalized === 1 || row.finalized === true,
         ...((typeof row.endedAt === 'string' || typeof row.endedAt === 'number') ? { endedAt: row.endedAt } : {}),
       };
+      const refineStatus = typeof row.refineStatus === 'string' ? row.refineStatus.trim().toLowerCase() : '';
+      return { artifact, ...(refineStatus ? { refineStatus } : {}) };
     } catch {
       return undefined;
     } finally {
       database?.close();
     }
+  }
+
+  private async waitForFinalArtifact(meetingId: string): Promise<WisprMeetingArtifact | undefined> {
+    let latest = this.readArtifactState(meetingId);
+    if (!latest || this.artifactWaitTimeoutMs === 0) return latest?.artifact;
+
+    const terminalStatuses = new Set(['complete', 'completed', 'failed', 'error', 'skipped']);
+    const isReady = (state: WisprMeetingArtifactState): boolean => (
+      terminalStatuses.has(state.refineStatus ?? '')
+      || Boolean(state.artifact.notes && state.artifact.summary)
+    );
+    if (isReady(latest)) return latest.artifact;
+
+    // A short/non-substantive call may never enter Wispr's refine pipeline.
+    // Give that pipeline a small start window; once it starts or produces a
+    // partial artifact, use the full bounded wait for the companion field.
+    let waitBudgetMs = latest.refineStatus || latest.artifact.notes || latest.artifact.summary
+      ? this.artifactWaitTimeoutMs
+      : Math.min(this.artifactWaitTimeoutMs, ARTIFACT_START_GRACE_MS);
+    for (let elapsedMs = 0; elapsedMs < waitBudgetMs; elapsedMs += this.artifactPollIntervalMs) {
+      await new Promise<void>((resolve) => setTimeout(resolve, this.artifactPollIntervalMs));
+      const next = this.readArtifactState(meetingId);
+      if (!next) continue;
+      latest = next;
+      if (isReady(latest)) return latest.artifact;
+      if (
+        waitBudgetMs < this.artifactWaitTimeoutMs
+        && (latest.refineStatus || latest.artifact.notes || latest.artifact.summary)
+      ) {
+        waitBudgetMs = this.artifactWaitTimeoutMs;
+      }
+    }
+    return latest.artifact;
   }
 
   async reset(rowboatMeetingId?: string): Promise<void> {

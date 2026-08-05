@@ -283,3 +283,97 @@ test('native Zoom evidence names a timestamp-aligned Wispr system cluster', asyn
     await fsp.rm(root, { recursive: true, force: true });
   }
 });
+
+test('finalization waits for Wispr post-call title, thoughts, and summary', async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'rowboat-wispr-artifact-test-'));
+  const home = path.join(root, 'home');
+  const flow = path.join(home, 'Library', 'Application Support', 'Wispr Flow');
+  const rowboat = path.join(home, '.rowboat');
+  const wisprApp = path.join(root, 'Wispr Flow.app');
+  const wisprMeetingId = 'wispr-artifact-meeting';
+  const meetingDir = path.join(flow, 'meetings', wisprMeetingId);
+  await fsp.mkdir(meetingDir, { recursive: true });
+  await fsp.mkdir(wisprApp, { recursive: true });
+  await fsp.writeFile(path.join(meetingDir, 'live.ndjson'), `${JSON.stringify({
+    id: 'final-1',
+    text: 'We agreed on the smaller scope.',
+    startRecordingMs: 100,
+    endRecordingMs: 1_000,
+    speaker: { id: 'self', source: 'mic', name: null },
+  })}\n`);
+
+  const databasePath = path.join(flow, 'flow.sqlite');
+  const database = new DatabaseSync(databasePath);
+  database.exec(`
+    CREATE TABLE Meetings (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      createdAt TEXT NOT NULL,
+      isDeleted INTEGER NOT NULL,
+      finalized INTEGER NOT NULL,
+      endedAt INTEGER,
+      speakerMap TEXT,
+      notes TEXT,
+      summary TEXT,
+      participantNames TEXT,
+      refineStatus TEXT
+    );
+  `);
+  database.prepare(`
+    INSERT INTO Meetings (
+      id, title, createdAt, isDeleted, finalized, endedAt, speakerMap,
+      notes, summary, participantNames, refineStatus
+    ) VALUES (?, ?, ?, 0, 0, NULL, ?, NULL, NULL, NULL, ?)
+  `).run(
+    wisprMeetingId,
+    'Meeting Notes',
+    new Date().toISOString(),
+    JSON.stringify({ people: {}, assignments: {} }),
+    'processing',
+  );
+  database.close();
+
+  const source = new WisprNotetakerSource({
+    platform: 'darwin',
+    homeDirectory: home,
+    flowSupportDirectory: flow,
+    rowboatDirectory: rowboat,
+    wisprApplicationPath: wisprApp,
+    extensionSourceRoot: path.join(root, 'unused-extension'),
+    artifactPollIntervalMs: 10,
+    artifactWaitTimeoutMs: 500,
+    onEvent: () => {},
+  });
+
+  try {
+    await source.setPreferred(true);
+    await source.begin('rowboat-artifact-test');
+    const finalizing = source.finalize('rowboat-artifact-test');
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const update = new DatabaseSync(databasePath);
+    update.prepare(`
+      UPDATE Meetings
+      SET title = ?, notes = ?, summary = ?, participantNames = ?,
+          finalized = 1, endedAt = ?, refineStatus = 'complete'
+      WHERE id = ?
+    `).run(
+      'Product review',
+      'Remember the onboarding concern.',
+      'The team agreed to ship the smaller scope.',
+      JSON.stringify(['Rahul Khatri', 'Akbar']),
+      Date.now(),
+      wisprMeetingId,
+    );
+    update.close();
+
+    const final = await finalizing;
+    assert.equal(final.artifact?.title, 'Product review');
+    assert.equal(final.artifact?.notes, 'Remember the onboarding concern.');
+    assert.equal(final.artifact?.summary, 'The team agreed to ship the smaller scope.');
+    assert.deepEqual(final.artifact?.participantNames, ['Rahul Khatri', 'Akbar']);
+    assert.equal(final.artifact?.finalized, true);
+  } finally {
+    await source.dispose();
+    await fsp.rm(root, { recursive: true, force: true });
+  }
+});
