@@ -1214,6 +1214,20 @@ function App() {
     })
   }, [meetingTranscription.state])
 
+  // When Wispr itself starts a Notetaker session, attach Rowboat
+  // automatically. The main process buffers the first chunk until this start
+  // path creates the owned meeting note, so no line is lost to the handoff.
+  useEffect(() => window.ipc.on('meeting:wispr:meetingDetected', () => {
+    if (meetingTranscription.state === 'idle') handleToggleMeetingRef.current?.()
+  }), [meetingTranscription.state])
+
+  // Wispr owns the capture lifecycle in this provider mode. Its refined local
+  // transcript is the durable end signal, so Rowboat finalizes the matching
+  // note automatically instead of asking the user to stop twice.
+  useEffect(() => window.ipc.on('meeting:wispr:meetingEnded', () => {
+    if (meetingTranscription.state === 'recording') handleToggleMeetingRef.current?.()
+  }), [meetingTranscription.state])
+
   // Check if voice is available on mount and when OAuth state changes
   const refreshVoiceAvailability = useCallback(() => {
     Promise.all([
@@ -6574,6 +6588,16 @@ function App() {
         meetingNotePathRef.current = null
       }
     } else if (meetingTranscription.state === 'idle') {
+      const meetingProvider = await window.ipc
+        .invoke('meeting:transcription:getProvider', null)
+        .catch(() => ({ provider: 'deepgram' as const, configured: false }))
+      if (meetingProvider.provider === 'wispr-flow') {
+        // Wispr owns microphone/system capture and its macOS permissions in
+        // this mode. Rowboat must not request Screen Recording or open a
+        // second audio graph before starting the read-only connector.
+        await startMeetingNow()
+        return
+      }
       // CoreAudio Tap on macOS 14.2+ is an audio-only capture path. It must
       // not be gated on the unrelated Screen Recording status; the actual
       // getDisplayMedia request asks macOS for the relevant permission. Older

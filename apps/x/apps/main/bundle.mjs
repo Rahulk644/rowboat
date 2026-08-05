@@ -139,6 +139,18 @@ const crxPreloadSrc = fs.realpathSync(
 fs.copyFileSync(crxPreloadSrc, path.join(here, '.package', 'dist', 'chrome-extension-api.preload.js'));
 console.log('✅ electron-chrome-extensions preload staged');
 
+// Ship the clean-room Wispr Flow Notetaker extension as a plain local
+// integration resource. The normal connector follows Wispr's local meeting
+// artifacts and does not install it. A developer can explicitly install this
+// optional latency accelerator into the private ~/.rowboat directory; Wispr
+// then loads it only when its feature-gated extension system is enabled.
+const wisprIntegrationSrc = path.resolve(here, '../../../../integrations/wispr-flow');
+const wisprIntegrationDest = path.join(here, '.package', 'resources', 'wispr-flow');
+fs.rmSync(wisprIntegrationDest, { recursive: true, force: true });
+fs.mkdirSync(path.dirname(wisprIntegrationDest), { recursive: true });
+fs.cpSync(wisprIntegrationSrc, wisprIntegrationDest, { recursive: true, dereference: true });
+console.log('✅ Wispr Flow local connector staged');
+
 // Compile the mic-monitor helper (ambient meeting detection) on macOS.
 // Best-effort: without swiftc — or on other platforms — the app still works,
 // ad-hoc meeting detection just stays off (main checks the binary exists).

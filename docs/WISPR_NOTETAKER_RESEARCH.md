@@ -172,3 +172,16 @@ implementation of another application.
 
 For Rowboat's current implementation and physical acceptance limits, see
 [meetings-self-hosted-alpha.md](meetings-self-hosted-alpha.md).
+
+## Implemented local connector
+
+Rowboat now has an optional clean-room local connector that follows Wispr's
+local live/refined meeting artifacts and read-only meeting database. The
+installed 1.6.399 build contains an extension transcript callback, but the
+entire extension system is controlled by Wispr's `ExtensionSystem` feature
+flag; it was disabled for the qualified account. Rowboat therefore treats that
+callback only as a possible latency accelerator and never as the correctness
+path. In this provider mode Rowboat opens no audio streams and does not invoke
+the self-hosted or Deepgram transcription paths. Setup, security boundaries,
+rollback, and the physical acceptance script are in
+[wispr-flow-local-connector.md](wispr-flow-local-connector.md).

@@ -162,12 +162,46 @@ export interface CalendarEventMeta {
     source?: string
 }
 
-function formatTranscript(date: string, calendarEvent?: CalendarEventMeta): string {
+type WisprMeetingArtifact = {
+    meetingId: string
+    title?: string
+    notes?: string
+    summary?: string
+    participantNames: string[]
+    finalized: boolean
+    endedAt?: string | number
+}
+
+const WISPR_ARTIFACT_START = '<!-- rowboat:wispr-artifact:start -->';
+const WISPR_ARTIFACT_END = '<!-- rowboat:wispr-artifact:end -->';
+
+function renderWisprArtifact(artifact: WisprMeetingArtifact): string {
+    const sections = [WISPR_ARTIFACT_START, '## Wispr Flow meeting artifact'];
+    if (artifact.summary?.trim()) sections.push('', '### Summary', '', artifact.summary.trim());
+    if (artifact.notes?.trim()) sections.push('', '### Notes', '', artifact.notes.trim());
+    if (artifact.participantNames.length > 0) {
+        sections.push('', '### Participants', '', artifact.participantNames.map(name => `- ${name}`).join('\n'));
+    }
+    sections.push('', WISPR_ARTIFACT_END);
+    return sections.join('\n');
+}
+
+function replaceWisprArtifact(content: string, artifact: WisprMeetingArtifact): string {
+    const block = renderWisprArtifact(artifact);
+    const start = content.indexOf(WISPR_ARTIFACT_START);
+    const end = content.indexOf(WISPR_ARTIFACT_END);
+    if (start >= 0 && end >= start) {
+        return `${content.slice(0, start)}${block}${content.slice(end + WISPR_ARTIFACT_END.length)}`;
+    }
+    return `${content.trimEnd()}\n\n${block}\n`;
+}
+
+function formatTranscript(date: string, calendarEvent?: CalendarEventMeta, source = 'rowboat'): string {
     const noteTitle = calendarEvent?.summary || 'Meeting Notes';
     const lines = [
         '---',
         'type: meeting',
-        'source: rowboat',
+        `source: ${source}`,
         `title: ${noteTitle}`,
         `date: "${date}"`,
     ];
@@ -195,6 +229,32 @@ function formatTranscript(date: string, calendarEvent?: CalendarEventMeta): stri
     return renderNewMeetingNote(lines.join('\n'), createTranscriptV2Block([]));
 }
 
+async function createMeetingNoteFile(
+    calendarEvent: CalendarEventMeta | undefined,
+    source: 'rowboat' | 'wispr-flow',
+): Promise<string> {
+    const now = new Date();
+    const dateStr = now.toISOString();
+    const dateFolder = dateStr.split('T')[0];
+    const timestamp = dateStr.replace(/:/g, '-').replace(/\.\d+Z$/, '');
+    const filename = calendarEvent?.summary
+        ? calendarEvent.summary.replace(/[\\/*?:"<>|]/g, '').replace(/\s+/g, '_').substring(0, 100).trim()
+        : `meeting-${timestamp}`;
+    let notePath = `knowledge/Meetings/rowboat/${dateFolder}/${filename}.md`;
+    if (calendarEvent?.summary) {
+        try {
+            const { exists } = await window.ipc.invoke('workspace:exists', { path: notePath });
+            if (exists) notePath = `knowledge/Meetings/rowboat/${dateFolder}/${filename}-${timestamp}.md`;
+        } catch { /* retain the first candidate */ }
+    }
+    await window.ipc.invoke('workspace:writeFile', {
+        path: notePath,
+        data: formatTranscript(dateStr, calendarEvent, source),
+        opts: { encoding: 'utf8', mkdirp: true },
+    });
+    return notePath;
+}
+
 // ---------------------------------------------------------------------------
 // Hook
 // ---------------------------------------------------------------------------
@@ -204,6 +264,7 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
     const stateRef = useRef<MeetingTranscriptionState>('idle');
     const wsRef = useRef<WebSocket | null>(null);
     const selfHostedMeetingIdRef = useRef<string | null>(null);
+    const wisprMeetingIdRef = useRef<string | null>(null);
     const transcriptMeetingIdRef = useRef<string | null>(null);
     const selfHostedCommittedRef = useRef<Record<SelfHostedChannel, string>>({ mic: '', system: '' });
     const selfHostedPcmRef = useRef({
@@ -295,6 +356,15 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
         const meetingId = transcriptMeetingIdRef.current;
         if (!meetingId) return;
         upsertSegments(segments.filter(segment => segment.meetingId === meetingId));
+    }), [upsertSegments]);
+
+    // Wispr owns capture and transcription in this mode. Electron main emits
+    // fast final chunks first, then higher revisions from live/refined NDJSON
+    // once source, timing, and speaker evidence are durable.
+    useEffect(() => window.ipc.on('meeting:wispr:event', (event) => {
+        const meetingId = wisprMeetingIdRef.current;
+        if (!meetingId || event.rowboatMeetingId !== meetingId) return;
+        upsertSegments(normalizeTranscriptSegments({ version: 2, segments: event.segments }));
     }), [upsertSegments]);
 
     const applySelfHostedSnapshot = useCallback((channel: SelfHostedChannel, snapshot: SelfHostedSnapshot) => {
@@ -573,6 +643,13 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
                 meetingId: selfHostedMeetingId,
             }).catch((error) => console.error('[meeting] Failed to reset self-hosted transcription:', error));
         }
+        const wisprMeetingId = wisprMeetingIdRef.current;
+        if (wisprMeetingId) {
+            wisprMeetingIdRef.current = null;
+            await window.ipc.invoke('meeting:wispr:reset', {
+                rowboatMeetingId: wisprMeetingId,
+            }).catch((error) => console.error('[meeting] Failed to reset Wispr transcription:', error));
+        }
     }, [stopInputCapture]);
 
     useEffect(() => () => {
@@ -589,6 +666,34 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
 
         try {
 
+        const selectedProvider = await window.ipc.invoke('meeting:transcription:getProvider', null);
+        if (selectedProvider.provider === 'wispr-flow') {
+            if (!selectedProvider.configured) throw new Error(selectedProvider.reason ?? 'Wispr Flow connector is not configured');
+            const meetingId = `rowboat-${crypto.randomUUID()}`;
+            const initial = await window.ipc.invoke('meeting:wispr:begin', { rowboatMeetingId: meetingId });
+
+            transcriptSegmentsRef.current = [];
+            transcriptBlockMissingNotifiedRef.current = false;
+            transcriptMeetingIdRef.current = meetingId;
+            wisprMeetingIdRef.current = meetingId;
+            // Accept watcher events immediately after begin(). Creating the
+            // Markdown note is asynchronous, but transcript-v2 upserts can be
+            // safely buffered in memory until notePathRef is assigned.
+            const notePath = await createMeetingNoteFile(calendarEvent, 'wispr-flow');
+            notePathRef.current = notePath;
+            if (initial.segments.length > 0) {
+                upsertSegments(normalizeTranscriptSegments({ version: 2, segments: initial.segments }));
+            }
+
+            // Wispr remains the recording owner. Opening its Notetaker is a
+            // supported local deep link; its automatic detection or ⌥M starts
+            // capture, while Rowboat only mirrors resulting local artifacts.
+            void window.ipc.invoke('meeting:wispr:openNotetaker', null).catch(() => {});
+            stateRef.current = 'recording';
+            setState('recording');
+            return notePath;
+        }
+
         // Run independent setup steps in parallel for faster startup
         const [headphoneResult, transcriptionResult, micResult, systemResult] = await Promise.allSettled([
             // 1. Detect headphones vs speakers
@@ -596,7 +701,7 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
             // 2. Select the main-process self-hosted provider when configured;
             // otherwise retain Rowboat's existing Deepgram path.
             (async () => {
-                const provider = await window.ipc.invoke('meeting:transcription:getProvider', null);
+                const provider = selectedProvider;
                 if (provider.reason) console.warn('[meeting] Self-hosted provider unavailable:', provider.reason);
                 if (provider.provider === 'self-hosted-nemotron') {
                     const meetingId = `rowboat-${crypto.randomUUID()}`;
@@ -1027,37 +1132,13 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
         merger.connect(processor);
         processor.connect(audioCtx.destination);
 
-        // Create the note file, organized by date like voice memos
-        const now = new Date();
-        const dateStr = now.toISOString();
-        const dateFolder = dateStr.split('T')[0]; // YYYY-MM-DD
-        const timestamp = dateStr.replace(/:/g, '-').replace(/\.\d+Z$/, '');
-        const filename = calendarEvent?.summary
-            ? calendarEvent.summary.replace(/[\\/*?:"<>|]/g, '').replace(/\s+/g, '_').substring(0, 100).trim()
-            : `meeting-${timestamp}`;
-        let notePath = `knowledge/Meetings/rowboat/${dateFolder}/${filename}.md`;
-        // Title-derived names collide within a day — every ad-hoc detection is
-        // titled "Meeting", and recurring calendar events repeat their summary.
-        // Never overwrite an earlier meeting's note: suffix with the timestamp.
-        if (calendarEvent?.summary) {
-            try {
-                const { exists } = await window.ipc.invoke('workspace:exists', { path: notePath });
-                if (exists) notePath = `knowledge/Meetings/rowboat/${dateFolder}/${filename}-${timestamp}.md`;
-            } catch { /* fall through with the unsuffixed path */ }
-        }
+        const notePath = await createMeetingNoteFile(calendarEvent, 'rowboat');
         notePathRef.current = notePath;
 
         // Parse the linked event's end time (timed events only) so the silence
         // window can shorten once the meeting is past its scheduled end.
         const calEndMs = calendarEvent?.end?.dateTime ? Date.parse(calendarEvent.end.dateTime) : NaN;
         calendarEndMsRef.current = Number.isFinite(calEndMs) ? calEndMs : null;
-
-        const initialContent = formatTranscript(dateStr, calendarEvent);
-        await window.ipc.invoke('workspace:writeFile', {
-            path: notePath,
-            data: initialContent,
-            opts: { encoding: 'utf8', mkdirp: true },
-        });
 
         // Arm silence detection. Initialise the activity clock to "now" so the
         // checker is live from the very start of recording — a session that
@@ -1126,8 +1207,17 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
         try {
         stopInputCapture();
         const selfHostedMeetingId = selfHostedMeetingIdRef.current;
+        const wisprMeetingId = wisprMeetingIdRef.current;
+        let wisprArtifact: WisprMeetingArtifact | undefined;
         try {
-            if (selfHostedMeetingId) {
+            if (wisprMeetingId) {
+                const final = await window.ipc.invoke('meeting:wispr:finalize', {
+                    rowboatMeetingId: wisprMeetingId,
+                });
+                upsertSegments(normalizeTranscriptSegments({ version: 2, segments: final.segments }));
+                wisprArtifact = final.artifact;
+                wisprMeetingIdRef.current = null;
+            } else if (selfHostedMeetingId) {
                 flushSelfHostedPcm();
                 await selfHostedFeedTailRef.current;
                 const final = await window.ipc.invoke('meeting:transcription:finalize', {
@@ -1149,9 +1239,25 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
             // finalize() releases remote slots even when it fails. Clear the
             // renderer identity so cleanup cannot race a duplicate reset.
             if (selfHostedMeetingId) selfHostedMeetingIdRef.current = null;
+            if (wisprMeetingId) wisprMeetingIdRef.current = null;
         }
         await cleanup();
         await writeTranscriptToFile();
+        if (wisprArtifact && notePathRef.current) {
+            try {
+                const existing = await window.ipc.invoke('workspace:readFile', {
+                    path: notePathRef.current,
+                    encoding: 'utf8',
+                });
+                await window.ipc.invoke('workspace:writeFile', {
+                    path: notePathRef.current,
+                    data: replaceWisprArtifact(existing.data, wisprArtifact),
+                    opts: { encoding: 'utf8' },
+                });
+            } catch (error) {
+                console.warn('[meeting] Could not import the final Wispr meeting artifact:', error);
+            }
+        }
         stateRef.current = 'idle';
         setState('idle');
         } finally {
@@ -1161,7 +1267,7 @@ export function useMeetingTranscription(onAutoStop?: () => void) {
             }
             lifecycleGateRef.current.finish(lifecycleToken);
         }
-    }, [cleanup, stopInputCapture, writeTranscriptToFile, flushSelfHostedPcm, applySelfHostedSnapshot]);
+    }, [cleanup, stopInputCapture, writeTranscriptToFile, flushSelfHostedPcm, applySelfHostedSnapshot, upsertSegments]);
 
     return { state, start, stop };
 }

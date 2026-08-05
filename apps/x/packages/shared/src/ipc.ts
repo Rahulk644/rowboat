@@ -161,6 +161,27 @@ const SelfHostedMeetingSnapshotSchema = z.object({
   segments: z.array(MeetingTranscriptSegmentSchema),
 });
 
+const WisprConnectorStatusSchema = z.object({
+  supported: z.boolean(),
+  wisprInstalled: z.boolean(),
+  connectorInstalled: z.boolean(),
+  connected: z.boolean(),
+  extensionConnected: z.boolean(),
+  preferred: z.boolean(),
+  restartRequired: z.boolean(),
+  reason: z.string().optional(),
+});
+
+const WisprMeetingArtifactSchema = z.object({
+  meetingId: z.string().min(1).max(240),
+  title: z.string().max(500).optional(),
+  notes: z.string().max(1_000_000).optional(),
+  summary: z.string().max(1_000_000).optional(),
+  participantNames: z.array(z.string().min(1).max(160)).max(500),
+  finalized: z.boolean(),
+  endedAt: z.union([z.string(), z.number()]).optional(),
+});
+
 // Explicit developer/operator probe for a live self-hosted session. It
 // intentionally contains only bounded pipeline counters and timings: never
 // PCM, transcript text, identities, session IDs, tokens, or worker URLs.
@@ -1176,10 +1197,74 @@ const ipcSchemas = {
   'meeting:transcription:getProvider': {
     req: z.null(),
     res: z.object({
-      provider: z.enum(['deepgram', 'self-hosted-nemotron']),
+      provider: z.enum(['deepgram', 'self-hosted-nemotron', 'wispr-flow']),
       configured: z.boolean(),
       reason: z.string().optional(),
     }),
+  },
+  // Wispr Flow remains the capture/transcription owner. Rowboat follows its
+  // local append log and meeting database read-only. A small owner-only socket
+  // extension can accelerate final chunks when Wispr enables its extension
+  // system, but correctness never depends on it. No Wispr credentials, private
+  // network endpoints, or PCM cross this boundary.
+  'meeting:wispr:getStatus': {
+    req: z.null(),
+    res: WisprConnectorStatusSchema,
+  },
+  'meeting:wispr:install': {
+    req: z.null(),
+    res: WisprConnectorStatusSchema,
+  },
+  'meeting:wispr:setPreferred': {
+    req: z.object({ preferred: z.boolean() }),
+    res: WisprConnectorStatusSchema,
+  },
+  'meeting:wispr:openNotetaker': {
+    req: z.null(),
+    res: z.object({ success: z.literal(true) }),
+  },
+  'meeting:wispr:begin': {
+    req: z.object({ rowboatMeetingId: z.string().min(1).max(120) }),
+    res: z.object({
+      wisprMeetingId: z.string().min(1).max(240).optional(),
+      segments: z.array(MeetingTranscriptSegmentSchema),
+    }),
+  },
+  'meeting:wispr:finalize': {
+    req: z.object({ rowboatMeetingId: z.string().min(1).max(120) }),
+    res: z.object({
+      segments: z.array(MeetingTranscriptSegmentSchema),
+      artifact: WisprMeetingArtifactSchema.optional(),
+    }),
+  },
+  'meeting:wispr:reset': {
+    req: z.object({ rowboatMeetingId: z.string().min(1).max(120).optional() }),
+    res: z.object({ success: z.literal(true) }),
+  },
+  'meeting:wispr:event': {
+    req: z.object({
+      type: z.literal('transcript'),
+      rowboatMeetingId: z.string().min(1).max(120),
+      wisprMeetingId: z.string().min(1).max(240),
+      segments: z.array(MeetingTranscriptSegmentSchema),
+    }),
+    res: z.null(),
+  },
+  // Wispr has already started/created the local meeting at this point, so the
+  // renderer may create its corresponding Rowboat note without opening any
+  // Rowboat audio device.
+  'meeting:wispr:meetingDetected': {
+    req: z.object({ wisprMeetingId: z.string().min(1).max(240) }),
+    res: z.null(),
+  },
+  // The refined append log is Wispr's durable end-of-capture signal. Rowboat
+  // follows it so users do not have to stop the same meeting twice.
+  'meeting:wispr:meetingEnded': {
+    req: z.object({
+      rowboatMeetingId: z.string().min(1).max(120),
+      wisprMeetingId: z.string().min(1).max(240),
+    }),
+    res: z.null(),
   },
   'meeting:transcription:begin': {
     req: z.object({

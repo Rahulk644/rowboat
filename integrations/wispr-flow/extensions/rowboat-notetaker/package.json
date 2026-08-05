@@ -1,0 +1,6 @@
+{
+  "name": "rowboat-notetaker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local Wispr Flow Notetaker bridge for Rowboat"
+}

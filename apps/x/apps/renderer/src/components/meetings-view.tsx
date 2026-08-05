@@ -63,6 +63,17 @@ type MeetingsViewProps = {
   meetingSummarizing?: boolean
 }
 
+type WisprConnectorStatus = {
+  supported: boolean
+  wisprInstalled: boolean
+  connectorInstalled: boolean
+  connected: boolean
+  extensionConnected: boolean
+  preferred: boolean
+  restartRequired: boolean
+  reason?: string
+}
+
 function isMeetingPath(path: string | undefined): boolean {
   return typeof path === 'string' && (path === MEETINGS_ROOT || path.startsWith(`${MEETINGS_ROOT}/`))
 }
@@ -1148,6 +1159,44 @@ export function MeetingsView({ onOpenNote, onTakeMeetingNotes, meetingState, mee
   const [notes, setNotes] = useState<MeetingNoteRow[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [wisprStatus, setWisprStatus] = useState<WisprConnectorStatus | null>(null)
+  const [wisprBusy, setWisprBusy] = useState(false)
+
+  const refreshWisprStatus = useCallback(async () => {
+    try {
+      setWisprStatus(await window.ipc.invoke('meeting:wispr:getStatus', null))
+    } catch {
+      setWisprStatus(null)
+    }
+  }, [])
+
+  useEffect(() => {
+    void refreshWisprStatus()
+    const interval = setInterval(() => { void refreshWisprStatus() }, 5_000)
+    return () => clearInterval(interval)
+  }, [refreshWisprStatus])
+
+  const configureWispr = useCallback(async () => {
+    setWisprBusy(true)
+    try {
+      const next = await window.ipc.invoke('meeting:wispr:setPreferred', { preferred: true })
+      setWisprStatus(next)
+      await window.ipc.invoke('meeting:wispr:openNotetaker', null)
+    } catch (err) {
+      console.error('Failed to configure Wispr Flow:', err)
+    } finally {
+      setWisprBusy(false)
+    }
+  }, [])
+
+  const useRowboatCapture = useCallback(async () => {
+    setWisprBusy(true)
+    try {
+      setWisprStatus(await window.ipc.invoke('meeting:wispr:setPreferred', { preferred: false }))
+    } finally {
+      setWisprBusy(false)
+    }
+  }, [])
 
   const loadNotes = useCallback(async () => {
     setLoading(true)
@@ -1268,6 +1317,51 @@ export function MeetingsView({ onOpenNote, onTakeMeetingNotes, meetingState, mee
         <p className="mt-1 text-[14px] text-black/50 dark:text-white/[0.52]">
           Upcoming events and meeting notes.
         </p>
+        {wisprStatus?.supported && wisprStatus.wisprInstalled ? (
+          <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border/60 bg-card px-4 py-3">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+                <span>Wispr Flow Notetaker</span>
+                <span className={cn(
+                  'rounded-full px-2 py-0.5 text-[11px] font-medium',
+                  wisprStatus.preferred && wisprStatus.connected
+                    ? 'bg-emerald-500/12 text-emerald-700 dark:text-emerald-300'
+                    : 'bg-muted text-muted-foreground',
+                )}>
+                  {wisprStatus.preferred
+                    ? wisprStatus.connected
+                      ? wisprStatus.extensionConnected ? 'Live · accelerated' : 'Live · local'
+                      : 'Open Wispr Flow'
+                    : 'Available'}
+                </span>
+              </div>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                {wisprStatus.preferred
+                  ? 'Wispr captures and transcribes; Rowboat stores the live meeting and runs your intelligence workflow.'
+                  : 'Use Wispr capture and speaker attribution inside Rowboat without a second audio recorder.'}
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              {wisprStatus.preferred ? (
+                <Button type="button" size="sm" variant="ghost" disabled={wisprBusy || meetingState !== 'idle'} onClick={useRowboatCapture}>
+                  Use Rowboat capture
+                </Button>
+              ) : null}
+              <Button
+                type="button"
+                size="sm"
+                variant={wisprStatus.preferred ? 'outline' : 'default'}
+                disabled={wisprBusy || meetingState !== 'idle'}
+                onClick={wisprStatus.preferred
+                  ? () => { void window.ipc.invoke('meeting:wispr:openNotetaker', null) }
+                  : configureWispr}
+              >
+                {wisprBusy ? <Loader2 className="mr-2 size-3.5 animate-spin" /> : <ExternalLink className="mr-2 size-3.5" />}
+                {wisprStatus.preferred ? 'Open Wispr' : 'Use Wispr Flow'}
+              </Button>
+            </div>
+          </div>
+        ) : null}
       </div>
       <div className="flex-1 overflow-auto">
         <div className="mx-auto w-full max-w-[1120px] px-[30px] pb-12">

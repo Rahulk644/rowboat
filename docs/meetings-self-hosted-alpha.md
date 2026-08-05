@@ -2,6 +2,8 @@
 
 Meetings is **Beta**. This guide tells contributors how to qualify the
 self-hosted meeting path without over-claiming what is currently shipped.
+The separate optional Wispr-owned capture provider is documented in
+[wispr-flow-local-connector.md](wispr-flow-local-connector.md).
 
 ## User journey
 

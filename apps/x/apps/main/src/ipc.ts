@@ -95,6 +95,7 @@ import { selfHostedMeetingTranscription } from './meeting-transcription.js';
 import { AecAsrDeliveryQueue, MeetingAecRouter } from './meeting-aec-router.js';
 import { createMeetingBridgeRuntime, resolveRowboatRepositoryRoot } from './meeting-bridge-runtime.js';
 import { resolveSystemAudioCaptureMode } from './meeting-system-audio.js';
+import { WisprNotetakerSource } from './wispr-notetaker.js';
 
 // Ambient meeting detection must ignore Rowboat's own mic use: meeting
 // capture and assistant voice/video calls both hold the mic. Either being
@@ -130,6 +131,19 @@ const meetingBridgeRuntime = createMeetingBridgeRuntime({
   },
 });
 
+function resolveWisprExtensionSourceRoot(): string {
+  return app.isPackaged
+    ? path.join(process.resourcesPath, 'wispr-flow')
+    : path.resolve(app.getAppPath(), '../../../../integrations/wispr-flow');
+}
+
+const wisprNotetakerSource = new WisprNotetakerSource({
+  extensionSourceRoot: resolveWisprExtensionSourceRoot(),
+  onEvent: (event) => broadcastToWindows('meeting:wispr:event', event),
+  onDetected: (event) => broadcastToWindows('meeting:wispr:meetingDetected', event),
+  onEnded: (event) => broadcastToWindows('meeting:wispr:meetingEnded', event),
+});
+
 /**
  * The renderer normally finalizes a meeting. Force-quit and updater paths can
  * bypass that UI, so Electron main owns this final sidecar cleanup boundary.
@@ -138,7 +152,10 @@ export async function shutdownMeetingTranscription(): Promise<void> {
   bridgeEligibleMeetings.clear();
   meetingAecRouters.clear();
   meetingAecAsrQueues.clear();
-  await meetingBridgeRuntime.dispose();
+  await Promise.all([
+    meetingBridgeRuntime.dispose(),
+    wisprNotetakerSource.dispose(),
+  ]);
 }
 
 function meetingAecRouter(meetingId: string): MeetingAecRouter {
@@ -988,6 +1005,9 @@ export function setupIpcHandlers() {
   if (!MEETING_ONLY_MODE) {
     warmSentContacts();
   }
+  void wisprNotetakerSource.start().catch((error) => {
+    console.warn('[meeting] Wispr local connector unavailable:', error instanceof Error ? error.message : String(error));
+  });
 
   registerIpcHandlers({
     'app:getVersions': async () => {
@@ -1052,7 +1072,43 @@ export function setupIpcHandlers() {
       return { success: true as const };
     },
     'meeting:transcription:getProvider': async () => {
+      const wispr = await wisprNotetakerSource.getStatus();
+      if (wispr.preferred) {
+        return {
+          provider: 'wispr-flow' as const,
+          configured: wispr.connected,
+          ...(!wispr.wisprInstalled
+            ? { reason: 'Install and sign in to Wispr Flow first.' }
+            : !wispr.connected
+              ? { reason: 'Open Wispr Flow once so its local meeting workspace is available.' }
+              : {}),
+        };
+      }
       return selfHostedMeetingTranscription.getStatus();
+    },
+    'meeting:wispr:getStatus': async () => {
+      return wisprNotetakerSource.getStatus();
+    },
+    'meeting:wispr:install': async () => {
+      return wisprNotetakerSource.install();
+    },
+    'meeting:wispr:setPreferred': async (_event, args) => {
+      await wisprNotetakerSource.setPreferred(args.preferred);
+      return wisprNotetakerSource.getStatus();
+    },
+    'meeting:wispr:openNotetaker': async () => {
+      await shell.openExternal('wispr-flow://open/notetaker');
+      return { success: true as const };
+    },
+    'meeting:wispr:begin': async (_event, args) => {
+      return wisprNotetakerSource.begin(args.rowboatMeetingId);
+    },
+    'meeting:wispr:finalize': async (_event, args) => {
+      return wisprNotetakerSource.finalize(args.rowboatMeetingId);
+    },
+    'meeting:wispr:reset': async (_event, args) => {
+      await wisprNotetakerSource.reset(args.rowboatMeetingId);
+      return { success: true as const };
     },
     'meeting:transcription:begin': async (_event, args) => {
       await selfHostedMeetingTranscription.begin(args.meetingId, args.language);
