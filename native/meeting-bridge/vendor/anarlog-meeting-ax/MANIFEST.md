@@ -9,9 +9,13 @@ copy of the entire Anarlog application.
 - License: [MIT](LICENSE)
 - Local use: optional, native macOS Zoom Accessibility inspection only.
 - Local patches: the implementation removes every non-Zoom platform, browser
-  path, chat path, AX mutation path, screenshots, telemetry, source values for
-  editable controls, and unrelated workspace dependencies. It retains strict
-  traversal/time bounds and explicit-label parsing semantics.
+  path, chat path, general AX mutation path, screenshots, telemetry, source
+  values for editable controls, and unrelated workspace dependencies. It
+  retains strict traversal/time bounds and explicit-label parsing semantics.
+  One Zoom-only interoperability exception best-effort enables the manual and
+  enhanced application Accessibility attributes before inspection; its
+  clean-room provenance and qualification boundary are recorded in
+  [`../../FATHOM_INTEROP_RESEARCH.md`](../../FATHOM_INTEROP_RESEARCH.md).
 
 ## Audited source inputs
 

@@ -105,11 +105,16 @@ and physical qualification gate are in
 [`vendor/anarlog-meeting-ax/MANIFEST.md`](vendor/anarlog-meeting-ax/MANIFEST.md).
 
 It performs a non-prompting Accessibility trust check, looks up only the
-native Zoom bundle (`us.zoom.xos`), applies Anarlog's 0.6-second AX messaging
+native Zoom bundle (`us.zoom.xos`), best-effort enables Zoom's manual/enhanced
+Accessibility application surface, applies Anarlog's 0.6-second AX messaging
 timeout and 18-depth/1,800-node limits, and emits a name only from an explicit
-active-speaker label. Multiple plausible Zoom windows, inaccessible trees,
-generic labels, and roster-only rows produce no active-speaker claim. The
-provider never scans browser tabs or reads editable input values.
+active-speaker label. Enhancement attempts are Zoom-only and cached per PID for
+five minutes; failure cannot block audio or create evidence. Multiple plausible
+Zoom windows, inaccessible trees, generic labels, and roster-only rows produce
+no active-speaker claim. The provider never scans browser tabs or reads
+editable input values. The behavior-level provenance and intentional
+differences from Fathom are in
+[`FATHOM_INTEROP_RESEARCH.md`](FATHOM_INTEROP_RESEARCH.md).
 
 The feature compiling is not permission to enable it in a user build. It still
 requires the real macOS TCC/Zoom qualification listed in the manifest, and

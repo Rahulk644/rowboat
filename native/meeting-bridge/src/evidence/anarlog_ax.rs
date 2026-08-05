@@ -10,7 +10,10 @@
 use super::{EvidenceError, EvidenceSource, MeetingEvidenceSource, SpeakerEvidence};
 
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
-use std::{collections::HashSet, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    time::{Duration, Instant},
+};
 
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
 use cidre::{arc, ax, cf, ns};
@@ -29,6 +32,8 @@ const MAX_AUXILIARY_DIALOGS: usize = 4;
 const MAX_EXPOSED_SURFACES: usize = MAX_WINDOWS + MAX_AUXILIARY_DIALOGS + 8;
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
 const AX_DIAGNOSTICS_ENV: &str = "ROWBOAT_MEETING_BRIDGE_AX_DIAGNOSTICS";
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+const ZOOM_AX_ENHANCEMENT_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// The fields the bridge accepts from Anarlog's participant stream. Screen
 /// bounds are intentionally excluded: Rowboat needs evidence, not layout.
@@ -71,6 +76,14 @@ pub trait AnarlogAxProvider: Send {
 pub struct MacosZoomAnarlogProvider {
     meeting_started_at: Instant,
     last_diagnostics: Option<AxDiagnostics>,
+    enhancement_attempts: HashMap<i32, AxEnhancementAttempt>,
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+#[derive(Debug, Clone)]
+struct AxEnhancementAttempt {
+    attempted_at: Instant,
+    succeeded: bool,
 }
 
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
@@ -83,6 +96,7 @@ impl MacosZoomAnarlogProvider {
         Self {
             meeting_started_at,
             last_diagnostics: None,
+            enhancement_attempts: HashMap::new(),
         }
     }
 
@@ -101,8 +115,12 @@ impl MacosZoomAnarlogProvider {
             return;
         }
         eprintln!(
-            "meeting-bridge AX diagnostic: trusted={} zoom_processes={} outcomes={:?}",
-            diagnostics.trusted, diagnostics.zoom_processes, diagnostics.outcomes
+            "meeting-bridge AX diagnostic: trusted={} zoom_processes={} enhancement_attempts={} enhanced_zoom_processes={} outcomes={:?}",
+            diagnostics.trusted,
+            diagnostics.zoom_processes,
+            diagnostics.enhancement_attempts,
+            diagnostics.enhanced_zoom_processes,
+            diagnostics.outcomes
         );
         self.last_diagnostics = Some(diagnostics);
     }
@@ -118,12 +136,30 @@ impl AnarlogAxProvider for MacosZoomAnarlogProvider {
 
         let observed_at_sample = self.observed_at_sample();
         let bundle_id = ns::String::with_str(ZOOM_BUNDLE_ID);
+        let running_apps = ns::RunningApp::with_bundle_id(&bundle_id);
+        let live_pids = running_apps
+            .iter()
+            .map(ns::RunningApp::pid)
+            .collect::<HashSet<_>>();
+        self.enhancement_attempts
+            .retain(|pid, _| live_pids.contains(pid));
         let mut inspections = Vec::new();
         let mut zoom_processes = 0;
+        let mut enhancement_attempts = 0;
+        let mut enhanced_zoom_processes = 0;
         let mut outcomes = Vec::new();
-        for app in ns::RunningApp::with_bundle_id(&bundle_id).iter() {
+        for app in running_apps.iter() {
             zoom_processes += 1;
-            let ax_app = ax::UiElement::with_app_pid(app.pid());
+            let pid = app.pid();
+            let mut ax_app = ax::UiElement::with_app_pid(pid);
+            let (attempted, enhanced) = ensure_zoom_enhanced_accessibility(
+                &mut ax_app,
+                pid,
+                &mut self.enhancement_attempts,
+                Instant::now(),
+            );
+            enhancement_attempts += usize::from(attempted);
+            enhanced_zoom_processes += usize::from(enhanced);
             // Anarlog's per-process cap prevents an unresponsive AX target
             // from stalling capture/transport. Treat any inaccessible tree as
             // no evidence rather than guessing a speaker.
@@ -139,7 +175,12 @@ impl AnarlogAxProvider for MacosZoomAnarlogProvider {
                 });
             }
         }
-        self.emit_diagnostics_if_changed(AxDiagnostics::trusted(zoom_processes, outcomes));
+        self.emit_diagnostics_if_changed(AxDiagnostics::trusted(
+            zoom_processes,
+            enhancement_attempts,
+            enhanced_zoom_processes,
+            outcomes,
+        ));
         Ok(inspections)
     }
 }
@@ -194,6 +235,8 @@ enum ZoomAxDiagnostic {
 struct AxDiagnostics {
     trusted: bool,
     zoom_processes: usize,
+    enhancement_attempts: usize,
+    enhanced_zoom_processes: usize,
     outcomes: Vec<ZoomAxDiagnostic>,
 }
 
@@ -256,14 +299,23 @@ impl AxDiagnostics {
         Self {
             trusted: false,
             zoom_processes: 0,
+            enhancement_attempts: 0,
+            enhanced_zoom_processes: 0,
             outcomes: Vec::new(),
         }
     }
 
-    fn trusted(zoom_processes: usize, outcomes: Vec<ZoomAxDiagnostic>) -> Self {
+    fn trusted(
+        zoom_processes: usize,
+        enhancement_attempts: usize,
+        enhanced_zoom_processes: usize,
+        outcomes: Vec<ZoomAxDiagnostic>,
+    ) -> Self {
         Self {
             trusted: true,
             zoom_processes,
+            enhancement_attempts,
+            enhanced_zoom_processes,
             outcomes,
         }
     }
@@ -272,6 +324,53 @@ impl AxDiagnostics {
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
 fn ax_diagnostics_enabled() -> bool {
     std::env::var_os(AX_DIAGNOSTICS_ENV).is_some_and(|value| value == "1")
+}
+
+/// Zoom exposes its complete native meeting tree only after these two
+/// application-level compatibility attributes are enabled. Fathom applies
+/// the same pair immediately after creating its per-process AX application.
+/// Keep the side effect Zoom-only, best-effort, and rate limited: failure must
+/// never become speaker evidence or interrupt independent audio capture.
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn ensure_zoom_enhanced_accessibility(
+    ax_app: &mut ax::UiElement,
+    pid: i32,
+    attempts: &mut HashMap<i32, AxEnhancementAttempt>,
+    now: Instant,
+) -> (bool, bool) {
+    if !zoom_ax_enhancement_retry_due(attempts.get(&pid), now) {
+        return (
+            false,
+            attempts.get(&pid).is_some_and(|entry| entry.succeeded),
+        );
+    }
+
+    let manual_attr_name = cf::String::from_str("AXManualAccessibility");
+    let enhanced_attr_name = cf::String::from_str("AXEnhancedUserInterface");
+    let manual_attr = ax::Attr::with_raw(&manual_attr_name);
+    let enhanced_attr = ax::Attr::with_raw(&enhanced_attr_name);
+    let enabled = ax_app
+        .set_attr(&manual_attr, cf::Boolean::value_true().as_type_ref())
+        .is_ok()
+        & ax_app
+            .set_attr(&enhanced_attr, cf::Boolean::value_true().as_type_ref())
+            .is_ok();
+    attempts.insert(
+        pid,
+        AxEnhancementAttempt {
+            attempted_at: now,
+            succeeded: enabled,
+        },
+    );
+    (true, enabled)
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn zoom_ax_enhancement_retry_due(previous: Option<&AxEnhancementAttempt>, now: Instant) -> bool {
+    previous.is_none_or(|previous| {
+        now.checked_duration_since(previous.attempted_at)
+            .is_none_or(|elapsed| elapsed >= ZOOM_AX_ENHANCEMENT_RETRY_INTERVAL)
+    })
 }
 
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
@@ -459,7 +558,8 @@ fn collect_fallback_surfaces(
         return true;
     };
     let role = role.to_string();
-    collect_surface_with_role(element, &role, surfaces, false);
+    let subrole = string_attr(element, ax::attr::subrole());
+    collect_surface_with_role(element, &role, subrole.as_deref(), surfaces, false);
     if surface_limits_exceeded(surfaces) {
         return false;
     }
@@ -508,25 +608,27 @@ fn collect_surface(
         }
         return false;
     };
-    collect_surface_with_role(surface, &role, surfaces, count_ignored)
+    let subrole = string_attr(surface, ax::attr::subrole());
+    collect_surface_with_role(surface, &role, subrole.as_deref(), surfaces, count_ignored)
 }
 
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
 fn collect_surface_with_role(
     surface: &ax::UiElement,
     role: &str,
+    subrole: Option<&str>,
     surfaces: &mut ZoomApplicationSurfaces,
     count_ignored: bool,
 ) -> bool {
     if !surfaces.seen_surface_hashes.insert(surface.hash()) {
         return false;
     }
-    if role == "AXWindow" {
-        surfaces.primary_windows.push(surface.retained());
+    if is_zoom_top_level_auxiliary_dialog(role, subrole) {
+        surfaces.top_level_dialogs.push(surface.retained());
         return true;
     }
-    if is_zoom_top_level_auxiliary_dialog(role) {
-        surfaces.top_level_dialogs.push(surface.retained());
+    if role == "AXWindow" {
+        surfaces.primary_windows.push(surface.retained());
         return true;
     }
     if count_ignored {
@@ -573,8 +675,9 @@ fn application_windows(ax_app: &ax::UiElement) -> Option<arc::R<cf::ArrayOf<ax::
 }
 
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
-fn is_zoom_top_level_auxiliary_dialog(role: &str) -> bool {
+fn is_zoom_top_level_auxiliary_dialog(role: &str, subrole: Option<&str>) -> bool {
     matches!(role, "AXSystemDialog" | "AXDialog")
+        || (role == "AXWindow" && matches!(subrole, Some("AXSystemDialog") | Some("AXDialog")))
 }
 
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
@@ -1051,10 +1154,14 @@ mod tests {
     #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
     use super::{
         find_zoom_active_speakers, inspect_zoom_windows, is_zoom_top_level_auxiliary_dialog,
-        zoom_meeting_window_validation, SurfaceDiscoveryStats, ZoomAxDiagnostic, ZoomAxNode,
+        zoom_ax_enhancement_retry_due, zoom_meeting_window_validation, AxEnhancementAttempt,
+        SurfaceDiscoveryStats, ZoomAxDiagnostic, ZoomAxNode,
     };
     #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
-    use std::collections::HashSet;
+    use std::{
+        collections::HashSet,
+        time::{Duration, Instant},
+    };
 
     #[test]
     fn roster_presence_does_not_turn_into_a_speaking_claim() {
@@ -1313,9 +1420,42 @@ mod tests {
     #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
     #[test]
     fn only_explicit_top_level_system_dialog_roles_are_auxiliary_surfaces() {
-        assert!(is_zoom_top_level_auxiliary_dialog("AXSystemDialog"));
-        assert!(is_zoom_top_level_auxiliary_dialog("AXDialog"));
-        assert!(!is_zoom_top_level_auxiliary_dialog("AXGroup"));
-        assert!(!is_zoom_top_level_auxiliary_dialog("AXSheet"));
+        assert!(is_zoom_top_level_auxiliary_dialog("AXSystemDialog", None));
+        assert!(is_zoom_top_level_auxiliary_dialog("AXDialog", None));
+        assert!(is_zoom_top_level_auxiliary_dialog(
+            "AXWindow",
+            Some("AXSystemDialog")
+        ));
+        assert!(is_zoom_top_level_auxiliary_dialog(
+            "AXWindow",
+            Some("AXDialog")
+        ));
+        assert!(!is_zoom_top_level_auxiliary_dialog("AXWindow", None));
+        assert!(!is_zoom_top_level_auxiliary_dialog(
+            "AXWindow",
+            Some("AXStandardWindow")
+        ));
+        assert!(!is_zoom_top_level_auxiliary_dialog("AXGroup", None));
+        assert!(!is_zoom_top_level_auxiliary_dialog("AXSheet", None));
+    }
+
+    #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+    #[test]
+    fn zoom_enhancement_attempts_are_cached_for_five_minutes_per_pid() {
+        let attempted_at = Instant::now();
+        let previous = AxEnhancementAttempt {
+            attempted_at,
+            succeeded: true,
+        };
+
+        assert!(!zoom_ax_enhancement_retry_due(
+            Some(&previous),
+            attempted_at + Duration::from_secs(299)
+        ));
+        assert!(zoom_ax_enhancement_retry_due(
+            Some(&previous),
+            attempted_at + Duration::from_secs(300)
+        ));
+        assert!(zoom_ax_enhancement_retry_due(None, attempted_at));
     }
 }
