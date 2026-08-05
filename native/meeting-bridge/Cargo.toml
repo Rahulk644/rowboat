@@ -35,7 +35,9 @@ cidre = { version = "=0.15.0", features = ["ax"], optional = true }
 macos-accessibility-client = { version = "=0.0.1", optional = true }
 
 [lints.rust]
-unsafe_code = "forbid"
+# `anarlog_ax` has one audited conversion for the typed `AXWindows` array.
+# Keep all other unsafe code denied at the crate boundary.
+unsafe_code = "deny"
 missing_debug_implementations = "allow"
 
 [lints.clippy]

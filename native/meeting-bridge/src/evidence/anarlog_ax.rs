@@ -13,7 +13,7 @@ use super::{EvidenceError, EvidenceSource, MeetingEvidenceSource, SpeakerEvidenc
 use std::{collections::HashSet, time::Instant};
 
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
-use cidre::{arc, ax, ns};
+use cidre::{arc, ax, cf, ns};
 
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
 const ZOOM_BUNDLE_ID: &str = "us.zoom.xos";
@@ -25,6 +25,8 @@ const MAX_NODES: usize = 1_800;
 const MAX_WINDOWS: usize = 8;
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
 const MAX_AUXILIARY_DIALOGS: usize = 4;
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+const MAX_EXPOSED_SURFACES: usize = MAX_WINDOWS + MAX_AUXILIARY_DIALOGS + 8;
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
 const AX_DIAGNOSTICS_ENV: &str = "ROWBOAT_MEETING_BRIDGE_AX_DIAGNOSTICS";
 
@@ -152,9 +154,11 @@ struct ZoomProcessInspection {
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ZoomAxDiagnostic {
-    SurfaceTraversalRejected {
+    ApplicationWindowsUnavailable,
+    ApplicationSurfaceLimitExceeded {
         primary_windows: usize,
         top_level_dialogs: usize,
+        ignored_surfaces: usize,
     },
     SurfaceNodeTraversalRejected {
         primary_windows: usize,
@@ -164,10 +168,12 @@ enum ZoomAxDiagnostic {
         primary_windows: usize,
         validated_meetings: usize,
         top_level_dialogs: usize,
+        ignored_surfaces: usize,
     },
     ValidatedMeeting {
         primary_windows: usize,
         top_level_dialogs: usize,
+        ignored_surfaces: usize,
         active_speaker_labels: usize,
     },
 }
@@ -178,6 +184,13 @@ struct AxDiagnostics {
     trusted: bool,
     zoom_processes: usize,
     outcomes: Vec<ZoomAxDiagnostic>,
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+struct ZoomApplicationSurfaces {
+    primary_windows: Vec<arc::R<ax::UiElement>>,
+    top_level_dialogs: Vec<arc::R<ax::UiElement>>,
+    ignored_surfaces: usize,
 }
 
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
@@ -206,31 +219,20 @@ fn ax_diagnostics_enabled() -> bool {
 
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
 fn inspect_zoom_process(ax_app: &ax::UiElement) -> ZoomProcessInspection {
-    let mut windows = Vec::new();
-    let mut auxiliary_dialogs = Vec::new();
-    let mut visited = 0;
-    if !collect_zoom_surfaces(
-        ax_app,
-        0,
-        &mut visited,
-        &mut windows,
-        &mut auxiliary_dialogs,
-    ) || windows.len() > MAX_WINDOWS
-        || auxiliary_dialogs.len() > MAX_AUXILIARY_DIALOGS
-    {
-        return ZoomProcessInspection {
-            active_speakers: None,
-            diagnostic: ZoomAxDiagnostic::SurfaceTraversalRejected {
-                primary_windows: windows.len(),
-                top_level_dialogs: auxiliary_dialogs.len(),
-            },
-        };
-    }
-    let primary_window_count = windows.len();
-    let top_level_dialog_count = auxiliary_dialogs.len();
+    let surfaces = match zoom_application_surfaces(ax_app) {
+        Ok(surfaces) => surfaces,
+        Err(diagnostic) => {
+            return ZoomProcessInspection {
+                active_speakers: None,
+                diagnostic,
+            };
+        }
+    };
+    let primary_window_count = surfaces.primary_windows.len();
+    let top_level_dialog_count = surfaces.top_level_dialogs.len();
 
     let mut window_nodes = Vec::new();
-    for window in windows {
+    for window in surfaces.primary_windows {
         let mut nodes = Vec::new();
         if !collect_nodes(&window, 0, &mut nodes) {
             return ZoomProcessInspection {
@@ -245,7 +247,7 @@ fn inspect_zoom_process(ax_app: &ax::UiElement) -> ZoomProcessInspection {
     }
 
     let mut auxiliary_dialog_nodes = Vec::new();
-    for dialog in auxiliary_dialogs {
+    for dialog in surfaces.top_level_dialogs {
         let mut nodes = Vec::new();
         if !collect_nodes(&dialog, 0, &mut nodes) {
             return ZoomProcessInspection {
@@ -258,7 +260,11 @@ fn inspect_zoom_process(ax_app: &ax::UiElement) -> ZoomProcessInspection {
         }
         auxiliary_dialog_nodes.push(nodes);
     }
-    inspect_zoom_windows(window_nodes, auxiliary_dialog_nodes)
+    inspect_zoom_windows(
+        window_nodes,
+        auxiliary_dialog_nodes,
+        surfaces.ignored_surfaces,
+    )
 }
 
 /// One validated meeting surface proves that this Zoom process is in a call.
@@ -269,6 +275,7 @@ fn inspect_zoom_process(ax_app: &ax::UiElement) -> ZoomProcessInspection {
 fn inspect_zoom_windows(
     window_nodes: Vec<Vec<ZoomAxNode>>,
     auxiliary_dialog_nodes: Vec<Vec<ZoomAxNode>>,
+    ignored_surfaces: usize,
 ) -> ZoomProcessInspection {
     let candidates = window_nodes
         .iter()
@@ -284,6 +291,7 @@ fn inspect_zoom_windows(
                 primary_windows: window_nodes.len(),
                 validated_meetings: candidates.len(),
                 top_level_dialogs: auxiliary_dialog_nodes.len(),
+                ignored_surfaces,
             },
         };
     }
@@ -303,49 +311,69 @@ fn inspect_zoom_windows(
         diagnostic: ZoomAxDiagnostic::ValidatedMeeting {
             primary_windows: window_nodes.len(),
             top_level_dialogs: auxiliary_dialog_nodes.len(),
+            ignored_surfaces,
             active_speaker_labels: speakers.len(),
         },
         active_speakers: Some(speakers),
     }
 }
 
+/// Reads the AX API's dedicated top-level surface list instead of assuming the
+/// application's generic child tree contains every window. Zoom's floating
+/// speaking indicator is omitted by the latter but exposed by `AXWindows`.
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
-fn collect_zoom_surfaces(
-    element: &ax::UiElement,
-    depth: usize,
-    visited: &mut usize,
-    windows: &mut Vec<arc::R<ax::UiElement>>,
-    auxiliary_dialogs: &mut Vec<arc::R<ax::UiElement>>,
-) -> bool {
-    if depth > MAX_TREE_DEPTH || *visited >= MAX_NODES {
-        return false;
-    }
-    *visited += 1;
-
-    let Ok(role) = element.role() else {
-        return false;
+fn zoom_application_surfaces(
+    ax_app: &ax::UiElement,
+) -> Result<ZoomApplicationSurfaces, ZoomAxDiagnostic> {
+    let Some(ax_windows) = application_windows(ax_app) else {
+        return Err(ZoomAxDiagnostic::ApplicationWindowsUnavailable);
     };
-    let role = role.to_string();
-    if role == "AXWindow" {
-        windows.push(element.retained());
-        return windows.len() <= MAX_WINDOWS;
-    }
-    // Sky AX reports the speaking indicator as a `system dialog zoom floating
-    // video window`, not an `AXWindow`. Accept only a direct child of Zoom's
-    // application AX root, then later read only explicit `Talking: Name`
-    // labels from it. Nested dialogs remain part of their owning window and do
-    // not widen this auxiliary-surface boundary.
-    if depth == 1 && is_zoom_top_level_auxiliary_dialog(&role) {
-        auxiliary_dialogs.push(element.retained());
-        return auxiliary_dialogs.len() <= MAX_AUXILIARY_DIALOGS;
-    }
 
-    let Ok(children) = element.children() else {
-        return !ax_role_may_have_children(&role);
+    let mut surfaces = ZoomApplicationSurfaces {
+        primary_windows: Vec::new(),
+        top_level_dialogs: Vec::new(),
+        ignored_surfaces: 0,
     };
-    children
-        .iter()
-        .all(|child| collect_zoom_surfaces(child, depth + 1, visited, windows, auxiliary_dialogs))
+    for surface in ax_windows.iter().take(MAX_EXPOSED_SURFACES + 1) {
+        match surface.role().ok().map(|role| role.to_string()) {
+            Some(role) if role == "AXWindow" => surfaces.primary_windows.push(surface.retained()),
+            Some(role) if is_zoom_top_level_auxiliary_dialog(&role) => {
+                surfaces.top_level_dialogs.push(surface.retained());
+            }
+            _ => surfaces.ignored_surfaces += 1,
+        }
+        if surfaces.primary_windows.len() > MAX_WINDOWS
+            || surfaces.top_level_dialogs.len() > MAX_AUXILIARY_DIALOGS
+            || surfaces.primary_windows.len()
+                + surfaces.top_level_dialogs.len()
+                + surfaces.ignored_surfaces
+                > MAX_EXPOSED_SURFACES
+        {
+            return Err(ZoomAxDiagnostic::ApplicationSurfaceLimitExceeded {
+                primary_windows: surfaces.primary_windows.len(),
+                top_level_dialogs: surfaces.top_level_dialogs.len(),
+                ignored_surfaces: surfaces.ignored_surfaces,
+            });
+        }
+    }
+    Ok(surfaces)
+}
+
+/// cidre exposes the raw `AXWindows` attribute safely but has no typed
+/// shortcut for it. The Core Accessibility contract guarantees a CFArray of
+/// AXUIElements. We check the outer CF type before this single, audited cast;
+/// each item is used only through cidre's safe AX methods.
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+#[allow(unsafe_code)]
+fn application_windows(ax_app: &ax::UiElement) -> Option<arc::R<cf::ArrayOf<ax::UiElement>>> {
+    let raw_windows = ax_app.attr_value(ax::attr::windows()).ok()?;
+    (raw_windows.get_type_id() == cf::Array::type_id()).then(|| {
+        // SAFETY: `AXWindows` is documented by the macOS Accessibility API as
+        // a CFArray whose elements are AXUIElement values. The type-id check
+        // rejects a malformed outer value before reinterpreting its retained
+        // CF ownership wrapper.
+        unsafe { std::mem::transmute(raw_windows) }
+    })
 }
 
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
@@ -817,7 +845,7 @@ mod tests {
             "Video render Vikram Prasanna, Computer audio unmuted",
         )];
         let system_dialog = vec![zoom_node(2, "AXStaticText", "Talking: Vikram Prasanna")];
-        let inspection = inspect_zoom_windows(vec![meeting_window], vec![system_dialog]);
+        let inspection = inspect_zoom_windows(vec![meeting_window], vec![system_dialog], 0);
         let speakers = inspection
             .active_speakers
             .as_ref()
@@ -838,6 +866,7 @@ mod tests {
             ZoomAxDiagnostic::ValidatedMeeting {
                 primary_windows: 1,
                 top_level_dialogs: 1,
+                ignored_surfaces: 0,
                 active_speaker_labels: 1,
             }
         ));
@@ -847,7 +876,7 @@ mod tests {
     #[test]
     fn top_level_dialog_cannot_name_a_transcript_without_one_validated_window() {
         let system_dialog = vec![zoom_node(2, "AXStaticText", "Talking: Vikram Prasanna")];
-        let inspection = inspect_zoom_windows(Vec::new(), vec![system_dialog]);
+        let inspection = inspect_zoom_windows(Vec::new(), vec![system_dialog], 0);
 
         assert!(inspection.active_speakers.is_none());
         assert!(matches!(
@@ -856,6 +885,7 @@ mod tests {
                 primary_windows: 0,
                 validated_meetings: 0,
                 top_level_dialogs: 1,
+                ignored_surfaces: 0,
             }
         ));
     }
