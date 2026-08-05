@@ -154,27 +154,36 @@ struct ZoomProcessInspection {
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ZoomAxDiagnostic {
-    ApplicationWindowsUnavailable,
     ApplicationSurfaceLimitExceeded {
         primary_windows: usize,
         top_level_dialogs: usize,
         ignored_surfaces: usize,
+        discovery: SurfaceDiscoveryStats,
+    },
+    FallbackTraversalLimitExceeded {
+        primary_windows: usize,
+        top_level_dialogs: usize,
+        ignored_surfaces: usize,
+        discovery: SurfaceDiscoveryStats,
     },
     SurfaceNodeTraversalRejected {
         primary_windows: usize,
         top_level_dialogs: usize,
+        discovery: SurfaceDiscoveryStats,
     },
     MeetingWindowCount {
         primary_windows: usize,
         validated_meetings: usize,
         top_level_dialogs: usize,
         ignored_surfaces: usize,
+        discovery: SurfaceDiscoveryStats,
     },
     ValidatedMeeting {
         primary_windows: usize,
         top_level_dialogs: usize,
         ignored_surfaces: usize,
         active_speaker_labels: usize,
+        discovery: SurfaceDiscoveryStats,
     },
 }
 
@@ -191,6 +200,18 @@ struct ZoomApplicationSurfaces {
     primary_windows: Vec<arc::R<ax::UiElement>>,
     top_level_dialogs: Vec<arc::R<ax::UiElement>>,
     ignored_surfaces: usize,
+    discovery: SurfaceDiscoveryStats,
+    seen_surface_hashes: HashSet<usize>,
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SurfaceDiscoveryStats {
+    direct_ax_windows_available: bool,
+    fallback_used: bool,
+    fallback_visited_nodes: usize,
+    fallback_skipped_branches: usize,
+    focused_surface_candidates: usize,
 }
 
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
@@ -240,6 +261,7 @@ fn inspect_zoom_process(ax_app: &ax::UiElement) -> ZoomProcessInspection {
                 diagnostic: ZoomAxDiagnostic::SurfaceNodeTraversalRejected {
                     primary_windows: primary_window_count,
                     top_level_dialogs: top_level_dialog_count,
+                    discovery: surfaces.discovery.clone(),
                 },
             };
         }
@@ -255,6 +277,7 @@ fn inspect_zoom_process(ax_app: &ax::UiElement) -> ZoomProcessInspection {
                 diagnostic: ZoomAxDiagnostic::SurfaceNodeTraversalRejected {
                     primary_windows: primary_window_count,
                     top_level_dialogs: top_level_dialog_count,
+                    discovery: surfaces.discovery.clone(),
                 },
             };
         }
@@ -264,6 +287,7 @@ fn inspect_zoom_process(ax_app: &ax::UiElement) -> ZoomProcessInspection {
         window_nodes,
         auxiliary_dialog_nodes,
         surfaces.ignored_surfaces,
+        surfaces.discovery,
     )
 }
 
@@ -276,6 +300,7 @@ fn inspect_zoom_windows(
     window_nodes: Vec<Vec<ZoomAxNode>>,
     auxiliary_dialog_nodes: Vec<Vec<ZoomAxNode>>,
     ignored_surfaces: usize,
+    discovery: SurfaceDiscoveryStats,
 ) -> ZoomProcessInspection {
     let candidates = window_nodes
         .iter()
@@ -292,6 +317,7 @@ fn inspect_zoom_windows(
                 validated_meetings: candidates.len(),
                 top_level_dialogs: auxiliary_dialog_nodes.len(),
                 ignored_surfaces,
+                discovery,
             },
         };
     }
@@ -313,6 +339,7 @@ fn inspect_zoom_windows(
             top_level_dialogs: auxiliary_dialog_nodes.len(),
             ignored_surfaces,
             active_speaker_labels: speakers.len(),
+            discovery,
         },
         active_speakers: Some(speakers),
     }
@@ -320,43 +347,170 @@ fn inspect_zoom_windows(
 
 /// Reads the AX API's dedicated top-level surface list instead of assuming the
 /// application's generic child tree contains every window. Zoom's floating
-/// speaking indicator is omitted by the latter but exposed by `AXWindows`.
+/// speaking indicator can be omitted by that list, so a bounded, best-effort
+/// child traversal supplements it only when a primary window or dialog is
+/// missing.
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
 fn zoom_application_surfaces(
     ax_app: &ax::UiElement,
 ) -> Result<ZoomApplicationSurfaces, ZoomAxDiagnostic> {
-    let Some(ax_windows) = application_windows(ax_app) else {
-        return Err(ZoomAxDiagnostic::ApplicationWindowsUnavailable);
-    };
-
     let mut surfaces = ZoomApplicationSurfaces {
         primary_windows: Vec::new(),
         top_level_dialogs: Vec::new(),
         ignored_surfaces: 0,
+        discovery: SurfaceDiscoveryStats {
+            direct_ax_windows_available: false,
+            fallback_used: false,
+            fallback_visited_nodes: 0,
+            fallback_skipped_branches: 0,
+            focused_surface_candidates: 0,
+        },
+        seen_surface_hashes: HashSet::new(),
     };
-    for surface in ax_windows.iter().take(MAX_EXPOSED_SURFACES + 1) {
-        match surface.role().ok().map(|role| role.to_string()) {
-            Some(role) if role == "AXWindow" => surfaces.primary_windows.push(surface.retained()),
-            Some(role) if is_zoom_top_level_auxiliary_dialog(&role) => {
-                surfaces.top_level_dialogs.push(surface.retained());
+    if let Some(ax_windows) = application_windows(ax_app) {
+        surfaces.discovery.direct_ax_windows_available = true;
+        for surface in ax_windows.iter().take(MAX_EXPOSED_SURFACES + 1) {
+            collect_surface(surface, &mut surfaces, true);
+            if surface_limits_exceeded(&surfaces) {
+                return Err(surface_limit_diagnostic(&surfaces));
             }
-            _ => surfaces.ignored_surfaces += 1,
         }
-        if surfaces.primary_windows.len() > MAX_WINDOWS
-            || surfaces.top_level_dialogs.len() > MAX_AUXILIARY_DIALOGS
-            || surfaces.primary_windows.len()
-                + surfaces.top_level_dialogs.len()
-                + surfaces.ignored_surfaces
-                > MAX_EXPOSED_SURFACES
-        {
-            return Err(ZoomAxDiagnostic::ApplicationSurfaceLimitExceeded {
+    }
+
+    if surfaces.primary_windows.is_empty() || surfaces.top_level_dialogs.is_empty() {
+        surfaces.discovery.fallback_used = true;
+        if !collect_fallback_surfaces(ax_app, &mut surfaces) {
+            if surface_limits_exceeded(&surfaces) {
+                return Err(surface_limit_diagnostic(&surfaces));
+            }
+            return Err(ZoomAxDiagnostic::FallbackTraversalLimitExceeded {
                 primary_windows: surfaces.primary_windows.len(),
                 top_level_dialogs: surfaces.top_level_dialogs.len(),
                 ignored_surfaces: surfaces.ignored_surfaces,
+                discovery: surfaces.discovery.clone(),
             });
+        }
+        collect_focused_surfaces(ax_app, &mut surfaces);
+        if surface_limits_exceeded(&surfaces) {
+            return Err(surface_limit_diagnostic(&surfaces));
         }
     }
     Ok(surfaces)
+}
+
+/// Traversal is explicitly best-effort: one inaccessible child represents an
+/// unavailable AX branch, not evidence that its accessible siblings do not
+/// exist. The traversal reads no labels or values; it recognizes only surface
+/// roles, and fails closed if the bounded node budget is reached.
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn collect_fallback_surfaces(
+    element: &ax::UiElement,
+    surfaces: &mut ZoomApplicationSurfaces,
+) -> bool {
+    if surfaces.discovery.fallback_visited_nodes >= MAX_NODES {
+        return false;
+    }
+    surfaces.discovery.fallback_visited_nodes += 1;
+
+    let Ok(role) = element.role() else {
+        surfaces.discovery.fallback_skipped_branches += 1;
+        return true;
+    };
+    let role = role.to_string();
+    collect_surface_with_role(element, &role, surfaces, false);
+    if surface_limits_exceeded(surfaces) {
+        return false;
+    }
+
+    let Ok(children) = element.children() else {
+        if ax_role_may_have_children(&role) {
+            surfaces.discovery.fallback_skipped_branches += 1;
+        }
+        return true;
+    };
+    for child in children.iter() {
+        if !collect_fallback_surfaces(child, surfaces) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Focus is used only as another surface handle. Its labels, values, and
+/// descendants are never read here; downstream inspection still applies the
+/// exact-one-primary-window and explicit-`Talking:` requirements.
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn collect_focused_surfaces(ax_app: &ax::UiElement, surfaces: &mut ZoomApplicationSurfaces) {
+    let Ok(focused) = ax_app.focused_ui_element() else {
+        return;
+    };
+    if collect_surface(&focused, surfaces, false) {
+        surfaces.discovery.focused_surface_candidates += 1;
+    }
+    if let Ok(window) = focused.window() {
+        if collect_surface(&window, surfaces, false) {
+            surfaces.discovery.focused_surface_candidates += 1;
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn collect_surface(
+    surface: &ax::UiElement,
+    surfaces: &mut ZoomApplicationSurfaces,
+    count_ignored: bool,
+) -> bool {
+    let Some(role) = surface.role().ok().map(|role| role.to_string()) else {
+        if count_ignored {
+            surfaces.ignored_surfaces += 1;
+        }
+        return false;
+    };
+    collect_surface_with_role(surface, &role, surfaces, count_ignored)
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn collect_surface_with_role(
+    surface: &ax::UiElement,
+    role: &str,
+    surfaces: &mut ZoomApplicationSurfaces,
+    count_ignored: bool,
+) -> bool {
+    if !surfaces.seen_surface_hashes.insert(surface.hash()) {
+        return false;
+    }
+    if role == "AXWindow" {
+        surfaces.primary_windows.push(surface.retained());
+        return true;
+    }
+    if is_zoom_top_level_auxiliary_dialog(role) {
+        surfaces.top_level_dialogs.push(surface.retained());
+        return true;
+    }
+    if count_ignored {
+        surfaces.ignored_surfaces += 1;
+    }
+    false
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn surface_limits_exceeded(surfaces: &ZoomApplicationSurfaces) -> bool {
+    surfaces.primary_windows.len() > MAX_WINDOWS
+        || surfaces.top_level_dialogs.len() > MAX_AUXILIARY_DIALOGS
+        || surfaces.primary_windows.len()
+            + surfaces.top_level_dialogs.len()
+            + surfaces.ignored_surfaces
+            > MAX_EXPOSED_SURFACES
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn surface_limit_diagnostic(surfaces: &ZoomApplicationSurfaces) -> ZoomAxDiagnostic {
+    ZoomAxDiagnostic::ApplicationSurfaceLimitExceeded {
+        primary_windows: surfaces.primary_windows.len(),
+        top_level_dialogs: surfaces.top_level_dialogs.len(),
+        ignored_surfaces: surfaces.ignored_surfaces,
+        discovery: surfaces.discovery.clone(),
+    }
 }
 
 /// cidre exposes the raw `AXWindows` attribute safely but has no typed
@@ -767,7 +921,8 @@ mod tests {
 
     #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
     use super::{
-        inspect_zoom_windows, is_zoom_top_level_auxiliary_dialog, ZoomAxDiagnostic, ZoomAxNode,
+        inspect_zoom_windows, is_zoom_top_level_auxiliary_dialog, SurfaceDiscoveryStats,
+        ZoomAxDiagnostic, ZoomAxNode,
     };
 
     #[test]
@@ -834,6 +989,17 @@ mod tests {
     }
 
     #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+    fn surface_discovery() -> SurfaceDiscoveryStats {
+        SurfaceDiscoveryStats {
+            direct_ax_windows_available: true,
+            fallback_used: false,
+            fallback_visited_nodes: 0,
+            fallback_skipped_branches: 0,
+            focused_surface_candidates: 0,
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
     #[test]
     fn top_level_system_dialog_contributes_only_an_explicit_talking_label() {
         // The main meeting surface validates the Zoom meeting but has no
@@ -845,7 +1011,12 @@ mod tests {
             "Video render Vikram Prasanna, Computer audio unmuted",
         )];
         let system_dialog = vec![zoom_node(2, "AXStaticText", "Talking: Vikram Prasanna")];
-        let inspection = inspect_zoom_windows(vec![meeting_window], vec![system_dialog], 0);
+        let inspection = inspect_zoom_windows(
+            vec![meeting_window],
+            vec![system_dialog],
+            0,
+            surface_discovery(),
+        );
         let speakers = inspection
             .active_speakers
             .as_ref()
@@ -868,6 +1039,7 @@ mod tests {
                 top_level_dialogs: 1,
                 ignored_surfaces: 0,
                 active_speaker_labels: 1,
+                ..
             }
         ));
     }
@@ -876,7 +1048,8 @@ mod tests {
     #[test]
     fn top_level_dialog_cannot_name_a_transcript_without_one_validated_window() {
         let system_dialog = vec![zoom_node(2, "AXStaticText", "Talking: Vikram Prasanna")];
-        let inspection = inspect_zoom_windows(Vec::new(), vec![system_dialog], 0);
+        let inspection =
+            inspect_zoom_windows(Vec::new(), vec![system_dialog], 0, surface_discovery());
 
         assert!(inspection.active_speakers.is_none());
         assert!(matches!(
@@ -886,6 +1059,7 @@ mod tests {
                 validated_meetings: 0,
                 top_level_dialogs: 1,
                 ignored_surfaces: 0,
+                ..
             }
         ));
     }
