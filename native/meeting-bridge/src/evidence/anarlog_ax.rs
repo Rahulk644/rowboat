@@ -222,7 +222,11 @@ struct SurfaceDiscoveryStats {
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ZoomWindowValidation {
-    eligible_nodes: usize,
+    snapshot_nodes: usize,
+    non_input_nodes: usize,
+    state_container_nodes: usize,
+    static_text_nodes: usize,
+    other_non_input_nodes: usize,
     video_evidence_nodes: usize,
     audio_state_nodes: usize,
     colocated_evidence_nodes: usize,
@@ -665,16 +669,27 @@ fn node_labels(node: &ZoomAxNode) -> impl Iterator<Item = &str> {
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
 fn zoom_meeting_window_validation(nodes: &[ZoomAxNode]) -> ZoomWindowValidation {
     let mut validation = ZoomWindowValidation {
-        eligible_nodes: 0,
+        snapshot_nodes: nodes.len(),
+        non_input_nodes: 0,
+        state_container_nodes: 0,
+        static_text_nodes: 0,
+        other_non_input_nodes: 0,
         video_evidence_nodes: 0,
         audio_state_nodes: 0,
         colocated_evidence_nodes: 0,
     };
     for node in nodes {
-        if !matches!(node.role.as_deref(), Some("AXGroup") | Some("AXCell")) {
+        if is_text_input_role(node.role.as_deref()) {
             continue;
         }
-        validation.eligible_nodes += 1;
+        validation.non_input_nodes += 1;
+        match node.role.as_deref() {
+            Some("AXGroup") | Some("AXCell") | Some("AXRow") => {
+                validation.state_container_nodes += 1;
+            }
+            Some("AXStaticText") => validation.static_text_nodes += 1,
+            _ => validation.other_non_input_nodes += 1,
+        }
         let has_audio_state = node_labels(node).any(is_zoom_audio_state_label);
         let has_video_evidence = node_labels(node).any(is_zoom_video_evidence_label);
         validation.audio_state_nodes += usize::from(has_audio_state);
@@ -710,15 +725,19 @@ fn find_zoom_active_speakers(
 ) -> Vec<AnarlogParticipantStream> {
     let mut streams = Vec::new();
     for node in nodes {
-        if !matches!(
-            node.role.as_deref(),
-            Some("AXGroup") | Some("AXCell") | Some("AXRow")
-        ) {
+        if is_text_input_role(node.role.as_deref()) {
             continue;
         }
-        let Some((label, name, is_self)) =
-            node_labels(node).find_map(parse_zoom_active_speaker_label)
-        else {
+        let state_container = matches!(
+            node.role.as_deref(),
+            Some("AXGroup") | Some("AXCell") | Some("AXRow")
+        );
+        let Some((label, name, is_self)) = node_labels(node).find_map(|label| {
+            let lower = label.trim().to_ascii_lowercase();
+            (state_container || lower.starts_with("talking:") || lower.starts_with("video render "))
+                .then(|| parse_zoom_active_speaker_label(label))
+                .flatten()
+        }) else {
             continue;
         };
         if !names.insert(name.to_ascii_lowercase()) {
@@ -965,9 +984,11 @@ mod tests {
 
     #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
     use super::{
-        inspect_zoom_windows, is_zoom_top_level_auxiliary_dialog, zoom_meeting_window_validation,
-        SurfaceDiscoveryStats, ZoomAxDiagnostic, ZoomAxNode,
+        find_zoom_active_speakers, inspect_zoom_windows, is_zoom_top_level_auxiliary_dialog,
+        zoom_meeting_window_validation, SurfaceDiscoveryStats, ZoomAxDiagnostic, ZoomAxNode,
     };
+    #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+    use std::collections::HashSet;
 
     #[test]
     fn roster_presence_does_not_turn_into_a_speaking_claim() {
@@ -1050,7 +1071,9 @@ mod tests {
             zoom_node(1, "AXGroup", "Video tile"),
             zoom_node(2, "AXCell", "Computer audio unmuted"),
         ]);
-        assert_eq!(validation.eligible_nodes, 2);
+        assert_eq!(validation.snapshot_nodes, 2);
+        assert_eq!(validation.non_input_nodes, 2);
+        assert_eq!(validation.state_container_nodes, 2);
         assert_eq!(validation.video_evidence_nodes, 1);
         assert_eq!(validation.audio_state_nodes, 1);
         assert_eq!(validation.colocated_evidence_nodes, 0);
@@ -1061,6 +1084,44 @@ mod tests {
         let audio_only =
             zoom_meeting_window_validation(&[zoom_node(4, "AXCell", "Computer audio unmuted")]);
         assert!(!audio_only.is_valid());
+    }
+
+    #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+    #[test]
+    fn current_zoom_static_text_evidence_is_accepted_but_input_text_is_not() {
+        let static_text = zoom_meeting_window_validation(&[
+            zoom_node(1, "AXStaticText", "Video tile"),
+            zoom_node(2, "AXStaticText", "Computer audio unmuted"),
+        ]);
+        assert_eq!(static_text.static_text_nodes, 2);
+        assert!(static_text.is_valid());
+
+        let input_text = zoom_meeting_window_validation(&[
+            zoom_node(3, "AXTextField", "Video tile"),
+            zoom_node(4, "AXTextArea", "Computer audio unmuted"),
+        ]);
+        assert_eq!(input_text.non_input_nodes, 0);
+        assert!(!input_text.is_valid());
+    }
+
+    #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+    #[test]
+    fn non_input_static_text_accepts_only_explicit_talking_or_video_active_labels() {
+        let mut names = HashSet::new();
+        let streams = find_zoom_active_speakers(
+            &[
+                zoom_node(1, "AXStaticText", "Talking: Rakshit Singh"),
+                zoom_node(2, "AXStaticText", "Rakshit Singh is speaking"),
+                zoom_node(3, "AXTextField", "Talking: Input Text"),
+            ],
+            &mut names,
+        );
+
+        assert_eq!(streams.len(), 1);
+        assert_eq!(
+            streams[0].participant_name.as_deref(),
+            Some("Rakshit Singh")
+        );
     }
 
     #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
