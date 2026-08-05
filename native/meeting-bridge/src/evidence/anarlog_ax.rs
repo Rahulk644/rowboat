@@ -230,6 +230,11 @@ struct ZoomWindowValidation {
     video_evidence_nodes: usize,
     audio_state_nodes: usize,
     colocated_evidence_nodes: usize,
+    leave_control_nodes: usize,
+    participants_control_nodes: usize,
+    mute_control_nodes: usize,
+    explicit_talking_nodes: usize,
+    video_active_nodes: usize,
 }
 
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
@@ -237,6 +242,11 @@ impl ZoomWindowValidation {
     fn is_valid(&self) -> bool {
         self.colocated_evidence_nodes > 0
             || (self.video_evidence_nodes > 0 && self.audio_state_nodes > 0)
+            || (self.audio_state_nodes > 0
+                && self.leave_control_nodes > 0
+                && self.participants_control_nodes > 0
+                && self.mute_control_nodes > 0)
+            || (self.audio_state_nodes > 0 && self.explicit_talking_nodes > 0)
     }
 }
 
@@ -677,6 +687,11 @@ fn zoom_meeting_window_validation(nodes: &[ZoomAxNode]) -> ZoomWindowValidation 
         video_evidence_nodes: 0,
         audio_state_nodes: 0,
         colocated_evidence_nodes: 0,
+        leave_control_nodes: 0,
+        participants_control_nodes: 0,
+        mute_control_nodes: 0,
+        explicit_talking_nodes: 0,
+        video_active_nodes: 0,
     };
     for node in nodes {
         if is_text_input_role(node.role.as_deref()) {
@@ -692,9 +707,19 @@ fn zoom_meeting_window_validation(nodes: &[ZoomAxNode]) -> ZoomWindowValidation 
         }
         let has_audio_state = node_labels(node).any(is_zoom_audio_state_label);
         let has_video_evidence = node_labels(node).any(is_zoom_video_evidence_label);
+        let has_leave_control = node_labels(node).any(is_zoom_leave_control_label);
+        let has_participants_control = node_labels(node).any(is_zoom_participants_control_label);
+        let has_mute_control = node_labels(node).any(is_zoom_mute_control_label);
+        let has_explicit_talking = node_labels(node).any(is_zoom_explicit_talking_label);
+        let has_video_active = node_labels(node).any(is_zoom_video_active_label);
         validation.audio_state_nodes += usize::from(has_audio_state);
         validation.video_evidence_nodes += usize::from(has_video_evidence);
         validation.colocated_evidence_nodes += usize::from(has_audio_state && has_video_evidence);
+        validation.leave_control_nodes += usize::from(has_leave_control);
+        validation.participants_control_nodes += usize::from(has_participants_control);
+        validation.mute_control_nodes += usize::from(has_mute_control);
+        validation.explicit_talking_nodes += usize::from(has_explicit_talking);
+        validation.video_active_nodes += usize::from(has_video_active);
     }
     validation
 }
@@ -703,6 +728,47 @@ fn zoom_meeting_window_validation(nodes: &[ZoomAxNode]) -> ZoomWindowValidation 
 fn is_zoom_audio_state_label(label: &str) -> bool {
     let lower = label.to_ascii_lowercase();
     lower.contains("computer audio") || lower.contains("no audio connected")
+}
+
+/// Exact native Zoom meeting controls. These never inspect a window title or
+/// arbitrary text, and audio-only validation requires all three independent
+/// controls in addition to a real computer-audio state in the same AX window.
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn is_zoom_leave_control_label(label: &str) -> bool {
+    matches!(
+        label.trim().to_ascii_lowercase().as_str(),
+        "leave" | "leave meeting"
+    )
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn is_zoom_participants_control_label(label: &str) -> bool {
+    label.trim().eq_ignore_ascii_case("participants")
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn is_zoom_mute_control_label(label: &str) -> bool {
+    matches!(
+        label.trim().to_ascii_lowercase().as_str(),
+        "mute" | "unmute"
+    )
+}
+
+/// These predicates retain only a boolean/count for diagnostic and validation
+/// purposes. The parsed participant name is never returned from this path.
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn is_zoom_explicit_talking_label(label: &str) -> bool {
+    label.trim().to_ascii_lowercase().starts_with("talking:")
+        && parse_zoom_active_speaker_label(label).is_some()
+}
+
+#[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+fn is_zoom_video_active_label(label: &str) -> bool {
+    label
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("video render ")
+        && parse_zoom_active_speaker_label(label).is_some()
 }
 
 #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
@@ -1102,6 +1168,61 @@ mod tests {
         ]);
         assert_eq!(input_text.non_input_nodes, 0);
         assert!(!input_text.is_valid());
+    }
+
+    #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+    #[test]
+    fn audio_only_mini_window_requires_three_exact_meeting_controls() {
+        let meeting_controls = zoom_meeting_window_validation(&[
+            zoom_node(1, "AXStaticText", "Computer audio unmuted"),
+            zoom_node(2, "AXButton", "Leave"),
+            zoom_node(3, "AXButton", "Participants"),
+            zoom_node(4, "AXButton", "Mute"),
+        ]);
+        assert_eq!(meeting_controls.video_evidence_nodes, 0);
+        assert_eq!(meeting_controls.audio_state_nodes, 1);
+        assert_eq!(meeting_controls.leave_control_nodes, 1);
+        assert_eq!(meeting_controls.participants_control_nodes, 1);
+        assert_eq!(meeting_controls.mute_control_nodes, 1);
+        assert!(meeting_controls.is_valid());
+    }
+
+    #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+    #[test]
+    fn audio_settings_or_home_controls_cannot_validate_an_audio_only_window() {
+        let audio_settings = zoom_meeting_window_validation(&[
+            zoom_node(1, "AXStaticText", "Computer audio unmuted"),
+            zoom_node(2, "AXButton", "Mute"),
+            zoom_node(3, "AXStaticText", "Audio settings"),
+        ]);
+        assert!(!audio_settings.is_valid());
+
+        let home_surface = zoom_meeting_window_validation(&[
+            zoom_node(4, "AXButton", "Leave"),
+            zoom_node(5, "AXButton", "Participants"),
+            zoom_node(6, "AXButton", "Unmute"),
+            zoom_node(7, "AXStaticText", "Home"),
+        ]);
+        assert!(!home_surface.is_valid());
+    }
+
+    #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
+    #[test]
+    fn audio_and_explicit_talking_prove_a_compact_meeting_surface_without_controls() {
+        let compact_meeting = zoom_meeting_window_validation(&[
+            zoom_node(1, "AXStaticText", "Computer audio unmuted"),
+            zoom_node(2, "AXStaticText", "Talking: Rakshit Singh"),
+        ]);
+        assert_eq!(compact_meeting.explicit_talking_nodes, 1);
+        assert_eq!(compact_meeting.video_active_nodes, 0);
+        assert!(compact_meeting.is_valid());
+
+        let talking_without_audio = zoom_meeting_window_validation(&[zoom_node(
+            3,
+            "AXStaticText",
+            "Talking: Rakshit Singh",
+        )]);
+        assert!(!talking_without_audio.is_valid());
     }
 
     #[cfg(all(target_os = "macos", feature = "anarlog-ax"))]
