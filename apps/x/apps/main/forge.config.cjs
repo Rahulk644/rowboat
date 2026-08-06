@@ -11,6 +11,36 @@ const pkg = require('./package.json');
 // Ubuntu and shouldn't attempt to ship an Arch package.
 const SKIP_PACMAN = process.env.ROWBOAT_SKIP_PACMAN === '1';
 const SKIP_CODE_SIGNING = process.env.ROWBOAT_SKIP_CODE_SIGNING === '1';
+const PERSONAL_MEETINGS_BUILD = process.env.ROWBOAT_PERSONAL_MEETINGS_BUILD === '1';
+
+const MACOS_SIGNING = SKIP_CODE_SIGNING
+    ? {}
+    : PERSONAL_MEETINGS_BUILD
+        ? {
+              osxSign: {
+                  identity: '-',
+                  identityValidation: false,
+                  batchCodesignCalls: true,
+                  optionsForFile: () => ({
+                      entitlements: path.join(__dirname, 'entitlements.plist'),
+                      'entitlements-inherit': path.join(__dirname, 'entitlements.plist'),
+                  }),
+              },
+          }
+        : {
+              osxSign: {
+                  batchCodesignCalls: true,
+                  optionsForFile: () => ({
+                      entitlements: path.join(__dirname, 'entitlements.plist'),
+                      'entitlements-inherit': path.join(__dirname, 'entitlements.plist'),
+                  }),
+              },
+              osxNotarize: {
+                  appleId: process.env.APPLE_ID,
+                  appleIdPassword: process.env.APPLE_PASSWORD,
+                  teamId: process.env.APPLE_TEAM_ID,
+              },
+          };
 
 // Windows code signing via Azure Trusted Signing — CI-only. The GitHub workflow
 // downloads the Azure dlib, writes metadata.json, and exports these env vars;
@@ -221,14 +251,19 @@ module.exports = {
         onlyModules: [],
     },
     packagerConfig: {
-        executableName: 'rowboat',
+        ...(PERSONAL_MEETINGS_BUILD ? { name: 'Rowboat Personal Meetings' } : {}),
+        executableName: PERSONAL_MEETINGS_BUILD ? 'Rowboat Personal Meetings' : 'rowboat',
         icon: './icons/icon',  // .icns extension added automatically
-        appBundleId: 'com.rowboat.app',
+        appBundleId: PERSONAL_MEETINGS_BUILD ? 'com.rowboat.personal-meetings' : 'com.rowboat.app',
         appCategoryType: 'public.app-category.productivity',
         protocols: [
             { name: 'Rowboat', schemes: ['rowboat'] },
         ],
         extendInfo: {
+            ...(PERSONAL_MEETINGS_BUILD ? {
+                CFBundleDisplayName: 'Rowboat Personal Meetings',
+                CFBundleName: 'Rowboat Personal Meetings',
+            } : {}),
             NSAudioCaptureUsageDescription: 'Rowboat needs access to system audio to transcribe meetings from other apps (Zoom, Meet, etc.)',
             NSAccessibilityUsageDescription: 'Rowboat uses Accessibility during Zoom meetings to label active speakers and detect when the meeting window closes.',
             NSCameraUsageDescription: 'Rowboat uses your camera in video chat mode so the assistant can see you and give feedback (e.g. pitch practice).',
@@ -236,20 +271,10 @@ module.exports = {
         // Signs the packaged app's executables (rowboat.exe etc.); the Squirrel
         // maker below separately signs the installer it produces.
         ...(WINDOWS_SIGN ? { windowsSign: WINDOWS_SIGN } : {}),
-        ...(SKIP_CODE_SIGNING ? {} : {
-            osxSign: {
-                batchCodesignCalls: true,
-                optionsForFile: () => ({
-                    entitlements: path.join(__dirname, 'entitlements.plist'),
-                    'entitlements-inherit': path.join(__dirname, 'entitlements.plist'),
-                }),
-            },
-            osxNotarize: {
-                appleId: process.env.APPLE_ID,
-                appleIdPassword: process.env.APPLE_PASSWORD,
-                teamId: process.env.APPLE_TEAM_ID
-            },
-        }),
+        ...MACOS_SIGNING,
+        ...(PERSONAL_MEETINGS_BUILD ? {
+            extraResource: [path.join(__dirname, 'personal-meetings-build.json')],
+        } : {}),
         // Since we bundle the main process with esbuild, we don't need the workspace
         // node_modules. These settings prevent Forge's dependency walker (flora-colossus)
         // from trying to analyze/copy node_modules, which fails with pnpm's symlinked

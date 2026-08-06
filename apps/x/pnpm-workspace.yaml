@@ -2,6 +2,10 @@ packages:
   - apps/*
   - packages/*
 
+# Electron Forge packages the application from a physical node_modules tree.
+# pnpm 11 reads this setting from the workspace manifest.
+nodeLinker: hoisted
+
 allowBuilds:
   baileys: true
   core-js: true

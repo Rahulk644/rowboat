@@ -1,4 +1,6 @@
 import { app, autoUpdater, net, nativeImage, BrowserWindow } from "electron";
+import fs from "node:fs";
+import path from "node:path";
 import { capture } from "@x/core/dist/analytics/posthog.js";
 import type { ipc } from "@x/shared";
 
@@ -51,6 +53,13 @@ function showReadyBadge(): void {
  */
 export function initUpdater(): void {
   const version = app.getVersion();
+
+  if (fs.existsSync(path.join(process.resourcesPath, "personal-meetings-build.json"))) {
+    // A contributor package must never be replaced by Rowboat's release
+    // updater; it has a distinct identity and locally reviewed add-ons.
+    status = { state: "disabled", version, reason: "dev" };
+    return;
+  }
 
   if (!app.isPackaged) {
     status = { state: "disabled", version, reason: "dev" };
