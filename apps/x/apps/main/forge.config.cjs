@@ -22,8 +22,8 @@ const MACOS_SIGNING = SKIP_CODE_SIGNING
                   identityValidation: false,
                   batchCodesignCalls: true,
                   optionsForFile: () => ({
-                      entitlements: path.join(__dirname, 'entitlements.plist'),
-                      'entitlements-inherit': path.join(__dirname, 'entitlements.plist'),
+                      entitlements: path.join(__dirname, 'entitlements.personal.plist'),
+                      'entitlements-inherit': path.join(__dirname, 'entitlements.personal.plist'),
                   }),
               },
           }
