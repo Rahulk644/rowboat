@@ -94,6 +94,71 @@ function actionItemTexts(value: unknown): string[] {
   return [...new Set(items)].slice(0, 200);
 }
 
+type NormalizedTranscript = {
+  text?: string;
+  speakers: string[];
+};
+
+function isGenericSpeakerName(value: string): boolean {
+  return /^(?:speaker[ _-]*\d+|unknown(?: speaker)?|you|them)$/i.test(value.trim());
+}
+
+function dedupeNames(values: string[]): string[] {
+  const names = new Map<string, string>();
+  for (const value of values) {
+    const normalized = value.replace(/\s+/g, ' ').trim();
+    if (normalized && !names.has(normalized.toLocaleLowerCase())) {
+      names.set(normalized.toLocaleLowerCase(), normalized);
+    }
+  }
+  return [...names.values()].slice(0, 200);
+}
+
+/**
+ * Wispr returns its transcript as one plain-text line per turn (`Name: text`).
+ * Rowboat's legacy transcript block accepts the same turns only as
+ * `**Name:** text`. Preserve already-normalized turns, drop Wispr's sentinel
+ * banner, and provide an Unknown speaker turn for unlabeled plain text so a
+ * valid transcript can never render as an invalid block.
+ */
+function normalizeTranscriptForRowboat(value: string | undefined): NormalizedTranscript {
+  if (!value) return { speakers: [] };
+  const output: string[] = [];
+  const speakers: string[] = [];
+  let sawTurn = false;
+
+  for (const rawLine of value.split('\n')) {
+    const line = rawLine.trim();
+    if (!line || /^<<<.*>>>$/.test(line)) continue;
+
+    const markdownTurn = line.match(/^\*\*([^*:\n]{1,120}):\*\*\s*(.*)$/);
+    if (markdownTurn) {
+      const speaker = markdownTurn[1].replace(/\s+/g, ' ').trim();
+      output.push(`**${speaker}:** ${markdownTurn[2].trim()}`);
+      speakers.push(speaker);
+      sawTurn = true;
+      continue;
+    }
+
+    const plainTurn = line.match(/^([^*:\n]{1,120}):\s+(.*)$/);
+    if (plainTurn && /\p{L}/u.test(plainTurn[1])) {
+      const speaker = plainTurn[1].replace(/\s+/g, ' ').trim();
+      output.push(`**${speaker}:** ${plainTurn[2].trim()}`);
+      speakers.push(speaker);
+      sawTurn = true;
+      continue;
+    }
+
+    if (sawTurn && output.length > 0) output[output.length - 1] += ` ${line}`;
+    else output.push(line);
+  }
+
+  const text = output.join('\n').trim();
+  if (!text) return { speakers: [] };
+  if (!sawTurn) return { text: `**Unknown speaker:** ${text}`, speakers: [] };
+  return { text, speakers: dedupeNames(speakers) };
+}
+
 function transcriptText(value: unknown): string | undefined {
   const direct = textValue(value);
   if (direct) return direct;
@@ -145,9 +210,11 @@ export function normalizeWisprMeeting(value: unknown): NormalizedWisprMeeting | 
   const thoughts = textValue(firstValue(source, [
     'myThoughts', 'my_thoughts', 'thoughts', 'notes', 'userNotes', 'user_notes', 'content',
   ]));
-  const transcript = transcriptText(firstValue(source, [
+  const rawTranscript = transcriptText(firstValue(source, [
     'transcript', 'rawTranscript', 'raw_transcript', 'sentences', 'segments', 'utterances',
   ]));
+  const normalizedTranscript = normalizeTranscriptForRowboat(rawTranscript);
+  const transcript = normalizedTranscript.text;
   if (!transcript && !summary && !thoughts) return null;
 
   const rawStatus = textValue(firstValue(source, ['status', 'state', 'processingStatus']))?.toLowerCase();
@@ -174,9 +241,11 @@ export function normalizeWisprMeeting(value: unknown): NormalizedWisprMeeting | 
   ]));
   const title = (textValue(firstValue(source, ['title', 'meetingTitle', 'meeting_title', 'name']))
     ?? 'Wispr meeting').replace(/\s+/g, ' ').slice(0, 240);
-  const participants = participantNames(firstValue(source, [
+  const explicitParticipants = participantNames(firstValue(source, [
     'participants', 'attendees', 'people', 'participantNames', 'participant_names',
   ]));
+  const transcriptParticipants = normalizedTranscript.speakers.filter((name) => !isGenericSpeakerName(name));
+  const participants = dedupeNames([...explicitParticipants, ...transcriptParticipants]);
   const actionItems = actionItemTexts(firstValue(source, [
     'todos', 'toDos', 'actionItems', 'action_items', 'tasks',
   ]));

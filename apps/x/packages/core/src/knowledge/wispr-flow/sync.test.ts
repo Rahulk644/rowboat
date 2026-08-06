@@ -56,6 +56,33 @@ describe('Wispr Flow meeting sync', () => {
     expect(meeting?.transcript).toBeUndefined();
   });
 
+  it('converts Wispr speaker turns into a valid Rowboat transcript and derives named participants', () => {
+    const meeting = normalizeWisprMeeting({
+      id: 'wispr-meeting-speakers',
+      finalized: true,
+      transcript: [
+        '<<<Transcript starts here, use responsibly>>>',
+        'rajat prakash: First point.',
+        'Speaker 2: Generic diarized response.',
+        'Rahul Khatri: Follow-up point.',
+      ].join('\n'),
+    });
+    expect(meeting?.transcript).toContain('**rajat prakash:** First point.');
+    expect(meeting?.transcript).toContain('**Speaker 2:** Generic diarized response.');
+    expect(meeting?.transcript).toContain('**Rahul Khatri:** Follow-up point.');
+    expect(meeting?.participants).toEqual(['rajat prakash', 'Rahul Khatri']);
+  });
+
+  it('wraps an unlabeled Wispr transcript in a valid unknown-speaker turn', () => {
+    const meeting = normalizeWisprMeeting({
+      id: 'wispr-meeting-unlabeled',
+      finalized: true,
+      transcript: 'A transcript with no speaker boundary.',
+    });
+    expect(meeting?.transcript).toBe('**Unknown speaker:** A transcript with no speaker boundary.');
+    expect(meeting?.participants).toEqual([]);
+  });
+
   it('does not import a transcript-only live meeting', () => {
     const meeting = normalizeWisprMeeting({
       id: 'meeting-live',
