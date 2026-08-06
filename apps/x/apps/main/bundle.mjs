@@ -154,7 +154,14 @@ if (process.platform === 'darwin') {
       execSync(`swiftc -O "${swiftSrc}" -o "${helperOut}"`, { stdio: 'inherit' });
       console.log('✅ mic-monitor helper compiled');
     } catch {
-      console.warn('⚠️  mic-monitor helper not built (swiftc unavailable?) — meeting detection disabled');
+      const fallback = process.env.ROWBOAT_MIC_MONITOR_FALLBACK;
+      if (fallback && fs.existsSync(fallback)) {
+        fs.copyFileSync(fallback, helperOut);
+        fs.chmodSync(helperOut, 0o755);
+        console.log(`✅ mic-monitor helper staged from explicit fallback: ${fallback}`);
+      } else {
+        console.warn('⚠️  mic-monitor helper not built (swiftc unavailable?) — meeting detection disabled');
+      }
     }
   }
 }
