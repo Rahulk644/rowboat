@@ -28,12 +28,14 @@ export class FSClientRegistrationRepo implements IClientRegistrationRepo {
   }
 
   private async ensureConfigFile(): Promise<void> {
+    await fs.mkdir(path.dirname(this.configPath), { recursive: true, mode: 0o700 });
     try {
       await fs.access(this.configPath);
     } catch {
       // File doesn't exist, create it with empty object
-      await fs.writeFile(this.configPath, JSON.stringify({}, null, 2));
+      await fs.writeFile(this.configPath, JSON.stringify({}, null, 2), { mode: 0o600 });
     }
+    await fs.chmod(this.configPath, 0o600);
   }
 
   private async readConfig(): Promise<ClientRegistrationStorage> {
@@ -47,7 +49,8 @@ export class FSClientRegistrationRepo implements IClientRegistrationRepo {
   }
 
   private async writeConfig(config: ClientRegistrationStorage): Promise<void> {
-    await fs.writeFile(this.configPath, JSON.stringify(config, null, 2));
+    await fs.writeFile(this.configPath, JSON.stringify(config, null, 2), { mode: 0o600 });
+    await fs.chmod(this.configPath, 0o600);
   }
 
   async getClientRegistration(provider: string): Promise<ClientRegistrationResponse | null> {
@@ -84,4 +87,3 @@ export class FSClientRegistrationRepo implements IClientRegistrationRepo {
     await this.writeConfig(config);
   }
 }
-

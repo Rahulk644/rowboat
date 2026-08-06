@@ -67,6 +67,7 @@ const activeFlows = new Map<string, {
   codeVerifier: string;
   provider: string;
   config: Configuration;
+  resource?: string;
 }>();
 
 // Module-level state for tracking the active OAuth flow
@@ -316,7 +317,8 @@ export async function connectProvider(provider: string, credentials?: { clientId
             flow.config,
             callbackUrl,
             flow.codeVerifier,
-            state
+            state,
+            flow.resource,
           );
 
           // Save tokens and credentials. For Google, BYOK is the only path
@@ -426,13 +428,19 @@ export async function connectProvider(provider: string, credentials?: { clientId
       state = oauthClient.generateState();
 
       const scopes = providerConfig.scopes || [];
-      activeFlows.set(state, { codeVerifier, provider, config });
+      activeFlows.set(state, {
+        codeVerifier,
+        provider,
+        config,
+        resource: providerConfig.resource,
+      });
 
       const authUrl = oauthClient.buildAuthorizationUrl(config, {
         redirect_uri: redirectUri,
         scope: scopes.join(' '),
         code_challenge: codeChallenge,
         state,
+        ...(providerConfig.resource ? { resource: providerConfig.resource } : {}),
         // Google only returns a refresh_token when offline access is requested,
         // and only re-issues one when re-consent is forced. Without these, a
         // BYOK token expires after ~1h with no way to refresh (it goes stale and
@@ -660,7 +668,13 @@ export async function getAccessToken(provider: string): Promise<string | null> {
 
         // Refresh token, preserving existing scopes
         const existingScopes = tokens.scopes;
-        const refreshedTokens = await oauthClient.refreshTokens(config, tokens.refresh_token, existingScopes);
+        const providerConfig = await getProviderConfig(provider);
+        const refreshedTokens = await oauthClient.refreshTokens(
+          config,
+          tokens.refresh_token,
+          existingScopes,
+          providerConfig.resource,
+        );
         await oauthRepo.upsert(provider, { tokens: refreshedTokens });
         tokens = refreshedTokens;
       } catch (error) {

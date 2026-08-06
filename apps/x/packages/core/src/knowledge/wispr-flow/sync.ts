@@ -26,11 +26,13 @@ export type NormalizedWisprMeeting = {
   participants: string[];
   thoughts?: string;
   summary?: string;
-  transcript: string;
+  actionItems: string[];
+  transcript?: string;
   finalized: boolean;
 };
 
 type SyncState = {
+  version: 2;
   baselineComplete: boolean;
   synced: Record<string, { contentHash: string; filePath: string; importedAt: string }>;
   ignoredBaselineIds: string[];
@@ -77,6 +79,19 @@ function participantNames(value: unknown): string[] {
     return name ? [name] : [];
   }).filter(Boolean);
   return [...new Set(names)].slice(0, 200);
+}
+
+function actionItemTexts(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const items = value.flatMap((item) => {
+    if (typeof item === 'string') return [item.trim()];
+    const object = asObject(item);
+    const text = object && textValue(firstValue(object, [
+      'text', 'title', 'description', 'content', 'task', 'todo', 'actionItem', 'action_item',
+    ]));
+    return text ? [text] : [];
+  }).filter(Boolean);
+  return [...new Set(items)].slice(0, 200);
 }
 
 function transcriptText(value: unknown): string | undefined {
@@ -128,12 +143,12 @@ export function normalizeWisprMeeting(value: unknown): NormalizedWisprMeeting | 
     'summary', 'meetingSummary', 'meeting_summary', 'brief', 'overview',
   ]));
   const thoughts = textValue(firstValue(source, [
-    'myThoughts', 'my_thoughts', 'thoughts', 'notes', 'userNotes', 'user_notes',
+    'myThoughts', 'my_thoughts', 'thoughts', 'notes', 'userNotes', 'user_notes', 'content',
   ]));
   const transcript = transcriptText(firstValue(source, [
     'transcript', 'rawTranscript', 'raw_transcript', 'sentences', 'segments', 'utterances',
   ]));
-  if (!transcript) return null;
+  if (!transcript && !summary && !thoughts) return null;
 
   const rawStatus = textValue(firstValue(source, ['status', 'state', 'processingStatus']))?.toLowerCase();
   const explicitFinal = firstValue(source, ['finalized', 'isFinalized', 'is_finalized', 'complete', 'completed']);
@@ -151,19 +166,24 @@ export function normalizeWisprMeeting(value: unknown): NormalizedWisprMeeting | 
   );
 
   const occurredAt = isoValue(firstValue(source, [
-    'startedAt', 'started_at', 'date', 'createdAt', 'created_at', 'meetingDate',
+    'startedAt', 'started_at', 'start', 'date', 'createdAt', 'created_at', 'meetingDate',
   ])) ?? new Date().toISOString();
   const endedAt = isoValue(firstValue(source, [
-    'endedAt', 'ended_at', 'completedAt', 'completed_at', 'updatedAt', 'updated_at',
+    'endedAt', 'ended_at', 'end', 'completedAt', 'completed_at', 'updatedAt', 'updated_at',
+    'modifiedAt', 'modified_at',
   ]));
   const title = (textValue(firstValue(source, ['title', 'meetingTitle', 'meeting_title', 'name']))
     ?? 'Wispr meeting').replace(/\s+/g, ' ').slice(0, 240);
   const participants = participantNames(firstValue(source, [
     'participants', 'attendees', 'people', 'participantNames', 'participant_names',
   ]));
+  const actionItems = actionItemTexts(firstValue(source, [
+    'todos', 'toDos', 'actionItems', 'action_items', 'tasks',
+  ]));
 
   return { id, title, occurredAt, ...(endedAt ? { endedAt } : {}), participants,
-    ...(thoughts ? { thoughts } : {}), ...(summary ? { summary } : {}), transcript, finalized };
+    ...(thoughts ? { thoughts } : {}), ...(summary ? { summary } : {}), actionItems,
+    ...(transcript ? { transcript } : {}), finalized };
 }
 
 function collectObjects(value: unknown, depth = 0): JsonObject[] {
@@ -210,6 +230,18 @@ function toolScore(tool: McpTool, mode: 'list' | 'detail'): number {
 }
 
 export function chooseWisprTools(tools: McpTool[]): { list: McpTool; detail?: McpTool } {
+  // Wispr's public MCP contract currently exposes these canonical names. Use
+  // them when present so similarly described calendar tools (for example
+  // get_upcoming_meeting) cannot win a heuristic tie.
+  const canonicalList = tools.find((tool) => tool.name === 'search_meetings');
+  const canonicalDetail = tools.find((tool) => tool.name === 'get_meeting');
+  if (canonicalList) {
+    return {
+      list: canonicalList,
+      ...(canonicalDetail ? { detail: canonicalDetail } : {}),
+    };
+  }
+
   const rankedList = [...tools].sort((a, b) => toolScore(b, 'list') - toolScore(a, 'list'));
   const list = rankedList[0];
   if (!list || toolScore(list, 'list') < 6) {
@@ -225,29 +257,31 @@ function schemaProperties(tool: McpTool): JsonObject {
   return asObject(tool.inputSchema?.properties) ?? {};
 }
 
-function listArguments(tool: McpTool): JsonObject {
+export function listArguments(tool: McpTool): JsonObject {
   const properties = schemaProperties(tool);
   const args: JsonObject = {};
   for (const key of Object.keys(properties)) {
     const lower = key.toLowerCase();
     if (['limit', 'pagesize', 'page_size', 'maxresults', 'max_results'].includes(lower)) args[key] = 50;
-    else if (['query', 'q', 'search'].includes(lower)) args[key] = 'meeting';
-    else if (['fromdate', 'from_date', 'startdate', 'start_date'].includes(lower)) {
-      const from = new Date();
-      from.setDate(from.getDate() - 7);
-      args[key] = from.toISOString().slice(0, 10);
-    } else if (['todate', 'to_date', 'enddate', 'end_date'].includes(lower)) {
-      args[key] = new Date().toISOString().slice(0, 10);
-    }
+    // Wispr's search_meetings contract lists recently modified meetings when
+    // query is omitted. Supplying a generic word such as "meeting" filters by
+    // title/content and silently hides ordinary meeting titles.
   }
   return args;
 }
 
-function detailArguments(tool: McpTool, meetingId: string): JsonObject | null {
+export function detailArguments(tool: McpTool, meetingId: string): JsonObject | null {
   const properties = schemaProperties(tool);
   for (const key of Object.keys(properties)) {
     if (/^(id|meeting_?id|note_?id|notetaker_?id|transcript_?id)$/i.test(key)) {
-      return { [key]: meetingId };
+      const args: JsonObject = { [key]: meetingId };
+      if ('view_content' in properties) {
+        args.view_content = { start_char: 0, char_limit: 40_000 };
+      }
+      if ('view_transcript' in properties) {
+        args.view_transcript = { start_char: 0, char_limit: 40_000 };
+      }
+      return args;
     }
   }
   return null;
@@ -278,19 +312,28 @@ export function meetingToMarkdown(meeting: NormalizedWisprMeeting): string {
   ];
   if (meeting.thoughts) lines.push('## My thoughts', '', meeting.thoughts, '');
   if (meeting.summary) lines.push('## Summary', '', meeting.summary, '');
-  lines.push('## Transcript', '', '```transcript', JSON.stringify({ transcript: meeting.transcript }), '```', '');
+  if (meeting.actionItems.length > 0) {
+    lines.push('## Action items', '', ...meeting.actionItems.map((item) => `- ${item}`), '');
+  }
+  if (meeting.transcript) {
+    lines.push('## Transcript', '', '```transcript', JSON.stringify({ transcript: meeting.transcript }), '```', '');
+  } else {
+    lines.push('## Transcript', '', '_Not available from Wispr Flow for this meeting._', '');
+  }
   return lines.join('\n');
 }
 
 function defaultState(): SyncState {
-  return { baselineComplete: false, synced: {}, ignoredBaselineIds: [] };
+  return { version: 2, baselineComplete: false, synced: {}, ignoredBaselineIds: [] };
 }
 
 function loadState(): SyncState {
   try {
     if (!fs.existsSync(STATE_FILE)) return defaultState();
     const parsed = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) as Partial<SyncState>;
+    if (parsed.version !== 2) return defaultState();
     return {
+      version: 2,
       baselineComplete: parsed.baselineComplete === true,
       synced: parsed.synced ?? {},
       ignoredBaselineIds: Array.isArray(parsed.ignoredBaselineIds) ? parsed.ignoredBaselineIds : [],

@@ -223,6 +223,11 @@ export function buildAuthorizationUrl(
   });
 }
 
+/** Return RFC 8707 token-endpoint parameters for a protected resource. */
+export function resourceParameters(resource?: string): Record<string, string> | undefined {
+  return resource ? { resource } : undefined;
+}
+
 /**
  * Exchange authorization code for tokens
  */
@@ -230,14 +235,15 @@ export async function exchangeCodeForTokens(
   config: client.Configuration,
   callbackUrl: URL,
   codeVerifier: string,
-  expectedState: string
+  expectedState: string,
+  resource?: string,
 ): Promise<OAuthTokens> {
   console.log(`[OAuth] Exchanging authorization code for tokens...`);
 
   const response = await client.authorizationCodeGrant(config, callbackUrl, {
     pkceCodeVerifier: codeVerifier,
     expectedState,
-  });
+  }, resourceParameters(resource));
 
   console.log(`[OAuth] Token exchange successful`);
   return toOAuthTokens(response);
@@ -250,11 +256,16 @@ export async function exchangeCodeForTokens(
 export async function refreshTokens(
   config: client.Configuration,
   refreshToken: string,
-  existingScopes?: string[]
+  existingScopes?: string[],
+  resource?: string,
 ): Promise<OAuthTokens> {
   console.log(`[OAuth] Refreshing access token...`);
 
-  const response = await client.refreshTokenGrant(config, refreshToken);
+  const response = await client.refreshTokenGrant(
+    config,
+    refreshToken,
+    resourceParameters(resource),
+  );
 
   const tokens = toOAuthTokens(response);
 

@@ -51,11 +51,13 @@ export class FSOAuthRepo implements IOAuthRepo {
   }
 
   private async ensureConfigFile(): Promise<void> {
+    await fs.mkdir(path.dirname(this.configPath), { recursive: true, mode: 0o700 });
     try {
       await fs.access(this.configPath);
     } catch {
-      await fs.writeFile(this.configPath, JSON.stringify(DEFAULT_CONFIG, null, 2));
+      await fs.writeFile(this.configPath, JSON.stringify(DEFAULT_CONFIG, null, 2), { mode: 0o600 });
     }
+    await fs.chmod(this.configPath, 0o600);
   }
 
   private normalizeConfig(payload: unknown): { config: z.infer<typeof OAuthConfigSchema>; migrated: boolean } {
@@ -94,7 +96,8 @@ export class FSOAuthRepo implements IOAuthRepo {
   }
 
   private async writeConfig(config: z.infer<typeof OAuthConfigSchema>): Promise<void> {
-    await fs.writeFile(this.configPath, JSON.stringify(config, null, 2));
+    await fs.writeFile(this.configPath, JSON.stringify(config, null, 2), { mode: 0o600 });
+    await fs.chmod(this.configPath, 0o600);
   }
 
   async read(provider: string): Promise<z.infer<typeof ProviderConnectionSchema>> {

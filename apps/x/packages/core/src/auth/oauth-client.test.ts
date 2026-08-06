@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { registerClientAtEndpoint } from './oauth-client.js';
+import { registerClientAtEndpoint, resourceParameters } from './oauth-client.js';
+import { getProviderConfig } from './providers.js';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -51,5 +52,19 @@ describe('explicit OAuth dynamic client registration', () => {
       'https://mcp-auth.wisprflow.com/oauth2/register',
       { redirect_uris: ['http://127.0.0.1:19876/oauth/callback'] },
     )).rejects.toThrow(/^Dynamic client registration failed \(400\): x{1000}$/);
+  });
+});
+
+describe('OAuth protected-resource binding', () => {
+  it('binds the Wispr authorization and token requests to the public MCP resource', async () => {
+    const provider = await getProviderConfig('wispr-flow');
+    expect(provider.resource).toBe('https://api.wisprflow.ai/connect/mcp');
+    expect(resourceParameters(provider.resource)).toEqual({
+      resource: 'https://api.wisprflow.ai/connect/mcp',
+    });
+  });
+
+  it('does not add a resource parameter for ordinary providers', () => {
+    expect(resourceParameters()).toBeUndefined();
   });
 });

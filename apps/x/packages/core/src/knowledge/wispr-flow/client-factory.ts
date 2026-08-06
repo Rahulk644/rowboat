@@ -19,7 +19,7 @@ type ClientCache = {
 
 /**
  * Authenticated client for Wispr Flow's public MCP connector. Tokens and DCR
- * registrations use Rowboat's existing encrypted OAuth repositories; this
+ * registrations use Rowboat's existing owner-only OAuth repositories; this
  * client never reads Wispr's desktop session, Keychain, or private local data.
  */
 export class WisprFlowClientFactory {
@@ -55,6 +55,7 @@ export class WisprFlowClientFactory {
           config,
           tokens.refresh_token,
           tokens.scopes,
+          MCP_URL,
         );
         await repo.upsert(PROVIDER_NAME, { tokens: refreshed, error: null });
         await this.replaceClient(refreshed);
