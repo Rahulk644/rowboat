@@ -1,5 +1,9 @@
 import * as client from 'openid-client';
-import { OAuthTokens, ClientRegistrationResponse } from './types.js';
+import {
+  OAuthTokens,
+  ClientRegistrationRequest,
+  ClientRegistrationResponse,
+} from './types.js';
 
 /**
  * Cached configurations per provider (issuer:clientId -> Configuration)
@@ -94,6 +98,33 @@ export function createStaticConfiguration(
 }
 
 /**
+ * Register a public PKCE client against an explicit RFC 7591 endpoint.
+ *
+ * Some providers expose registration_endpoint only in RFC 8414 authorization
+ * server metadata, not in OpenID discovery. Keeping the POST isolated also
+ * makes the trust boundary and request shape independently testable.
+ */
+export async function registerClientAtEndpoint(
+  registrationEndpoint: string,
+  request: ClientRegistrationRequest,
+): Promise<ClientRegistrationResponse> {
+  const response = await fetch(registrationEndpoint, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(request),
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!response.ok) {
+    const detail = (await response.text()).slice(0, 1_000);
+    throw new Error(`Dynamic client registration failed (${response.status}): ${detail}`);
+  }
+  return ClientRegistrationResponse.parse(await response.json());
+}
+
+/**
  * Register client via Dynamic Client Registration (RFC 7591)
  * Returns both the Configuration and the registration response (for persistence)
  */
@@ -101,9 +132,34 @@ export async function registerClient(
   issuerUrl: string,
   redirectUris: string[],
   scopes: string[],
-  clientName: string = 'RowboatX Desktop App'
+  clientName: string = 'RowboatX Desktop App',
+  registrationEndpoint?: string,
 ): Promise<{ config: client.Configuration; registration: ClientRegistrationResponse }> {
   console.log(`[OAuth] Registering client via DCR at ${issuerUrl}...`);
+
+  // Some OAuth servers publish Dynamic Client Registration only in their
+  // RFC 8414 authorization-server document, while their OpenID discovery
+  // document omits registration_endpoint. openid-client's convenience DCR
+  // helper uses OpenID discovery and therefore cannot register those valid
+  // providers. When the provider advertises an explicit endpoint, perform the
+  // standard RFC 7591 POST and then use ordinary discovery for auth/token URLs.
+  if (registrationEndpoint) {
+    const registration = await registerClientAtEndpoint(registrationEndpoint, {
+      redirect_uris: redirectUris,
+      token_endpoint_auth_method: 'none',
+      grant_types: ['authorization_code', 'refresh_token'],
+      response_types: ['code'],
+      client_name: clientName,
+      scope: scopes.join(' '),
+    });
+    // This is a public desktop PKCE client. Ignore any unexpected secret in a
+    // registration response rather than changing the token auth method.
+    const config = await discoverConfiguration(issuerUrl, registration.client_id);
+    const cacheKey = `${issuerUrl}:${registration.client_id}:none`;
+    configCache.set(cacheKey, config);
+    return { config, registration };
+  }
+
   const config = await client.dynamicClientRegistration(
     new URL(issuerUrl),
     {
@@ -132,7 +188,7 @@ export async function registerClient(
   });
 
   // Cache the configuration
-  const cacheKey = `${issuerUrl}:${metadata.client_id}`;
+  const cacheKey = `${issuerUrl}:${metadata.client_id}:none`;
   configCache.set(cacheKey, config);
 
   return { config, registration };
@@ -249,4 +305,3 @@ export function getCachedConfiguration(issuerUrl: string, clientId: string): cli
 
 // Re-export Configuration type for external use
 export type { Configuration } from 'openid-client';
-

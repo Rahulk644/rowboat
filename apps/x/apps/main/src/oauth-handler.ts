@@ -174,7 +174,9 @@ async function getProviderConfiguration(
       const { config: oauthConfig, registration } = await oauthClient.registerClient(
         config.discovery.issuer,
         [redirectUri],
-        scopes
+        scopes,
+        'RowboatX Desktop App',
+        config.client.registrationEndpoint,
       );
 
       // Parse port from redirectUri (e.g. "http://localhost:8081/...") and save

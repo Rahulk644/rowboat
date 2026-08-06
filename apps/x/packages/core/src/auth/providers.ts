@@ -103,6 +103,7 @@ const providerConfigs: ProviderConfig = {
     },
     client: {
       mode: 'dcr',
+      registrationEndpoint: 'https://mcp-auth.wisprflow.com/oauth2/register',
     },
     scopes: [
       'openid',
