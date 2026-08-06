@@ -16,9 +16,9 @@ VERIFY_SCRIPT="$ROOT_DIR/script/verify_meeting_package.mjs"
 CONTRIBUTOR_INSTALL_SCRIPT="$ROOT_DIR/script/install_contributor_macos.mjs"
 
 case "$MODE" in
-  run|--run|--package|package|--verify|verify|--stable-install|stable-install|--logs|logs|--telemetry|telemetry|--debug|debug) ;;
+  run|--run|--full|full|--package|package|--verify|verify|--stable-install|stable-install|--logs|logs|--telemetry|telemetry|--debug|debug) ;;
   *)
-    echo "usage: $0 [run|--package|--verify|--stable-install|--logs|--telemetry|--debug]" >&2
+    echo "usage: $0 [run|--full|--package|--verify|--stable-install|--logs|--telemetry|--debug]" >&2
     exit 2
     ;;
 esac
@@ -201,6 +201,14 @@ case "$MODE" in
     export ROWBOAT_MEETING_BRIDGE_ENABLED=1
     export ROWBOAT_MEETING_CONTRIBUTOR_BUILD=1
     export ROWBOAT_MEETING_ONLY=1
+    exec "$APP_EXECUTABLE"
+    ;;
+  --full|full)
+    # Full isolated contributor Rowboat: connectors, Markdown knowledge,
+    # graph building, and agents remain enabled. This mode intentionally does
+    # not require or enable the experimental meeting bridge; Wispr can own the
+    # live meeting while its finalized MCP artifact syncs into Rowboat.
+    export ROWBOAT_MEETING_CONTRIBUTOR_BUILD=1
     exec "$APP_EXECUTABLE"
     ;;
   run|--run)

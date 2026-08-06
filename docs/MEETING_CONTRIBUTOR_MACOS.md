@@ -16,6 +16,17 @@ chmod 600 ~/.rowboat/config/meeting-transcription.env
 ./script/build_and_run.sh
 ```
 
+For the full Rowboat experience—connectors, Markdown knowledge, graph
+building, and agents—use the same isolated contributor bundle in full mode:
+
+```sh
+./script/build_and_run.sh --full
+```
+
+`--full` does not enable the experimental meeting bridge or require a private
+STT worker. It is the correct test path when Wispr owns the live Notetaker and
+Rowboat imports the finalized meeting through Wispr's OAuth MCP connector.
+
 The launcher accepts only the two listed keys; it does not source the file as
 shell code. The file remains outside the checkout, requires owner-only access,
 and its token stays in Electron main rather than the renderer or native helper.

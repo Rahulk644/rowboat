@@ -25,6 +25,8 @@ import { initUpdater } from "./updater.js";
 import { init as initGmailSync } from "@x/core/dist/knowledge/sync_gmail.js";
 import { init as initCalendarSync } from "@x/core/dist/knowledge/sync_calendar.js";
 import { init as initFirefliesSync } from "@x/core/dist/knowledge/sync_fireflies.js";
+import { init as initWisprFlowSync } from "@x/core/dist/knowledge/wispr-flow/sync.js";
+import { WisprFlowClientFactory } from "@x/core/dist/knowledge/wispr-flow/client-factory.js";
 import { init as initGranolaSync } from "@x/core/dist/knowledge/granola/sync.js";
 import { init as initGraphBuilder } from "@x/core/dist/knowledge/build_graph.js";
 import { init as initNoteTagging } from "@x/core/dist/knowledge/tag_notes.js";
@@ -708,7 +710,25 @@ app.whenReady().then(async () => {
   });
   initMeetingDetection({
     helperPath: path.join(__dirname, "mic-monitor"),
-    onDetected: (meeting) => showMeetingPopup(meeting),
+    onDetected: (meeting) => {
+      if (MEETING_ONLY_MODE) {
+        showMeetingPopup(meeting);
+        return;
+      }
+      // An authorized Wispr connector means Wispr owns the live Notetaker
+      // experience. Do not ask the user to start a second Rowboat recording;
+      // the finalized meeting will arrive through the MCP sync. Manual
+      // Rowboat recording stays available from the app/tray as a fallback.
+      void WisprFlowClientFactory.hasCredentials()
+        .then((connected) => {
+          if (connected) {
+            console.log('[meeting] Wispr Flow connected; suppressing duplicate Take Notes prompt');
+            return;
+          }
+          showMeetingPopup(meeting);
+        })
+        .catch(() => showMeetingPopup(meeting));
+    },
     // Call ended while recording (meeting app released the mic) — the
     // renderer stops capture and generates notes, same as a manual stop.
     onExternalCallEnded: () => {
@@ -833,6 +853,9 @@ app.whenReady().then(async () => {
 
   // start fireflies sync
   initFirefliesSync();
+
+  // Import finalized Wispr Notetaker meetings through Wispr's public OAuth MCP.
+  initWisprFlowSync();
 
   // start granola sync
   initGranolaSync();

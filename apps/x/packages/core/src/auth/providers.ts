@@ -95,6 +95,21 @@ const providerConfigs: ProviderConfig = {
       'profile',
       'email',
     ]
+  },
+  'wispr-flow': {
+    discovery: {
+      mode: 'issuer',
+      issuer: 'https://mcp-auth.wisprflow.com',
+    },
+    client: {
+      mode: 'dcr',
+    },
+    scopes: [
+      'openid',
+      'email',
+      'profile',
+      'offline_access',
+    ],
   }
 };
 

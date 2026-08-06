@@ -11,6 +11,7 @@ import { IClientRegistrationRepo } from '@x/core/dist/auth/client-repo.js';
 import { triggerSync as triggerGmailSync } from '@x/core/dist/knowledge/sync_gmail.js';
 import { triggerSync as triggerCalendarSync } from '@x/core/dist/knowledge/sync_calendar.js';
 import { triggerSync as triggerFirefliesSync } from '@x/core/dist/knowledge/sync_fireflies.js';
+import { triggerSync as triggerWisprFlowSync } from '@x/core/dist/knowledge/wispr-flow/sync.js';
 import { emitOAuthEvent } from './ipc.js';
 import { getBillingInfo } from '@x/core/dist/billing/billing.js';
 import { capture as analyticsCapture, identify as analyticsIdentify, reset as analyticsReset } from '@x/core/dist/analytics/posthog.js';
@@ -334,6 +335,8 @@ export async function connectProvider(provider: string, credentials?: { clientId
             triggerCalendarSync();
           } else if (provider === 'fireflies-ai') {
             triggerFirefliesSync();
+          } else if (provider === 'wispr-flow') {
+            triggerWisprFlowSync();
           }
 
           // For Rowboat sign-in, ensure user + Stripe customer exist before
